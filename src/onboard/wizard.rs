@@ -4619,6 +4619,7 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                             .map(|w| w.group_mention_patterns.clone())
                             .unwrap_or_default(),
                         proxy_url: existing_wa.and_then(|w| w.proxy_url.clone()),
+                        platform_type: None,
                     });
 
                     println!(
@@ -4735,6 +4736,7 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                         .map(|w| w.group_mention_patterns.clone())
                         .unwrap_or_default(),
                     proxy_url: existing_wa.and_then(|w| w.proxy_url.clone()),
+                    platform_type: None,
                 });
             }
             ChannelMenuChoice::Linq => {
