@@ -84,6 +84,9 @@ pub struct WhatsAppWebChannel {
         Arc<std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>>,
     /// Chats whose last incoming message was a voice note.
     voice_chats: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Platform type shown in WhatsApp's Linked Devices list.
+    /// Stored as a string; converted to `wa_rs_proto` type at connect time.
+    platform_type: Option<String>,
 }
 
 impl WhatsAppWebChannel {
@@ -127,6 +130,47 @@ impl WhatsAppWebChannel {
             tts_config: None,
             pending_voice: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             voice_chats: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            platform_type: None,
+        }
+    }
+
+    /// Set the platform type shown in WhatsApp's Linked Devices list.
+    ///
+    /// Accepted values (case-insensitive): "desktop" (default), "chrome",
+    /// "firefox", "safari", "edge", "ipad", "android_tablet", "ios_phone",
+    /// "wear_os".
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_platform_type(mut self, platform_type: Option<String>) -> Self {
+        self.platform_type = platform_type;
+        self
+    }
+
+    /// Convert a platform-type string to the wa-rs proto enum value.
+    ///
+    /// Returns `None` when the string is `None` or unrecognised (wa-rs will
+    /// use its own default, which presents as "Desktop" in Linked Devices).
+    #[cfg(feature = "whatsapp-web")]
+    fn resolve_platform_type(
+        s: Option<&str>,
+    ) -> Option<wa_rs_proto::whatsapp::device_props::PlatformType> {
+        use wa_rs_proto::whatsapp::device_props::PlatformType;
+        match s?.to_lowercase().as_str() {
+            "chrome" => Some(PlatformType::Chrome),
+            "firefox" => Some(PlatformType::Firefox),
+            "safari" => Some(PlatformType::Safari),
+            "edge" => Some(PlatformType::Edge),
+            "desktop" => Some(PlatformType::Desktop),
+            "ipad" => Some(PlatformType::Ipad),
+            "android_tablet" => Some(PlatformType::AndroidTablet),
+            "ios_phone" => Some(PlatformType::IosPhone),
+            "wear_os" => Some(PlatformType::WearOs),
+            other => {
+                tracing::warn!(
+                    "WhatsApp Web: unknown platform_type '{}', falling back to Desktop",
+                    other
+                );
+                Some(PlatformType::Desktop)
+            }
         }
     }
 
@@ -471,6 +515,115 @@ impl WhatsAppWebChannel {
         );
         Ok(())
     }
+    /// Connect to WhatsApp Web, send a single message, then disconnect.
+    ///
+    /// Used when `send()` is called without a running `listen()` loop — e.g. from
+    /// `zeroclaw channel send` or cron job delivery.  Requires an existing paired
+    /// session (session_path must already be populated via QR/pair-code linking).
+    #[cfg(feature = "whatsapp-web")]
+    async fn cold_send(&self, message: &SendMessage) -> Result<()> {
+        use wa_rs::bot::Bot;
+        use wa_rs::store::{Device, DeviceStore};
+        use wa_rs_core::types::events::Event;
+        use wa_rs_tokio_transport::TokioWebSocketTransportFactory;
+        use wa_rs_ureq_http::UreqHttpClient;
+
+        let expanded_session_path = shellexpand::tilde(&self.session_path).to_string();
+
+        let storage = RusqliteStore::new(&expanded_session_path)?;
+        let backend = Arc::new(storage);
+
+        if !backend.exists().await? {
+            anyhow::bail!(
+                "WhatsApp Web: no paired session found at '{}'. \
+                 Run `zeroclaw channel start` first to link a device via QR or pair code.",
+                expanded_session_path
+            );
+        }
+
+        let mut device = Device::new(backend.clone());
+        match backend.load().await? {
+            Some(core_device) => device.load_from_serializable(core_device),
+            None => anyhow::bail!("WhatsApp Web: session exists but failed to load device"),
+        }
+
+        let mut transport_factory = TokioWebSocketTransportFactory::new();
+        if let Ok(ws_url) = std::env::var("WHATSAPP_WS_URL") {
+            transport_factory = transport_factory.with_url(ws_url);
+        }
+        let http_client = UreqHttpClient::new();
+
+        // Signal from the event handler back to us once the socket is ready.
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel::<()>();
+        let connected_tx = Arc::new(parking_lot::Mutex::new(Some(connected_tx)));
+
+        let platform = Self::resolve_platform_type(self.platform_type.as_deref())
+            .unwrap_or(wa_rs_proto::whatsapp::device_props::PlatformType::Desktop);
+
+        let mut bot = Bot::builder()
+            .with_backend(backend)
+            .with_transport_factory(transport_factory)
+            .with_http_client(http_client)
+            .with_device_props(None, None, Some(platform))
+            .on_event(move |event, _client| {
+                let connected_tx = connected_tx.clone();
+                async move {
+                    if matches!(event, Event::Connected(_)) {
+                        if let Some(tx) = connected_tx.lock().take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                }
+            })
+            .build()
+            .await?;
+
+        let client = bot.client();
+        let bot_handle = bot.run().await?;
+
+        // Wait up to 30 s for the WhatsApp Web handshake to complete.
+        tokio::time::timeout(
+            tokio::time::Duration::from_secs(30),
+            connected_rx,
+        )
+        .await
+        .map_err(|_| anyhow!("WhatsApp Web cold send: timed out waiting for connection"))?
+        .map_err(|_| anyhow!("WhatsApp Web cold send: connection signal dropped"))?;
+
+        // Allowlist check (same as hot-path send).
+        if !Self::is_jid(&message.recipient) {
+            let normalized = self.normalize_phone(&message.recipient);
+            if !self.is_number_allowed(&normalized) {
+                bot_handle.abort();
+                let _ = bot_handle.await;
+                tracing::warn!(
+                    "WhatsApp Web cold send: recipient {} not in allowed list",
+                    message.recipient
+                );
+                return Ok(());
+            }
+        }
+
+        let to = self.recipient_to_jid(&message.recipient)?;
+        let outgoing = wa_rs_proto::whatsapp::Message {
+            conversation: Some(message.content.clone()),
+            ..Default::default()
+        };
+
+        let message_id = client.send_message(to, outgoing).await?;
+        tracing::info!(
+            "WhatsApp Web cold send: sent to {} (id: {})",
+            message.recipient,
+            message_id
+        );
+
+        // Give the transport a moment to flush before aborting the bot task.
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        bot_handle.abort();
+        let _ = bot_handle.await;
+
+        Ok(())
+    }
 }
 
 #[cfg(feature = "whatsapp-web")]
@@ -483,7 +636,8 @@ impl Channel for WhatsAppWebChannel {
     async fn send(&self, message: &SendMessage) -> Result<()> {
         let client = self.client.lock().clone();
         let Some(client) = client else {
-            anyhow::bail!("WhatsApp Web client not connected. Initialize the bot first.");
+            // Bot not started via listen() — use a one-shot connect/send/disconnect.
+            return Box::pin(self.cold_send(message)).await;
         };
 
         // Validate recipient allowlist only for direct phone-number targets.
@@ -666,10 +820,14 @@ impl Channel for WhatsAppWebChannel {
             let wa_group_policy = self.group_policy.clone();
             let wa_self_chat_mode = self.self_chat_mode;
 
+            let platform = Self::resolve_platform_type(self.platform_type.as_deref())
+                .unwrap_or(wa_rs_proto::whatsapp::device_props::PlatformType::Desktop);
+
             let mut builder = Bot::builder()
                 .with_backend(backend)
                 .with_transport_factory(transport_factory)
                 .with_http_client(http_client)
+                .with_device_props(None, None, Some(platform))
                 .on_event(move |event, client| {
                     let tx_inner = tx_clone.clone();
                     let allowed_numbers = allowed_numbers.clone();
@@ -1097,6 +1255,10 @@ impl WhatsAppWebChannel {
     }
 
     pub fn with_tts(self, _config: crate::config::TtsConfig) -> Self {
+        self
+    }
+
+    pub fn with_platform_type(self, _platform_type: Option<String>) -> Self {
         self
     }
 }

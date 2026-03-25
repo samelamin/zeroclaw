@@ -6549,6 +6549,14 @@ pub struct WhatsAppConfig {
     /// Overrides the global `[proxy]` setting for this channel only.
     #[serde(default)]
     pub proxy_url: Option<String>,
+    /// Platform type shown in WhatsApp's Linked Devices list (Web mode only).
+    ///
+    /// Controls what the device appears as on the linked phone. Accepted values
+    /// (case-insensitive): "desktop" (default), "chrome", "firefox", "safari",
+    /// "edge", "ipad", "android_tablet", "ios_phone", "wear_os".
+    /// When unset the client appears as "Desktop".
+    #[serde(default)]
+    pub platform_type: Option<String>,
 }
 
 impl ChannelConfig for WhatsAppConfig {
