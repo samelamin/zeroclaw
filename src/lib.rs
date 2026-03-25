@@ -233,12 +233,13 @@ the full agent loop. Useful for scripted notifications, hardware \
 sensor alerts, and automation pipelines.
 
 The --channel-id selects the channel by its config section name \
-(e.g. 'telegram', 'discord', 'slack'). The --recipient is the \
-platform-specific destination (e.g. a Telegram chat ID).
+(e.g. 'telegram', 'discord', 'slack', 'whatsapp'). The --recipient is the \
+platform-specific destination (e.g. a Telegram chat ID or E.164 phone number).
 
 Examples:
   zeroclaw channel send 'Someone is near your device.' --channel-id telegram --recipient 123456789
-  zeroclaw channel send 'Build succeeded!' --channel-id discord --recipient 987654321")]
+  zeroclaw channel send 'Build succeeded!' --channel-id discord --recipient 987654321
+  zeroclaw channel send 'Hello!' --channel-id whatsapp --recipient +15551234567")]
     Send {
         /// Message text to send
         message: String,

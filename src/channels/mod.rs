@@ -4324,25 +4324,29 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     .context("WhatsApp channel is not configured")?;
                 if !wa.is_web_config() {
                     anyhow::bail!(
-                        "WhatsApp channel send requires Web mode (session_path must be set)"
+                        "whatsapp channel send requires Web mode (session_path must be set in config)"
                     );
                 }
-                Ok(Arc::new(WhatsAppWebChannel::new(
-                    wa.session_path.clone().unwrap_or_default(),
-                    wa.pair_phone.clone(),
-                    wa.pair_code.clone(),
-                    wa.allowed_numbers.clone(),
-                    wa.mention_only,
-                    wa.mode.clone(),
-                    wa.dm_policy.clone(),
-                    wa.group_policy.clone(),
-                    wa.self_chat_mode,
-                )))
+                Ok(Arc::new(
+                    WhatsAppWebChannel::new(
+                        wa.session_path.clone().unwrap_or_default(),
+                        wa.pair_phone.clone(),
+                        wa.pair_code.clone(),
+                        wa.allowed_numbers.clone(),
+                        wa.mention_only,
+                        wa.mode.clone(),
+                        wa.dm_policy.clone(),
+                        wa.group_policy.clone(),
+                        wa.self_chat_mode,
+                    )
+                    .with_platform_type(wa.platform_type.clone()),
+                ))
             }
             #[cfg(not(feature = "whatsapp-web"))]
-            {
-                anyhow::bail!("WhatsApp channel requires the `whatsapp-web` feature");
-            }
+            anyhow::bail!(
+                "whatsapp channel requires the 'whatsapp-web' feature; \
+                 rebuild with: cargo build --features whatsapp-web"
+            )
         }
         "qq" => {
             let qq = config
@@ -4626,6 +4630,7 @@ fn collect_configured_channels(
                                 wa.group_policy.clone(),
                                 wa.self_chat_mode,
                             )
+                            .with_platform_type(wa.platform_type.clone())
                             .with_transcription(config.transcription.clone())
                             .with_tts(config.tts.clone())
                             .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
