@@ -67,5 +67,7 @@ lcov.info
 
 # Application and script directories (not needed for Docker runtime)
 apps/
+# Exception: Cargo.toml needed so the workspace manifest parses under --locked
+!apps/tauri/Cargo.toml
 python/
 scripts/
