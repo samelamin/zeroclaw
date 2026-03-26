@@ -2275,6 +2275,53 @@ async fn process_channel_message(
         }),
     );
 
+    // ── Webhook forward: POST to external URL instead of local LLM ──
+    if msg.channel == "whatsapp" {
+        if let Some(ref wa_cfg) = ctx.prompt_config.channels_config.whatsapp {
+            if let Some(ref forward_url) = wa_cfg.webhook_forward_url {
+                let payload = serde_json::json!({
+                    "sender": msg.sender,
+                    "message": msg.content,
+                    "channel": "whatsapp",
+                });
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .unwrap_or_default();
+                let mut req = client.post(forward_url).json(&payload);
+                if let Some(ref secret) = wa_cfg.webhook_forward_secret {
+                    req = req.header("X-Internal-Secret", secret);
+                }
+                match req.send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        tracing::info!(
+                            channel = "whatsapp",
+                            sender = %msg.sender,
+                            "Message forwarded to webhook"
+                        );
+                    }
+                    Ok(resp) => {
+                        tracing::error!(
+                            channel = "whatsapp",
+                            sender = %msg.sender,
+                            status = %resp.status(),
+                            "Webhook forward returned error"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            channel = "whatsapp",
+                            sender = %msg.sender,
+                            error = %e,
+                            "Webhook forward failed"
+                        );
+                    }
+                }
+                return; // Don't process with local LLM
+            }
+        }
+    }
+
     // ── Hook: on_message_received (modifying) ────────────
     let mut msg = if let Some(hooks) = &ctx.hooks {
         match hooks.run_on_message_received(msg).await {

@@ -4410,6 +4410,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         self_chat_mode: false,
                         proxy_url: None,
                         platform_type: None,
+                        webhook_forward_url: None,
+                        webhook_forward_secret: None,
                     });
 
                     println!(
@@ -4517,6 +4519,8 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     self_chat_mode: false,
                     proxy_url: None,
                     platform_type: None,
+                    webhook_forward_url: None,
+                    webhook_forward_secret: None,
                 });
             }
             ChannelMenuChoice::Linq => {
