@@ -4620,6 +4620,8 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                             .unwrap_or_default(),
                         proxy_url: existing_wa.and_then(|w| w.proxy_url.clone()),
                         platform_type: None,
+                        webhook_forward_url: None,
+                        webhook_forward_secret: None,
                     });
 
                     println!(
@@ -4737,6 +4739,8 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                         .unwrap_or_default(),
                     proxy_url: existing_wa.and_then(|w| w.proxy_url.clone()),
                     platform_type: None,
+                    webhook_forward_url: None,
+                    webhook_forward_secret: None,
                 });
             }
             ChannelMenuChoice::Linq => {

@@ -6857,6 +6857,16 @@ pub struct WhatsAppConfig {
     /// When unset the client appears as "Desktop".
     #[serde(default)]
     pub platform_type: Option<String>,
+    /// When set, incoming WhatsApp messages are forwarded via HTTP POST to this
+    /// URL instead of being processed by the local LLM. The POST body is JSON:
+    /// `{"sender": "+1234...", "message": "text", "channel": "whatsapp"}`.
+    /// An optional `webhook_forward_secret` is sent as `X-Internal-Secret` header.
+    /// Replies should be sent back via `zeroclaw channel send`.
+    #[serde(default)]
+    pub webhook_forward_url: Option<String>,
+    /// Shared secret sent as `X-Internal-Secret` header with forwarded webhooks.
+    #[serde(default)]
+    pub webhook_forward_secret: Option<String>,
 }
 
 impl ChannelConfig for WhatsAppConfig {
@@ -12791,6 +12801,8 @@ channel_ids = ["C123", "D456"]
             group_mention_patterns: vec![],
             proxy_url: None,
             platform_type: None,
+            webhook_forward_url: None,
+            webhook_forward_secret: None,
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -12820,6 +12832,8 @@ channel_ids = ["C123", "D456"]
             group_mention_patterns: vec![],
             proxy_url: None,
             platform_type: None,
+            webhook_forward_url: None,
+            webhook_forward_secret: None,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -12854,6 +12868,8 @@ channel_ids = ["C123", "D456"]
             group_mention_patterns: vec![],
             proxy_url: None,
             platform_type: None,
+            webhook_forward_url: None,
+            webhook_forward_secret: None,
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -12880,6 +12896,8 @@ channel_ids = ["C123", "D456"]
             group_mention_patterns: vec![],
             proxy_url: None,
             platform_type: None,
+            webhook_forward_url: None,
+            webhook_forward_secret: None,
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -12905,6 +12923,8 @@ channel_ids = ["C123", "D456"]
             group_mention_patterns: vec![],
             proxy_url: None,
             platform_type: None,
+            webhook_forward_url: None,
+            webhook_forward_secret: None,
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -12941,6 +12961,8 @@ channel_ids = ["C123", "D456"]
                 group_mention_patterns: vec![],
                 proxy_url: None,
                 platform_type: None,
+                webhook_forward_url: None,
+                webhook_forward_secret: None,
             }),
             linq: None,
             wati: None,
