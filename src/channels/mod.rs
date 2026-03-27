@@ -2298,43 +2298,32 @@ async fn process_channel_message(
                 if let Some(ref secret) = wa_cfg.webhook_forward_secret {
                     req = req.header("X-Internal-Secret", secret);
                 }
-                match req.send().await {
+
+                // Show typing indicator while waiting for the external agent to respond
+                let typing_channel = ctx.channels_by_name.get("whatsapp").cloned();
+                let typing_token = CancellationToken::new();
+                let typing_task = typing_channel.as_ref().map(|ch| {
+                    spawn_scoped_typing_task(
+                        Arc::clone(ch),
+                        msg.reply_target.clone(),
+                        typing_token.clone(),
+                    )
+                });
+
+                // Extract reply (if any) from the webhook response
+                let webhook_reply: Option<String> = match req.send().await {
                     Ok(resp) if resp.status().is_success() => {
-                        // Try to read reply from response body and send via persistent connection
-                        if let Ok(body) = resp.json::<serde_json::Value>().await {
-                            if let Some(reply) = body.get("reply").and_then(|v| v.as_str()) {
-                                if !reply.is_empty() {
-                                    let target_channel = ctx
-                                        .channels_by_name
-                                        .get("whatsapp")
-                                        .cloned();
-                                    if let Some(channel) = target_channel {
-                                        let send_msg = traits::SendMessage::new(
-                                            reply,
-                                            msg.reply_target.clone(),
-                                        );
-                                        if let Err(e) = channel.send(&send_msg).await {
-                                            tracing::error!(
-                                                channel = "whatsapp",
-                                                error = %e,
-                                                "Failed to send webhook reply via persistent connection"
-                                            );
-                                        } else {
-                                            tracing::info!(
-                                                channel = "whatsapp",
-                                                sender = %msg.sender,
-                                                "Webhook reply sent via persistent connection"
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        }
                         tracing::info!(
                             channel = "whatsapp",
                             sender = %msg.sender,
                             "Message forwarded to webhook"
                         );
+                        resp.json::<serde_json::Value>().await.ok().and_then(|body| {
+                            body.get("reply")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                                .map(|s| s.to_string())
+                        })
                     }
                     Ok(resp) => {
                         tracing::error!(
@@ -2343,6 +2332,7 @@ async fn process_channel_message(
                             status = %resp.status(),
                             "Webhook forward returned error"
                         );
+                        None
                     }
                     Err(e) => {
                         tracing::error!(
@@ -2351,6 +2341,35 @@ async fn process_channel_message(
                             error = %e,
                             "Webhook forward failed"
                         );
+                        None
+                    }
+                };
+
+                // Stop typing before delivering the reply so the user sees the
+                // transition from "typing…" → message rather than both at once.
+                typing_token.cancel();
+                if let Some(task) = typing_task {
+                    let _ = task.await;
+                }
+
+                if let Some(reply) = webhook_reply {
+                    let target_channel = ctx.channels_by_name.get("whatsapp").cloned();
+                    if let Some(channel) = target_channel {
+                        let send_msg =
+                            traits::SendMessage::new(reply, msg.reply_target.clone());
+                        if let Err(e) = channel.send(&send_msg).await {
+                            tracing::error!(
+                                channel = "whatsapp",
+                                error = %e,
+                                "Failed to send webhook reply via persistent connection"
+                            );
+                        } else {
+                            tracing::info!(
+                                channel = "whatsapp",
+                                sender = %msg.sender,
+                                "Webhook reply sent via persistent connection"
+                            );
+                        }
                     }
                 }
                 return; // Don't process with local LLM
