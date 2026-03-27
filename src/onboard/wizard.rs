@@ -4438,6 +4438,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         dm_mention_patterns: vec![],
                         group_mention_patterns: vec![],
                         proxy_url: None,
+                        platform_type: None,
+                        webhook_forward_url: None,
+                        webhook_forward_secret: None,
                     });
 
                     println!(
@@ -4546,6 +4549,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     dm_mention_patterns: vec![],
                     group_mention_patterns: vec![],
                     proxy_url: None,
+                    platform_type: None,
+                    webhook_forward_url: None,
+                    webhook_forward_secret: None,
                 });
             }
             ChannelMenuChoice::Linq => {

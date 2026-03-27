@@ -593,7 +593,8 @@ pub(crate) async fn deliver_announcement(
                     wa.dm_policy.clone(),
                     wa.group_policy.clone(),
                     wa.self_chat_mode,
-                );
+                )
+                .with_platform_type(wa.platform_type.clone());
                 channel
                     .send(&SendMessage::new(safe_output.as_str(), target))
                     .await?;

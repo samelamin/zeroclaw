@@ -2281,6 +2281,83 @@ async fn process_channel_message(
         }),
     );
 
+    // ── Webhook forward: POST to external URL instead of local LLM ──
+    if msg.channel == "whatsapp" {
+        if let Some(ref wa_cfg) = ctx.prompt_config.channels_config.whatsapp {
+            if let Some(ref forward_url) = wa_cfg.webhook_forward_url {
+                let payload = serde_json::json!({
+                    "sender": msg.sender,
+                    "message": msg.content,
+                    "channel": "whatsapp",
+                });
+                let client = reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .unwrap_or_default();
+                let mut req = client.post(forward_url).json(&payload);
+                if let Some(ref secret) = wa_cfg.webhook_forward_secret {
+                    req = req.header("X-Internal-Secret", secret);
+                }
+                match req.send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        // Try to read reply from response body and send via persistent connection
+                        if let Ok(body) = resp.json::<serde_json::Value>().await {
+                            if let Some(reply) = body.get("reply").and_then(|v| v.as_str()) {
+                                if !reply.is_empty() {
+                                    let target_channel = ctx
+                                        .channels_by_name
+                                        .get("whatsapp")
+                                        .cloned();
+                                    if let Some(channel) = target_channel {
+                                        let send_msg = traits::SendMessage::new(
+                                            reply,
+                                            msg.reply_target.clone(),
+                                        );
+                                        if let Err(e) = channel.send(&send_msg).await {
+                                            tracing::error!(
+                                                channel = "whatsapp",
+                                                error = %e,
+                                                "Failed to send webhook reply via persistent connection"
+                                            );
+                                        } else {
+                                            tracing::info!(
+                                                channel = "whatsapp",
+                                                sender = %msg.sender,
+                                                "Webhook reply sent via persistent connection"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        tracing::info!(
+                            channel = "whatsapp",
+                            sender = %msg.sender,
+                            "Message forwarded to webhook"
+                        );
+                    }
+                    Ok(resp) => {
+                        tracing::error!(
+                            channel = "whatsapp",
+                            sender = %msg.sender,
+                            status = %resp.status(),
+                            "Webhook forward returned error"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            channel = "whatsapp",
+                            sender = %msg.sender,
+                            error = %e,
+                            "Webhook forward failed"
+                        );
+                    }
+                }
+                return; // Don't process with local LLM
+            }
+        }
+    }
+
     // ── Hook: on_message_received (modifying) ────────────
     let mut msg = if let Some(hooks) = &ctx.hooks {
         match hooks.run_on_message_received(msg).await {
@@ -4091,36 +4168,28 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                     .context("WhatsApp channel is not configured")?;
                 if !wa.is_web_config() {
                     anyhow::bail!(
-                        "WhatsApp channel send requires Web mode (session_path must be set)"
+                        "whatsapp channel send requires Web mode (session_path must be set in config)"
                     );
                 }
-                Ok(Arc::new(WhatsAppWebChannel::new(
-                    wa.session_path.clone().unwrap_or_default(),
-                    wa.pair_phone.clone(),
-                    wa.pair_code.clone(),
-                    wa.allowed_numbers.clone(),
-                    wa.mode.clone(),
-                    wa.dm_policy.clone(),
-                    wa.group_policy.clone(),
-                    wa.self_chat_mode,
-                )))
+                Ok(Arc::new(
+                    WhatsAppWebChannel::new(
+                        wa.session_path.clone().unwrap_or_default(),
+                        wa.pair_phone.clone(),
+                        wa.pair_code.clone(),
+                        wa.allowed_numbers.clone(),
+                        wa.mode.clone(),
+                        wa.dm_policy.clone(),
+                        wa.group_policy.clone(),
+                        wa.self_chat_mode,
+                    )
+                    .with_platform_type(wa.platform_type.clone()),
+                ))
             }
             #[cfg(not(feature = "whatsapp-web"))]
-            {
-                anyhow::bail!("WhatsApp channel requires the `whatsapp-web` feature");
-            }
-        }
-        "qq" => {
-            let qq = config
-                .channels_config
-                .qq
-                .as_ref()
-                .context("QQ channel is not configured")?;
-            Ok(Arc::new(QQChannel::new(
-                qq.app_id.clone(),
-                qq.app_secret.clone(),
-                qq.allowed_users.clone(),
-            )))
+            anyhow::bail!(
+                "whatsapp channel requires the 'whatsapp-web' feature; \
+                 rebuild with: cargo build --features whatsapp-web"
+            )
         }
         other => anyhow::bail!(
             "Unknown channel '{other}'. Supported: telegram, discord, slack, mattermost, signal, matrix, whatsapp, qq"
@@ -4386,6 +4455,7 @@ fn collect_configured_channels(
                                 wa.group_policy.clone(),
                                 wa.self_chat_mode,
                             )
+                            .with_platform_type(wa.platform_type.clone())
                             .with_transcription(config.transcription.clone())
                             .with_tts(config.tts.clone())
                             .with_dm_mention_patterns(wa.dm_mention_patterns.clone())
