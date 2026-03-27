@@ -280,6 +280,32 @@ mention_only = false               # optional: require @mention in groups (DMs a
 interrupt_on_new_message = false   # optional: cancel in-flight same-sender same-chat request
 ```
 
+**Webhook forwarding (multi-tenant routing):**
+
+Both modes support forwarding incoming messages to an external HTTP endpoint instead
+of processing them with the local LLM. This is the standard pattern for multi-tenant
+deployments where an external agent (e.g. a Nesayma routing layer) handles the message
+and returns a reply.
+
+```toml
+[channels_config.whatsapp]
+session_path = "~/.zeroclaw/state/whatsapp-web/session.db"
+allowed_numbers = ["*"]
+webhook_forward_url = "https://your-agent.example.com/whatsapp"
+webhook_forward_secret = "shared-secret"   # sent as X-Internal-Secret header
+```
+
+When `webhook_forward_url` is set:
+
+1. ZeroClaw shows a typing indicator to the user immediately.
+2. It POSTs `{"sender": "+1234...", "message": "text", "channel": "whatsapp"}` to the URL.
+3. The external agent processes the message and returns `{"reply": "response text"}` in the HTTP response body.
+4. ZeroClaw stops the typing indicator and sends the reply back to the user via the persistent WhatsApp Web connection.
+5. If the response body contains no `reply` field (or it is empty), no message is sent.
+
+The `webhook_forward_secret` value is sent as the `X-Internal-Secret` request header so
+the receiving endpoint can verify the request origin.
+
 Notes:
 
 - Build with `cargo build --features whatsapp-web` (or equivalent run command).
@@ -287,6 +313,7 @@ Notes:
 - Reply routing uses the originating chat JID, so direct and group replies work correctly.
 - `mention_only = true` makes the bot ignore group messages unless the bot is @-mentioned. Direct messages are always processed. Bot identity is seeded from `pair_phone` and updated from the device store on connect.
 - `interrupt_on_new_message = true` preserves interrupted user turns in conversation history, then restarts generation on the newest message.
+- The typing indicator is shown for the full duration of the external agent's response time, giving users the same UX as the local LLM path.
 
 ### 4.8 Webhook Channel Config (Gateway)
 
