@@ -370,7 +370,17 @@ flowchart TB
     LogReceive --> MemoryRecall[build_memory_context]
     MemoryRecall --> AutoSave[Auto-save if enabled]
 
-    AutoSave --> StartTyping[channel.start_typing]
+    AutoSave --> WebhookCheck{webhook_forward_url<br/>configured?}
+
+    WebhookCheck -->|Yes| StartTypingWH[channel.start_typing]
+    StartTypingWH --> ForwardHTTP[POST to external agent<br/>X-Internal-Secret header]
+    ForwardHTTP --> StopTypingWH[channel.stop_typing]
+    StopTypingWH --> GotReply{reply in<br/>response body?}
+    GotReply -->|Yes| SendForwardReply[channel.send reply<br/>via persistent connection]
+    GotReply -->|No| DoneNoReply[Message complete<br/>no reply sent]
+    SendForwardReply --> Done[Message complete]
+
+    WebhookCheck -->|No| StartTyping[channel.start_typing]
     StartTyping --> Timeout[300s timeout guard]
 
     Timeout --> AgentCall[run_tool_call_loop<br/>silent mode]
@@ -385,9 +395,10 @@ flowchart TB
     LogError --> SendError[channel.send error msg]
     LogTimeout --> SendTimeout[channel.send timeout msg]
 
-    SendReply --> Done[Message complete]
+    SendReply --> Done
     SendError --> Done
     SendTimeout --> Done
+    DoneNoReply --> Done
 
     Done --> NextWorker[Join next worker]
     NextWorker --> WorkerPool
@@ -399,8 +410,8 @@ flowchart TB
 
     class TG,DC,SL,IM,MX,SIG,WA,Email,IRC,Lark,DT,QQ channel
     class MPSC,Semaphore,WorkerPool queue
-    class Process,LogReceive,MemoryRecall,AutoSave,StartTyping,Timeout,AgentCall,StopTyping process
-    class LogReply,SendReply,Done,NextWorker success
+    class Process,LogReceive,MemoryRecall,AutoSave,WebhookCheck,StartTypingWH,ForwardHTTP,StopTypingWH,GotReply,StartTyping,Timeout,AgentCall,StopTyping process
+    class LogReply,SendReply,SendForwardReply,Done,DoneNoReply,NextWorker success
 ```
 
 ---
