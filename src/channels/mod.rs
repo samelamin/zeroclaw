@@ -2417,6 +2417,36 @@ async fn process_channel_message(
                 }
                 match req.send().await {
                     Ok(resp) if resp.status().is_success() => {
+                        // Try to read reply from response body and send via persistent connection
+                        if let Ok(body) = resp.json::<serde_json::Value>().await {
+                            if let Some(reply) = body.get("reply").and_then(|v| v.as_str()) {
+                                if !reply.is_empty() {
+                                    let target_channel = ctx
+                                        .channels_by_name
+                                        .get("whatsapp")
+                                        .cloned();
+                                    if let Some(channel) = target_channel {
+                                        let send_msg = traits::SendMessage::new(
+                                            reply,
+                                            msg.reply_target.clone(),
+                                        );
+                                        if let Err(e) = channel.send(&send_msg).await {
+                                            tracing::error!(
+                                                channel = "whatsapp",
+                                                error = %e,
+                                                "Failed to send webhook reply via persistent connection"
+                                            );
+                                        } else {
+                                            tracing::info!(
+                                                channel = "whatsapp",
+                                                sender = %msg.sender,
+                                                "Webhook reply sent via persistent connection"
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         tracing::info!(
                             channel = "whatsapp",
                             sender = %msg.sender,
