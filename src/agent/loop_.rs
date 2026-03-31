@@ -2288,12 +2288,14 @@ async fn execute_one_tool(
         arguments: Some(args_summary),
     });
     if let Some(tx) = on_delta {
-        let _ = tx.send(DraftEvent::ToolProgress {
-            tool_name: call_name.to_string(),
-            tool_id: String::new(),
-            phase: ToolPhase::Started,
-            detail: None,
-        }).await;
+        let _ = tx
+            .send(DraftEvent::ToolProgress {
+                tool_name: call_name.to_string(),
+                tool_id: String::new(),
+                phase: ToolPhase::Started,
+                detail: None,
+            })
+            .await;
     }
     let start = Instant::now();
 
@@ -2338,12 +2340,18 @@ async fn execute_one_tool(
                 success: r.success,
             });
             if let Some(tx) = on_delta {
-                let _ = tx.send(DraftEvent::ToolProgress {
-                    tool_name: call_name.to_string(),
-                    tool_id: String::new(),
-                    phase: if r.success { ToolPhase::Completed } else { ToolPhase::Failed },
-                    detail: Some(truncate_with_ellipsis(&r.output, 120)),
-                }).await;
+                let _ = tx
+                    .send(DraftEvent::ToolProgress {
+                        tool_name: call_name.to_string(),
+                        tool_id: String::new(),
+                        phase: if r.success {
+                            ToolPhase::Completed
+                        } else {
+                            ToolPhase::Failed
+                        },
+                        detail: Some(truncate_with_ellipsis(&r.output, 120)),
+                    })
+                    .await;
             }
             if r.success {
                 Ok(ToolExecutionOutcome {
@@ -2370,12 +2378,14 @@ async fn execute_one_tool(
                 success: false,
             });
             if let Some(tx) = on_delta {
-                let _ = tx.send(DraftEvent::ToolProgress {
-                    tool_name: call_name.to_string(),
-                    tool_id: String::new(),
-                    phase: ToolPhase::Failed,
-                    detail: Some(truncate_with_ellipsis(&e.to_string(), 120)),
-                }).await;
+                let _ = tx
+                    .send(DraftEvent::ToolProgress {
+                        tool_name: call_name.to_string(),
+                        tool_id: String::new(),
+                        phase: ToolPhase::Failed,
+                        detail: Some(truncate_with_ellipsis(&e.to_string(), 120)),
+                    })
+                    .await;
             }
             let reason = format!("Error executing {call_name}: {e}");
             Ok(ToolExecutionOutcome {
@@ -5443,8 +5453,16 @@ mod tests {
             .expect("should produce a sample whose byte index 300 is not a char boundary");
 
         let observer = NoopObserver;
-        let result =
-            execute_one_tool("unknown_tool", call_arguments, &[], None, &observer, None, None).await;
+        let result = execute_one_tool(
+            "unknown_tool",
+            call_arguments,
+            &[],
+            None,
+            &observer,
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_ok(), "execute_one_tool should not panic or error");
 
         let outcome = result.unwrap();
