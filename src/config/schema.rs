@@ -1381,6 +1381,10 @@ pub struct AgentConfig {
     /// behavior). Default: `2`.
     #[serde(default = "default_keep_tool_context_turns")]
     pub keep_tool_context_turns: usize,
+
+    /// Microcompaction config for surgical tool-result trimming before LLM calls.
+    #[serde(default)]
+    pub microcompaction: crate::agent::microcompactor::MicrocompactionConfig,
 }
 
 fn default_max_tool_result_chars() -> usize {
@@ -1432,6 +1436,7 @@ impl Default for AgentConfig {
                 crate::agent::context_compressor::ContextCompressionConfig::default(),
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
+            microcompaction: crate::agent::microcompactor::MicrocompactionConfig::default(),
         }
     }
 }
