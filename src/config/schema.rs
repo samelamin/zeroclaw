@@ -1363,6 +1363,10 @@ pub struct AgentConfig {
     /// Context compression configuration for automatic conversation compaction.
     #[serde(default)]
     pub context_compression: crate::agent::context_compressor::ContextCompressionConfig,
+
+    /// Microcompaction config for surgical tool-result trimming before LLM calls.
+    #[serde(default)]
+    pub microcompaction: crate::agent::microcompactor::MicrocompactionConfig,
 }
 
 fn default_agent_max_tool_iterations() -> usize {
@@ -1404,6 +1408,7 @@ impl Default for AgentConfig {
             auto_classify: None,
             context_compression:
                 crate::agent::context_compressor::ContextCompressionConfig::default(),
+            microcompaction: crate::agent::microcompactor::MicrocompactionConfig::default(),
         }
     }
 }
