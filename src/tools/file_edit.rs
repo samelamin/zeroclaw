@@ -249,7 +249,11 @@ impl Tool for FileEditTool {
 
         // 9d. Best-effort backup (content-hash keyed)
         {
-            let backup_dir = self.security.workspace_dir.join(".zeroclaw").join("backups");
+            let backup_dir = self
+                .security
+                .workspace_dir
+                .join(".zeroclaw")
+                .join("backups");
             if let Ok(()) = tokio::fs::create_dir_all(&backup_dir).await {
                 let hex_hash = pre_hash.to_hex();
                 let file_name = resolved_target

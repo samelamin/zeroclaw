@@ -612,13 +612,10 @@ impl WhatsAppWebChannel {
         let bot_handle = bot.run().await?;
 
         // Wait up to 30 s for the WhatsApp Web handshake to complete.
-        tokio::time::timeout(
-            tokio::time::Duration::from_secs(30),
-            connected_rx,
-        )
-        .await
-        .map_err(|_| anyhow!("WhatsApp Web cold send: timed out waiting for connection"))?
-        .map_err(|_| anyhow!("WhatsApp Web cold send: connection signal dropped"))?;
+        tokio::time::timeout(tokio::time::Duration::from_secs(30), connected_rx)
+            .await
+            .map_err(|_| anyhow!("WhatsApp Web cold send: timed out waiting for connection"))?
+            .map_err(|_| anyhow!("WhatsApp Web cold send: connection signal dropped"))?;
 
         // Allowlist check (same as hot-path send).
         if !Self::is_jid(&message.recipient) {
