@@ -2664,6 +2664,26 @@ async fn execute_one_tool(
         });
     };
 
+    // Best-effort input validation against tool's JSON schema.
+    // Log a warning if args don't match schema, but still execute —
+    // the tool handles its own validation internally.
+    {
+        let schema = tool.parameters_schema();
+        if let Some(required) = schema.get("required").and_then(|v| v.as_array()) {
+            for req_field in required {
+                if let Some(field_name) = req_field.as_str() {
+                    if call_arguments.get(field_name).is_none() {
+                        tracing::warn!(
+                            tool = call_name,
+                            missing_field = field_name,
+                            "Tool call missing required parameter — may fail"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     let tool_future = tool.execute(call_arguments);
     let tool_result = if let Some(token) = cancellation_token {
         tokio::select! {
@@ -2741,11 +2761,50 @@ async fn execute_one_tool(
     }
 }
 
+#[derive(Clone)]
 struct ToolExecutionOutcome {
     output: String,
     success: bool,
     error_reason: Option<String>,
     duration: Duration,
+}
+
+/// Simple cache for read-only tool results within a single tool-call loop session.
+/// Keyed by (tool_name, args_json). Only caches safe-to-cache tools.
+struct ToolResultCache {
+    entries: std::collections::HashMap<(String, String), ToolExecutionOutcome>,
+}
+
+impl ToolResultCache {
+    fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Check if this tool+args combo is cached.
+    fn get(&self, tool_name: &str, args: &serde_json::Value) -> Option<&ToolExecutionOutcome> {
+        let key = (tool_name.to_string(), args.to_string());
+        self.entries.get(&key)
+    }
+
+    /// Store a result. Only stores results from cacheable tools.
+    fn put(
+        &mut self,
+        tool_name: &str,
+        args: &serde_json::Value,
+        outcome: ToolExecutionOutcome,
+    ) {
+        if Self::is_cacheable(tool_name) {
+            let key = (tool_name.to_string(), args.to_string());
+            self.entries.insert(key, outcome);
+        }
+    }
+
+    /// Only cache read-only tools that have no side effects.
+    fn is_cacheable(tool_name: &str) -> bool {
+        matches!(tool_name, "file_read" | "content_search" | "web_fetch")
+    }
 }
 
 // ── LLM Error Recovery ──────────────────────────────────────────────────
@@ -2848,6 +2907,32 @@ fn should_execute_tools_in_parallel(
         if tool_calls.iter().any(|call| mgr.needs_approval(&call.name)) {
             // Approval-gated calls must keep sequential handling so the caller can
             // enforce CLI prompt/deny policy consistently.
+            return false;
+        }
+    }
+
+    // Dependency detection: if a file_write/file_edit targets a path that
+    // another tool also targets, force sequential to avoid race conditions.
+    {
+        let mut file_paths: std::collections::HashMap<&str, usize> =
+            std::collections::HashMap::new();
+        for call in tool_calls {
+            if let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) {
+                if call.name == "file_write"
+                    || call.name == "file_edit"
+                    || call.name == "file_read"
+                {
+                    *file_paths.entry(path).or_insert(0) += 1;
+                }
+            }
+        }
+        let has_write = tool_calls
+            .iter()
+            .any(|c| c.name == "file_write" || c.name == "file_edit");
+        if has_write && file_paths.values().any(|&count| count > 1) {
+            tracing::debug!(
+                "File dependency detected in parallel batch — forcing sequential"
+            );
             return false;
         }
     }
@@ -2971,6 +3056,8 @@ pub(crate) async fn run_tool_call_loop(
             max_repeats: pacing.loop_detection_max_repeats,
         },
     );
+
+    let mut tool_cache = ToolResultCache::new();
 
     for iteration in 0..max_iterations {
         let mut seen_tool_signatures: HashSet<(String, String)> = HashSet::new();
@@ -3275,15 +3362,28 @@ pub(crate) async fn run_tool_call_loop(
                     .map(|u| (u.input_tokens, u.output_tokens))
                     .unwrap_or((None, None));
 
+                let llm_duration = llm_started_at.elapsed();
                 observer.record_event(&ObserverEvent::LlmResponse {
                     provider: provider_name.to_string(),
                     model: model.to_string(),
-                    duration: llm_started_at.elapsed(),
+                    duration: llm_duration,
                     success: true,
                     error_message: None,
                     input_tokens: resp_input_tokens,
                     output_tokens: resp_output_tokens,
                 });
+
+                // Slow query alerting — warn when LLM calls take unusually long
+                const SLOW_QUERY_THRESHOLD_SECS: u64 = 30;
+                if llm_duration.as_secs() > SLOW_QUERY_THRESHOLD_SECS {
+                    tracing::warn!(
+                        provider = provider_name,
+                        model,
+                        duration_secs = llm_duration.as_secs(),
+                        iteration = iteration + 1,
+                        "Slow LLM query detected (>{SLOW_QUERY_THRESHOLD_SECS}s)"
+                    );
+                }
 
                 // Record cost via task-local tracker (no-op when not scoped)
                 let _ = resp
@@ -3732,15 +3832,28 @@ pub(crate) async fn run_tool_call_loop(
             )
             .await?
         } else {
-            execute_tools_sequential(
-                &executable_calls,
-                tools_registry,
-                activated_tools,
-                observer,
-                cancellation_token.as_ref(),
-                on_delta.as_ref(),
-            )
-            .await?
+            // Sequential path with per-session cache for read-only tools.
+            let mut seq_outcomes = Vec::with_capacity(executable_calls.len());
+            for call in &executable_calls {
+                if let Some(cached) = tool_cache.get(&call.name, &call.arguments) {
+                    tracing::debug!(tool = %call.name, "Tool result cache hit");
+                    seq_outcomes.push(cached.clone());
+                } else {
+                    let outcome = execute_one_tool(
+                        &call.name,
+                        call.arguments.clone(),
+                        tools_registry,
+                        activated_tools,
+                        observer,
+                        cancellation_token.as_ref(),
+                        on_delta.as_ref(),
+                    )
+                    .await?;
+                    tool_cache.put(&call.name, &call.arguments, outcome.clone());
+                    seq_outcomes.push(outcome);
+                }
+            }
+            seq_outcomes
         };
 
         for ((idx, call), outcome) in executable_indices
