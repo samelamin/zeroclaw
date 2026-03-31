@@ -2734,6 +2734,9 @@ async fn process_channel_message(
                                 tracing::debug!("Draft update failed: {e}");
                             }
                         }
+                        DraftEvent::ToolProgress { .. } => {
+                            // Structured tool progress — ignored by default channel handler.
+                        }
                     }
                 }
             }))
