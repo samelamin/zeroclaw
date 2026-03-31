@@ -12125,7 +12125,6 @@ default_temperature = 0.7
             mention_only: false,
             ack_reactions: None,
             proxy_url: None,
-            platform_type: None,
         };
         let json = serde_json::to_string(&tc).unwrap();
         let parsed: TelegramConfig = serde_json::from_str(&json).unwrap();
@@ -12288,7 +12287,6 @@ allowed_users = ["@ops:matrix.org"]
             ignore_attachments: true,
             ignore_stories: false,
             proxy_url: None,
-            platform_type: None,
         };
         let json = serde_json::to_string(&sc).unwrap();
         let parsed: SignalConfig = serde_json::from_str(&json).unwrap();
@@ -12310,7 +12308,6 @@ allowed_users = ["@ops:matrix.org"]
             ignore_attachments: false,
             ignore_stories: true,
             proxy_url: None,
-            platform_type: None,
         };
         let toml_str = toml::to_string(&sc).unwrap();
         let parsed: SignalConfig = toml::from_str(&toml_str).unwrap();
@@ -14490,7 +14487,6 @@ default_model = "persisted-profile"
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
-            platform_type: None,
         };
         let json = serde_json::to_string(&lc).unwrap();
         let parsed: LarkConfig = serde_json::from_str(&json).unwrap();
@@ -14515,7 +14511,6 @@ default_model = "persisted-profile"
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
-            platform_type: None,
         };
         let toml_str = toml::to_string(&lc).unwrap();
         let parsed: LarkConfig = toml::from_str(&toml_str).unwrap();
@@ -14563,7 +14558,6 @@ default_model = "persisted-profile"
             receive_mode: LarkReceiveMode::Websocket,
             port: None,
             proxy_url: None,
-            platform_type: None,
         };
         let json = serde_json::to_string(&fc).unwrap();
         let parsed: FeishuConfig = serde_json::from_str(&json).unwrap();
@@ -14585,7 +14579,6 @@ default_model = "persisted-profile"
             receive_mode: LarkReceiveMode::Webhook,
             port: Some(9898),
             proxy_url: None,
-            platform_type: None,
         };
         let toml_str = toml::to_string(&fc).unwrap();
         let parsed: FeishuConfig = toml::from_str(&toml_str).unwrap();
@@ -14614,7 +14607,6 @@ default_model = "persisted-profile"
             webhook_secret: Some("webhook-secret".into()),
             allowed_users: vec!["user_a".into(), "*".into()],
             proxy_url: None,
-            platform_type: None,
         };
 
         let json = serde_json::to_string(&nc).unwrap();
