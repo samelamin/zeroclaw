@@ -53,8 +53,7 @@ pub(super) fn require_auth(
 fn error_response(err: &anyhow::Error, context: &str) -> impl IntoResponse {
     let msg = err.to_string().to_lowercase();
 
-    let (status, retry_after, retryable) = if msg.contains("not found") || msg.contains("no such")
-    {
+    let (status, retry_after, retryable) = if msg.contains("not found") || msg.contains("no such") {
         (StatusCode::NOT_FOUND, "0", false)
     } else if msg.contains("rate limit") || msg.contains("too many") {
         (StatusCode::TOO_MANY_REQUESTS, "60", true)

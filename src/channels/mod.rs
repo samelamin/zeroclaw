@@ -2435,12 +2435,15 @@ async fn process_channel_message(
                             sender = %msg.sender,
                             "Message forwarded to webhook"
                         );
-                        resp.json::<serde_json::Value>().await.ok().and_then(|body| {
-                            body.get("reply")
-                                .and_then(|v| v.as_str())
-                                .filter(|s| !s.is_empty())
-                                .map(|s| s.to_string())
-                        })
+                        resp.json::<serde_json::Value>()
+                            .await
+                            .ok()
+                            .and_then(|body| {
+                                body.get("reply")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|s| !s.is_empty())
+                                    .map(|s| s.to_string())
+                            })
                     }
                     Ok(resp) => {
                         tracing::error!(
@@ -2472,8 +2475,7 @@ async fn process_channel_message(
                 if let Some(reply) = webhook_reply {
                     let target_channel = ctx.channels_by_name.get("whatsapp").cloned();
                     if let Some(channel) = target_channel {
-                        let send_msg =
-                            traits::SendMessage::new(reply, msg.reply_target.clone());
+                        let send_msg = traits::SendMessage::new(reply, msg.reply_target.clone());
                         if let Err(e) = channel.send(&send_msg).await {
                             tracing::error!(
                                 channel = "whatsapp",

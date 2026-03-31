@@ -2373,10 +2373,7 @@ enum RecoveryAction {
 /// 1. Microcompact (clear old tool results)
 /// 2. Emergency truncation (drop oldest half of non-system messages)
 /// 3. Give up
-fn recover_prompt_too_long(
-    history: &mut Vec<ChatMessage>,
-    error_msg: &str,
-) -> RecoveryAction {
+fn recover_prompt_too_long(history: &mut Vec<ChatMessage>, error_msg: &str) -> RecoveryAction {
     tracing::warn!("Prompt too long — attempting staged recovery");
 
     // Stage 1: Microcompact
@@ -3075,10 +3072,7 @@ pub(crate) async fn run_tool_call_loop(
 
                 // ── Staged recovery for prompt-too-long errors ──
                 if crate::providers::reliable::is_context_window_exceeded(&e) {
-                    match recover_prompt_too_long(
-                        history,
-                        &safe_error,
-                    ) {
+                    match recover_prompt_too_long(history, &safe_error) {
                         RecoveryAction::Retry => {
                             tracing::info!("Prompt-too-long recovery succeeded, retrying");
                             continue; // retry the LLM call with trimmed history

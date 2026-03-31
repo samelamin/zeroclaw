@@ -12,11 +12,11 @@ pub mod loop_;
 pub mod loop_detector;
 pub mod memory_loader;
 pub mod microcompactor;
-pub mod tool_executor;
 pub mod personality;
 pub mod prompt;
 pub mod thinking;
 pub mod tool_execution;
+pub mod tool_executor;
 
 #[cfg(test)]
 mod tests;

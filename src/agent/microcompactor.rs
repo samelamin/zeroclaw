@@ -72,7 +72,7 @@ const CLEARED_PREFIX: &str = "[Tool result cleared";
 ///
 /// This is idempotent and has zero LLM cost.
 pub fn microcompact(
-    messages: &mut Vec<ChatMessage>,
+    messages: &mut [ChatMessage],
     config: &MicrocompactionConfig,
 ) -> MicrocompactionResult {
     if !config.enabled {
@@ -100,8 +100,7 @@ pub fn microcompact(
     let mut cleared_count: usize = 0;
     let mut chars_reclaimed: usize = 0;
 
-    for i in 0..protection_boundary {
-        let msg = &messages[i];
+    for msg in &mut messages[..protection_boundary] {
         if msg.role != "tool" {
             continue;
         }
@@ -130,7 +129,7 @@ pub fn microcompact(
         chars_reclaimed += reclaimed;
         cleared_count += 1;
 
-        messages[i] = ChatMessage::tool(replacement);
+        *msg = ChatMessage::tool(replacement);
     }
 
     MicrocompactionResult {
@@ -231,7 +230,10 @@ mod tests {
     fn idempotent_skips_already_cleared() {
         let mut messages = vec![
             msg("system", "sys"),
-            msg("tool", "[Tool result cleared \u{2014} was 5000 chars]\npreview..."),
+            msg(
+                "tool",
+                "[Tool result cleared \u{2014} was 5000 chars]\npreview...",
+            ),
             msg("user", "next"),
         ];
         let result = microcompact(&mut messages, &default_config());
