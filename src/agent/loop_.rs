@@ -2697,6 +2697,84 @@ struct ToolExecutionOutcome {
     duration: Duration,
 }
 
+// ── LLM Error Recovery ──────────────────────────────────────────────────
+// Multi-stage recovery for common LLM failures, following Claude Code's
+// pattern of inline recovery in the query loop with extracted helpers.
+
+/// Action to take after a recovery attempt.
+#[derive(Debug)]
+enum RecoveryAction {
+    /// Retry the LLM call with the (possibly modified) history.
+    Retry,
+    /// Give up — surface the error to the caller.
+    GiveUp(String),
+}
+
+/// Attempt staged recovery from a prompt-too-long / context_length_exceeded error.
+///
+/// Stages:
+/// 1. Microcompact (clear old tool results)
+/// 2. Emergency truncation (drop oldest half of non-system messages)
+/// 3. Give up
+fn recover_prompt_too_long(
+    history: &mut Vec<ChatMessage>,
+    error_msg: &str,
+) -> RecoveryAction {
+    tracing::warn!("Prompt too long — attempting staged recovery");
+
+    // Stage 1: Microcompact
+    let mc = crate::agent::microcompactor::microcompact(
+        history,
+        &crate::agent::microcompactor::MicrocompactionConfig {
+            protect_recent_turns: 2, // aggressive: only protect last 2
+            max_result_chars: 200,
+            preview_chars: 100,
+            ..Default::default()
+        },
+    );
+    if mc.cleared_count > 0 {
+        tracing::info!(
+            cleared = mc.cleared_count,
+            reclaimed = mc.chars_reclaimed,
+            "Stage 1 recovery: microcompacted"
+        );
+        return RecoveryAction::Retry;
+    }
+
+    // Stage 2: Emergency truncation — drop oldest half of non-system messages
+    let non_system_start = if history.first().map_or(false, |m| m.role == "system") {
+        1
+    } else {
+        0
+    };
+    let non_system_count = history.len() - non_system_start;
+    if non_system_count > 2 {
+        let drop_count = non_system_count / 2;
+        history.drain(non_system_start..non_system_start + drop_count);
+        tracing::info!(
+            dropped = drop_count,
+            remaining = history.len(),
+            "Stage 2 recovery: emergency truncation"
+        );
+        return RecoveryAction::Retry;
+    }
+
+    // Stage 3: Give up
+    RecoveryAction::GiveUp(format!(
+        "Prompt too long after all recovery stages: {error_msg}"
+    ))
+}
+
+/// Build a continuation prompt for max-output-tokens truncation recovery.
+#[allow(dead_code)]
+fn build_continuation_prompt(truncated_response: &str) -> ChatMessage {
+    ChatMessage::user(format!(
+        "Your previous response was truncated. Here is what you wrote so far:\n\n\
+         {truncated_response}\n\n\
+         Please continue exactly from where you left off."
+    ))
+}
+
 fn should_execute_tools_in_parallel(
     tool_calls: &[ParsedToolCall],
     approval: Option<&ApprovalManager>,
@@ -3268,6 +3346,23 @@ pub(crate) async fn run_tool_call_loop(
                         "duration_ms": llm_started_at.elapsed().as_millis(),
                     }),
                 );
+
+                // ── Staged recovery for prompt-too-long errors ──
+                if crate::providers::reliable::is_context_window_exceeded(&e) {
+                    match recover_prompt_too_long(
+                        history,
+                        &safe_error,
+                    ) {
+                        RecoveryAction::Retry => {
+                            tracing::info!("Prompt-too-long recovery succeeded, retrying");
+                            continue; // retry the LLM call with trimmed history
+                        }
+                        RecoveryAction::GiveUp(msg) => {
+                            return Err(anyhow::anyhow!("{msg}"));
+                        }
+                    }
+                }
+
                 return Err(e);
             }
         };
