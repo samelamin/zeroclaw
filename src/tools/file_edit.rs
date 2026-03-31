@@ -326,10 +326,8 @@ pub async fn cleanup_old_backups(workspace_dir: &std::path::Path, max_age: std::
             Err(_) => continue,
         };
         if let Ok(age) = now.duration_since(modified) {
-            if age > max_age {
-                if tokio::fs::remove_file(entry.path()).await.is_ok() {
-                    removed += 1;
-                }
+            if age > max_age && tokio::fs::remove_file(entry.path()).await.is_ok() {
+                removed += 1;
             }
         }
     }
@@ -990,7 +988,9 @@ mod tests {
 
         // Create a "backup" file
         let backup_file = backup_dir.join("test.abc123");
-        tokio::fs::write(&backup_file, "old backup content").await.unwrap();
+        tokio::fs::write(&backup_file, "old backup content")
+            .await
+            .unwrap();
 
         // With max_age of 0, everything is "old"
         super::cleanup_old_backups(tmp.path(), std::time::Duration::from_secs(0)).await;
@@ -1005,7 +1005,9 @@ mod tests {
         tokio::fs::create_dir_all(&backup_dir).await.unwrap();
 
         let backup_file = backup_dir.join("test.abc123");
-        tokio::fs::write(&backup_file, "recent backup").await.unwrap();
+        tokio::fs::write(&backup_file, "recent backup")
+            .await
+            .unwrap();
 
         // With max_age of 1 hour, recent files should be kept
         super::cleanup_old_backups(tmp.path(), std::time::Duration::from_secs(3600)).await;

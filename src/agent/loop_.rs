@@ -2789,12 +2789,7 @@ impl ToolResultCache {
     }
 
     /// Store a result. Only stores results from cacheable tools.
-    fn put(
-        &mut self,
-        tool_name: &str,
-        args: &serde_json::Value,
-        outcome: ToolExecutionOutcome,
-    ) {
+    fn put(&mut self, tool_name: &str, args: &serde_json::Value, outcome: ToolExecutionOutcome) {
         if Self::is_cacheable(tool_name) {
             let key = (tool_name.to_string(), args.to_string());
             self.entries.insert(key, outcome);
@@ -2918,9 +2913,7 @@ fn should_execute_tools_in_parallel(
             std::collections::HashMap::new();
         for call in tool_calls {
             if let Some(path) = call.arguments.get("path").and_then(|v| v.as_str()) {
-                if call.name == "file_write"
-                    || call.name == "file_edit"
-                    || call.name == "file_read"
+                if call.name == "file_write" || call.name == "file_edit" || call.name == "file_read"
                 {
                     *file_paths.entry(path).or_insert(0) += 1;
                 }
@@ -2930,9 +2923,7 @@ fn should_execute_tools_in_parallel(
             .iter()
             .any(|c| c.name == "file_write" || c.name == "file_edit");
         if has_write && file_paths.values().any(|&count| count > 1) {
-            tracing::debug!(
-                "File dependency detected in parallel batch — forcing sequential"
-            );
+            tracing::debug!("File dependency detected in parallel batch — forcing sequential");
             return false;
         }
     }
