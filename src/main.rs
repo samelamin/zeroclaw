@@ -274,6 +274,30 @@ Examples:
         session_timeout: Option<u64>,
     },
 
+    /// Start MCP server (Model Context Protocol)
+    #[command(long_about = "\
+Start the MCP server for tool integration.
+
+Exposes ZeroClaw's tools over the Model Context Protocol (MCP), \
+following Claude Code's pattern. Use stdio for local IDE integration \
+or HTTP for remote clients.
+
+Examples:
+  zeroclaw mcp                        # stdio transport (for Claude Desktop)
+  zeroclaw mcp --http                 # HTTP+SSE transport
+  zeroclaw mcp --http --port 8080     # custom port")]
+    Mcp {
+        /// Use HTTP+SSE transport instead of stdio
+        #[arg(long)]
+        http: bool,
+        /// Port for HTTP transport
+        #[arg(long, default_value = "3000")]
+        port: u16,
+        /// Enable debug logging
+        #[arg(long)]
+        debug: bool,
+    },
+
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
     #[command(long_about = "\
 Start the long-running autonomous daemon.
@@ -1044,6 +1068,26 @@ async fn main() -> Result<()> {
             }
             let server = channels::acp_server::AcpServer::new(config, acp_config);
             server.run().await
+        }
+
+        Commands::Mcp { http, port, debug } => {
+            let mcp_config = zeroclaw::mcp_server::McpServerConfig {
+                transport: if http {
+                    zeroclaw::mcp_server::TransportMode::Http
+                } else {
+                    zeroclaw::mcp_server::TransportMode::Stdio
+                },
+                port,
+                api_key: std::env::var("MCP_API_KEY").ok(),
+                debug,
+                workspace_dir: config
+                    .config_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from(".")),
+            };
+            zeroclaw::mcp_server::serve(mcp_config).await?;
+            Ok(())
         }
 
         Commands::Gateway { gateway_command } => {

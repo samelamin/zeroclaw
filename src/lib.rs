@@ -58,6 +58,7 @@ pub mod hooks;
 pub mod i18n;
 pub(crate) mod identity;
 pub(crate) mod integrations;
+pub mod mcp_server;
 pub mod memory;
 pub(crate) mod migration;
 pub(crate) mod multimodal;
