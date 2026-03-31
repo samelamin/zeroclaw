@@ -69,6 +69,7 @@ impl CircuitBreaker {
     /// Record a failed call — increments failure counter and updates timestamp.
     pub fn record_failure(&self) {
         self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+        #[allow(clippy::cast_possible_truncation)] // millis since epoch fits u64 for ~584M years
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -92,6 +93,7 @@ impl CircuitBreaker {
         let last = self.last_failure_epoch_ms.load(Ordering::Relaxed);
         #[cfg(not(target_has_atomic = "64"))]
         let last = self.last_failure_epoch_ms.load(Ordering::Relaxed) as u64;
+        #[allow(clippy::cast_possible_truncation)]
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()

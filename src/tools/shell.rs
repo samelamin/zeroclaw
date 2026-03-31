@@ -167,9 +167,9 @@ impl ShellTool {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let mut child = cmd.spawn().map_err(|e| {
-            anyhow::anyhow!("Failed to spawn command: {e}")
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("Failed to spawn command: {e}"))?;
 
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
@@ -208,15 +208,12 @@ impl ShellTool {
 
         // ── Wait with timeout ──────────────────────────────────
         let timeout_secs = self.timeout_secs;
-        let result = tokio::time::timeout(
-            Duration::from_secs(timeout_secs),
-            async {
-                let stdout_out = stdout_task.await.unwrap_or_default();
-                let stderr_out = stderr_task.await.unwrap_or_default();
-                let status = child.wait().await?;
-                Ok::<_, anyhow::Error>((status, stdout_out, stderr_out))
-            },
-        )
+        let result = tokio::time::timeout(Duration::from_secs(timeout_secs), async {
+            let stdout_out = stdout_task.await.unwrap_or_default();
+            let stderr_out = stderr_task.await.unwrap_or_default();
+            let status = child.wait().await?;
+            Ok::<_, anyhow::Error>((status, stdout_out, stderr_out))
+        })
         .await;
 
         match result {

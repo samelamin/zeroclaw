@@ -121,8 +121,9 @@ pub fn estimate_complexity(message: &str) -> u32 {
     }
 
     // Multiple questions or requirements increase complexity
-    let question_marks = message.chars().filter(|c| *c == '?').count();
-    score += (question_marks as u32).min(3) * 5;
+    let question_marks =
+        u32::try_from(message.chars().filter(|c| *c == '?').count()).unwrap_or(u32::MAX);
+    score += question_marks.min(3) * 5;
 
     // Code blocks suggest complexity
     if message.contains("```") {
