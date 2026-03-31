@@ -181,7 +181,9 @@ impl Tool for FileEditTool {
             });
         }
 
-        // ── 9. Read → match → replace → write ─────────────────────
+        // ── 9. Read → match → replace → write (with safety) ──────────
+
+        // 9a. Read file and capture baseline for staleness detection
         let content = match tokio::fs::read_to_string(&resolved_target).await {
             Ok(c) => c,
             Err(e) => {
@@ -193,6 +195,13 @@ impl Tool for FileEditTool {
             }
         };
 
+        let pre_hash = blake3::hash(content.as_bytes());
+        let pre_mtime = tokio::fs::metadata(&resolved_target)
+            .await
+            .ok()
+            .and_then(|m| m.modified().ok());
+
+        // 9b. Match
         let match_count = content.matches(old_string).count();
 
         if match_count == 0 {
@@ -215,20 +224,75 @@ impl Tool for FileEditTool {
 
         let new_content = content.replacen(old_string, new_string, 1);
 
-        match tokio::fs::write(&resolved_target, &new_content).await {
-            Ok(()) => Ok(ToolResult {
-                success: true,
-                output: format!(
-                    "Edited {path}: replaced 1 occurrence ({} bytes)",
-                    new_content.len()
-                ),
-                error: None,
-            }),
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("Failed to write file: {e}")),
-            }),
+        // 9c. Staleness check — re-stat before writing
+        if let Some(pre_mt) = pre_mtime {
+            if let Ok(meta) = tokio::fs::metadata(&resolved_target).await {
+                if let Ok(post_mt) = meta.modified() {
+                    if post_mt != pre_mt {
+                        // mtime changed — verify content hash
+                        if let Ok(current) = tokio::fs::read_to_string(&resolved_target).await {
+                            if blake3::hash(current.as_bytes()) != pre_hash {
+                                return Ok(ToolResult {
+                                    success: false,
+                                    output: String::new(),
+                                    error: Some(
+                                        "File was modified by another process since read \u{2014} aborting edit to avoid data loss"
+                                            .into(),
+                                    ),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 9d. Best-effort backup (content-hash keyed)
+        {
+            let backup_dir = self.security.workspace_dir.join(".zeroclaw").join("backups");
+            if let Ok(()) = tokio::fs::create_dir_all(&backup_dir).await {
+                let hex_hash = pre_hash.to_hex();
+                let file_name = resolved_target
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy();
+                let backup_name = format!("{file_name}.{}", &hex_hash[..12]);
+                let _ = tokio::fs::copy(&resolved_target, backup_dir.join(&backup_name)).await;
+            }
+        }
+
+        // 9e. Atomic write: temp file + rename
+        let tmp_path = resolved_target.with_extension("zeroclaw-edit-tmp");
+        match tokio::fs::write(&tmp_path, &new_content).await {
+            Ok(()) => {
+                match tokio::fs::rename(&tmp_path, &resolved_target).await {
+                    Ok(()) => Ok(ToolResult {
+                        success: true,
+                        output: format!(
+                            "Edited {path}: replaced 1 occurrence ({} bytes)",
+                            new_content.len()
+                        ),
+                        error: None,
+                    }),
+                    Err(e) => {
+                        // Rename failed — clean up temp file
+                        let _ = tokio::fs::remove_file(&tmp_path).await;
+                        Ok(ToolResult {
+                            success: false,
+                            output: String::new(),
+                            error: Some(format!("Failed to write file (atomic rename): {e}")),
+                        })
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp_path).await;
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to write file: {e}")),
+                })
+            }
         }
     }
 }
@@ -810,5 +874,69 @@ mod tests {
             .contains("runtime config/state file"));
 
         let _ = tokio::fs::remove_dir_all(&root).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_creates_backup() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_backup");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("test.txt"), "original content here")
+            .await
+            .unwrap();
+
+        let tool = FileEditTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({
+                "path": "test.txt",
+                "old_string": "original content",
+                "new_string": "new content"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success, "edit should succeed: {:?}", result.error);
+
+        // Verify backup was created
+        let backup_dir = dir.join(".zeroclaw").join("backups");
+        assert!(backup_dir.exists(), "backup directory should exist");
+        let mut entries = tokio::fs::read_dir(&backup_dir).await.unwrap();
+        let entry = entries.next_entry().await.unwrap();
+        assert!(entry.is_some(), "backup file should exist");
+
+        // Verify the backup contains the original content
+        let backup_path = entry.unwrap().path();
+        let backup_content = tokio::fs::read_to_string(&backup_path).await.unwrap();
+        assert_eq!(backup_content, "original content here");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn file_edit_atomic_write_no_temp_left() {
+        let dir = std::env::temp_dir().join("zeroclaw_test_file_edit_atomic_cleanup");
+        let _ = tokio::fs::remove_dir_all(&dir).await;
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        tokio::fs::write(dir.join("test.txt"), "hello world")
+            .await
+            .unwrap();
+
+        let tool = FileEditTool::new(test_security(dir.clone()));
+        let result = tool
+            .execute(json!({
+                "path": "test.txt",
+                "old_string": "hello",
+                "new_string": "goodbye"
+            }))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+
+        // Verify no temp file left behind
+        let tmp_path = dir.join("test.zeroclaw-edit-tmp");
+        assert!(!tmp_path.exists(), "temp file should be cleaned up");
+
+        let _ = tokio::fs::remove_dir_all(&dir).await;
     }
 }
