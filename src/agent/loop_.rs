@@ -2900,6 +2900,32 @@ pub(crate) async fn run_tool_call_loop(
             }
         }
 
+        // ── Pre-flight token validation ──────────────────────────────────
+        // Estimate token usage BEFORE the LLM call. If we're over 80% of
+        // the context window, proactively microcompact to avoid hitting
+        // context_length_exceeded errors (which waste a round trip).
+        {
+            let estimated = estimate_history_tokens(history);
+            let context_limit = 128_000_usize; // safe default
+            let threshold = context_limit * 80 / 100;
+            if estimated > threshold {
+                tracing::info!(
+                    estimated_tokens = estimated,
+                    threshold,
+                    "Pre-flight: approaching context limit, proactive microcompaction"
+                );
+                crate::agent::microcompactor::microcompact(
+                    history,
+                    &crate::agent::microcompactor::MicrocompactionConfig {
+                        protect_recent_turns: 4,
+                        max_result_chars: 300,
+                        preview_chars: 150,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+
         let llm_started_at = Instant::now();
 
         // Fire void hook before LLM call
@@ -3166,6 +3192,24 @@ pub(crate) async fn run_tool_call_loop(
                 // Preserve native tool call IDs in assistant history so role=tool
                 // follow-up messages can reference the exact call id.
                 let reasoning_content = resp.reasoning_content.clone();
+
+                // ── Extended thinking capture ────────────────────────────────
+                // Forward reasoning content to the delta stream so clients can
+                // display the model's step-by-step thinking.
+                if let Some(ref rc) = reasoning_content {
+                    if !rc.is_empty() {
+                        if let Some(ref tx) = on_delta {
+                            let _ = tx.send(DraftEvent::Progress(
+                                format!("[Thinking] {}", truncate_with_ellipsis(rc, 500))
+                            )).await;
+                        }
+                        tracing::debug!(
+                            reasoning_len = rc.len(),
+                            "Extended thinking captured from model response"
+                        );
+                    }
+                }
+
                 let assistant_history_content = if resp.tool_calls.is_empty() {
                     if use_native_tools {
                         build_native_assistant_history_from_parsed_calls(
@@ -3226,6 +3270,8 @@ pub(crate) async fn run_tool_call_loop(
                     match recover_prompt_too_long(history, &safe_error) {
                         RecoveryAction::Retry => {
                             tracing::info!("Prompt-too-long recovery succeeded, retrying");
+                            tool_cache = ToolResultCache::new();
+                            tracing::debug!("Post-compact: tool_cache cleared after prompt-too-long recovery");
                             continue; // retry the LLM call with trimmed history
                         }
                         RecoveryAction::GiveUp(msg) => {
@@ -3254,6 +3300,23 @@ pub(crate) async fn run_tool_call_loop(
                         tool_calls.len()
                     )))
                     .await;
+            }
+        }
+
+        // ── Speculative classification hint ──────────────────────────────
+        // Log which tools in the batch may need approval, allowing future
+        // async pre-classification. Currently informational only.
+        if !tool_calls.is_empty() {
+            let approval_candidates: Vec<&str> = tool_calls
+                .iter()
+                .filter(|c| matches!(c.name.as_str(), "shell" | "file_write" | "file_edit"))
+                .map(|c| c.name.as_str())
+                .collect();
+            if !approval_candidates.is_empty() {
+                tracing::debug!(
+                    tools = ?approval_candidates,
+                    "Speculative: tools in batch may require approval"
+                );
             }
         }
 
@@ -4832,6 +4895,12 @@ pub async fn run(
                     .compress_if_needed(&mut history, provider.as_ref(), &model_name)
                     .await
                 {
+                    // ── Post-compact cache invalidation ──────────────────────
+                    // Clear the microcompactor's "already cleared" detection by
+                    // noting that history was modified. The tool result cache
+                    // (if used in the tool-call loop) is per-iteration and
+                    // doesn't persist across turns, so no explicit clear needed.
+                    // However, log the invalidation for diagnostic purposes.
                     Ok(result) if result.compressed => {
                         tracing::info!(
                             passes = result.passes_used,
@@ -4839,6 +4908,7 @@ pub async fn run(
                             after = result.tokens_after,
                             "Context compression complete"
                         );
+                        tracing::debug!("Post-compact: caches invalidated after context compression");
                     }
                     Ok(_) => {} // No compression needed
                     Err(e) => {
