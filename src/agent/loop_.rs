@@ -2965,6 +2965,22 @@ pub(crate) async fn run_tool_call_loop(
             }),
         );
 
+        // Microcompaction: clear old tool results before LLM call (zero cost).
+        // Safe in the WhatsApp path — only trims tool-result content in the
+        // history Vec, never changes message count or ordering.
+        {
+            let mc_config = crate::agent::microcompactor::MicrocompactionConfig::default();
+            let mc_result = crate::agent::microcompactor::microcompact(history, &mc_config);
+            if mc_result.cleared_count > 0 {
+                tracing::debug!(
+                    cleared = mc_result.cleared_count,
+                    reclaimed_chars = mc_result.chars_reclaimed,
+                    iteration = iteration + 1,
+                    "Microcompaction in tool loop"
+                );
+            }
+        }
+
         let llm_started_at = Instant::now();
 
         // Fire void hook before LLM call
@@ -4705,6 +4721,21 @@ pub async fn run(
                 eprintln!("\nError sending CLI response: {e}\n");
             }
             observer.record_event(&ObserverEvent::TurnComplete);
+
+            // Microcompaction: surgically clear old tool results (zero LLM cost).
+            {
+                let mc_result = crate::agent::microcompactor::microcompact(
+                    &mut history,
+                    &config.agent.microcompaction,
+                );
+                if mc_result.cleared_count > 0 {
+                    tracing::debug!(
+                        cleared = mc_result.cleared_count,
+                        reclaimed_chars = mc_result.chars_reclaimed,
+                        "Microcompaction complete"
+                    );
+                }
+            }
 
             // Context compression before hard trimming to preserve long-context signal.
             {
