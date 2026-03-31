@@ -115,6 +115,9 @@ hex = "0.4"
 # CSPRNG for secure token generation
 rand = "0.10"
 
+# Fast cryptographic hash for content hashing
+blake3 = "1"
+
 # Portable atomic fallbacks for targets without native 64-bit atomics
 portable-atomic = "1"
 
