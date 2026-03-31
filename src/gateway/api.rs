@@ -44,6 +44,40 @@ pub(super) fn require_auth(
     }
 }
 
+// ── Error Classification ────────────────────────────────────────────
+// Maps anyhow::Error to appropriate HTTP status codes with retry hints.
+// Only applies to /api/* routes. Webhook handlers (WhatsApp, Telegram, etc.)
+// in mod.rs have their own error handling and are NOT affected.
+
+/// Classify an error into an HTTP response with appropriate status code.
+fn error_response(err: &anyhow::Error, context: &str) -> impl IntoResponse {
+    let msg = err.to_string().to_lowercase();
+
+    let (status, retry_after, retryable) = if msg.contains("not found") || msg.contains("no such")
+    {
+        (StatusCode::NOT_FOUND, "0", false)
+    } else if msg.contains("rate limit") || msg.contains("too many") {
+        (StatusCode::TOO_MANY_REQUESTS, "60", true)
+    } else if msg.contains("invalid") || msg.contains("bad request") {
+        (StatusCode::BAD_REQUEST, "0", false)
+    } else if msg.contains("busy") || msg.contains("in progress") {
+        (StatusCode::CONFLICT, "5", true)
+    } else if msg.contains("upstream") || msg.contains("provider") || msg.contains("api error") {
+        (StatusCode::BAD_GATEWAY, "10", true)
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, "0", false)
+    };
+
+    (
+        status,
+        [(header::HeaderName::from_static("retry-after"), retry_after)],
+        Json(serde_json::json!({
+            "error": format!("{context}: {err}"),
+            "retryable": retryable,
+        })),
+    )
+}
+
 // ── Query parameters ─────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -142,11 +176,7 @@ pub async fn handle_api_config_get(
     let toml_str = match toml::to_string_pretty(&masked_config) {
         Ok(s) => s,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to serialize config: {e}")})),
-            )
-                .into_response();
+            return error_response(&e.into(), "Failed to serialize config").into_response();
         }
     };
 
@@ -192,11 +222,7 @@ pub async fn handle_api_config_put(
 
     // Save to disk
     if let Err(e) = new_config.save().await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
-        )
-            .into_response();
+        return error_response(&e, "Failed to save config").into_response();
     }
 
     // Update in-memory config
@@ -241,11 +267,7 @@ pub async fn handle_api_cron_list(
     let config = state.config.lock().clone();
     match crate::cron::list_jobs(&config) {
         Ok(jobs) => Json(serde_json::json!({"jobs": jobs})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to list cron jobs: {e}")})),
-        )
-            .into_response(),
+        Err(e) => error_response(&e, "Failed to list cron jobs").into_response(),
     }
 }
 
@@ -337,11 +359,7 @@ pub async fn handle_api_cron_add(
 
     match result {
         Ok(job) => Json(serde_json::json!({"status": "ok", "job": job})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to add cron job: {e}")})),
-        )
-            .into_response(),
+        Err(e) => error_response(&e, "Failed to add cron job").into_response(),
     }
 }
 
@@ -386,11 +404,7 @@ pub async fn handle_api_cron_runs(
                 .collect();
             Json(serde_json::json!({"runs": runs_json})).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to list cron runs: {e}")})),
-        )
-            .into_response(),
+        Err(e) => error_response(&e, "Failed to list cron runs").into_response(),
     }
 }
 
@@ -446,11 +460,7 @@ pub async fn handle_api_cron_patch(
 
     match crate::cron::update_shell_job_with_approval(&config, &id, patch, false) {
         Ok(job) => Json(serde_json::json!({"status": "ok", "job": job})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to update cron job: {e}")})),
-        )
-            .into_response(),
+        Err(e) => error_response(&e, "Failed to update cron job").into_response(),
     }
 }
 
@@ -467,11 +477,7 @@ pub async fn handle_api_cron_delete(
     let config = state.config.lock().clone();
     match crate::cron::remove_job(&config, &id) {
         Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to remove cron job: {e}")})),
-        )
-            .into_response(),
+        Err(e) => error_response(&e, "Failed to remove cron job").into_response(),
     }
 }
 
@@ -516,11 +522,7 @@ pub async fn handle_api_cron_settings_patch(
     }
 
     if let Err(e) = config.save().await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
-        )
-            .into_response();
+        return error_response(&e, "Failed to save config").into_response();
     }
 
     *state.config.lock() = config.clone();
@@ -644,11 +646,7 @@ pub async fn handle_api_memory_list(
         let until = params.until.as_deref();
         match state.mem.recall(query, 50, None, since, until).await {
             Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Memory recall failed: {e}")})),
-            )
-                .into_response(),
+            Err(e) => error_response(&e, "Memory recall failed").into_response(),
         }
     } else {
         // List mode
@@ -661,11 +659,7 @@ pub async fn handle_api_memory_list(
 
         match state.mem.list(category.as_ref(), None).await {
             Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Memory list failed: {e}")})),
-            )
-                .into_response(),
+            Err(e) => error_response(&e, "Memory list failed").into_response(),
         }
     }
 }
@@ -697,11 +691,7 @@ pub async fn handle_api_memory_store(
         .await
     {
         Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Memory store failed: {e}")})),
-        )
-            .into_response(),
+        Err(e) => error_response(&e, "Memory store failed").into_response(),
     }
 }
 
@@ -719,11 +709,7 @@ pub async fn handle_api_memory_delete(
         Ok(deleted) => {
             Json(serde_json::json!({"status": "ok", "deleted": deleted})).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Memory forget failed: {e}")})),
-        )
-            .into_response(),
+        Err(e) => error_response(&e, "Memory forget failed").into_response(),
     }
 }
 
@@ -739,11 +725,7 @@ pub async fn handle_api_cost(
     if let Some(ref tracker) = state.cost_tracker {
         match tracker.get_summary() {
             Ok(summary) => Json(serde_json::json!({"cost": summary})).into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Cost summary failed: {e}")})),
-            )
-                .into_response(),
+            Err(e) => error_response(&e, "Cost summary failed").into_response(),
         }
     } else {
         Json(serde_json::json!({
@@ -1322,11 +1304,7 @@ pub async fn handle_api_session_delete(
             Json(serde_json::json!({"error": "Session not found"})),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to delete session: {e}")})),
-        )
-            .into_response(),
+        Err(e) => error_response(&anyhow::anyhow!(e), "Failed to delete session").into_response(),
     }
 }
 
@@ -1372,11 +1350,7 @@ pub async fn handle_api_session_rename(
 
     match backend.set_session_name(&session_key, name) {
         Ok(()) => Json(serde_json::json!({"session_id": id, "name": name})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to rename session: {e}")})),
-        )
-            .into_response(),
+        Err(e) => error_response(&anyhow::anyhow!(e), "Failed to rename session").into_response(),
     }
 }
 
