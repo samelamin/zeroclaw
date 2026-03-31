@@ -77,6 +77,194 @@ impl ShellTool {
         self.timeout_secs = secs;
         self
     }
+
+    /// Execute a shell command with line-by-line stdout streaming.
+    ///
+    /// Each line of stdout is sent to `progress_tx` as it arrives, giving
+    /// callers real-time visibility into long-running commands. The full
+    /// output is still collected and returned in `ToolResult`.
+    ///
+    /// Security checks (rate-limit, command validation, forbidden paths,
+    /// sandbox wrapping, and environment sanitisation) are identical to
+    /// the `Tool::execute` implementation.
+    pub async fn execute_streaming(
+        &self,
+        args: serde_json::Value,
+        progress_tx: tokio::sync::mpsc::Sender<String>,
+    ) -> anyhow::Result<ToolResult> {
+        let command = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow::anyhow!("Missing 'command' parameter"))?;
+        let approved = args
+            .get("approved")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // ── Security gates (same as execute) ───────────────────
+        if self.security.is_rate_limited() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: too many actions in the last hour".into()),
+            });
+        }
+
+        match self.security.validate_command_execution(command, approved) {
+            Ok(_) => {}
+            Err(reason) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(reason),
+                });
+            }
+        }
+
+        if let Some(path) = self.security.forbidden_path_argument(command) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!("Path blocked by security policy: {path}")),
+            });
+        }
+
+        if !self.security.record_action() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("Rate limit exceeded: action budget exhausted".into()),
+            });
+        }
+
+        // ── Build command (same as execute) ────────────────────
+        let mut cmd = match self
+            .runtime
+            .build_shell_command(command, &self.security.workspace_dir)
+        {
+            Ok(cmd) => cmd,
+            Err(e) => {
+                return Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("Failed to build runtime command: {e}")),
+                });
+            }
+        };
+
+        self.sandbox
+            .wrap_command(cmd.as_std_mut())
+            .map_err(|e| anyhow::anyhow!("Sandbox error: {}", e))?;
+
+        cmd.env_clear();
+        for var in collect_allowed_shell_env_vars(&self.security) {
+            if let Ok(val) = std::env::var(&var) {
+                cmd.env(&var, val);
+            }
+        }
+
+        // ── Spawn with piped stdout/stderr ─────────────────────
+        cmd.stdout(std::process::Stdio::piped());
+        cmd.stderr(std::process::Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!("Failed to spawn command: {e}")
+        })?;
+
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        // Stream stdout lines via progress channel
+        let progress_tx_clone = progress_tx.clone();
+        let stdout_task = tokio::spawn(async move {
+            let mut output = String::new();
+            if let Some(stdout) = stdout {
+                use tokio::io::{AsyncBufReadExt, BufReader};
+                let reader = BufReader::new(stdout);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    let _ = progress_tx_clone.send(line.clone()).await;
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+            }
+            output
+        });
+
+        // Capture stderr (no streaming)
+        let stderr_task = tokio::spawn(async move {
+            let mut output = String::new();
+            if let Some(stderr) = stderr {
+                use tokio::io::{AsyncBufReadExt, BufReader};
+                let reader = BufReader::new(stderr);
+                let mut lines = reader.lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    output.push_str(&line);
+                    output.push('\n');
+                }
+            }
+            output
+        });
+
+        // ── Wait with timeout ──────────────────────────────────
+        let timeout_secs = self.timeout_secs;
+        let result = tokio::time::timeout(
+            Duration::from_secs(timeout_secs),
+            async {
+                let stdout_out = stdout_task.await.unwrap_or_default();
+                let stderr_out = stderr_task.await.unwrap_or_default();
+                let status = child.wait().await?;
+                Ok::<_, anyhow::Error>((status, stdout_out, stderr_out))
+            },
+        )
+        .await;
+
+        match result {
+            Ok(Ok((status, stdout_out, stderr_out))) => {
+                let mut stdout = stdout_out;
+                let mut stderr = stderr_out;
+
+                // Truncate to prevent OOM (same limits as execute)
+                if stdout.len() > MAX_OUTPUT_BYTES {
+                    let mut b = MAX_OUTPUT_BYTES.min(stdout.len());
+                    while b > 0 && !stdout.is_char_boundary(b) {
+                        b -= 1;
+                    }
+                    stdout.truncate(b);
+                    stdout.push_str("\n... [output truncated at 1MB]");
+                }
+                if stderr.len() > MAX_OUTPUT_BYTES {
+                    let mut b = MAX_OUTPUT_BYTES.min(stderr.len());
+                    while b > 0 && !stderr.is_char_boundary(b) {
+                        b -= 1;
+                    }
+                    stderr.truncate(b);
+                    stderr.push_str("\n... [stderr truncated at 1MB]");
+                }
+
+                Ok(ToolResult {
+                    success: status.success(),
+                    output: stdout,
+                    error: if stderr.is_empty() {
+                        None
+                    } else {
+                        Some(stderr)
+                    },
+                })
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => {
+                let _ = child.kill().await;
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!(
+                        "Command timed out after {timeout_secs}s and was killed"
+                    )),
+                })
+            }
+        }
+    }
 }
 
 fn is_valid_env_var_name(name: &str) -> bool {
@@ -789,5 +977,47 @@ mod tests {
             .expect("command with sandbox should succeed");
         assert!(result.success);
         assert!(result.output.contains("sandbox_test"));
+    }
+
+    // ── Streaming execution tests ───────────────────────
+
+    #[tokio::test]
+    async fn shell_streaming_captures_output() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let args = json!({"command": "echo hello && echo world"});
+
+        let result = tool
+            .execute_streaming(args, tx)
+            .await
+            .expect("streaming execution should succeed");
+        assert!(result.success);
+        assert!(result.output.contains("hello"));
+        assert!(result.output.contains("world"));
+
+        // Check that progress messages were sent
+        let mut lines = vec![];
+        while let Ok(line) = rx.try_recv() {
+            lines.push(line);
+        }
+        assert!(
+            lines.len() >= 2,
+            "Should have received at least 2 progress lines, got {}: {:?}",
+            lines.len(),
+            lines
+        );
+    }
+
+    #[tokio::test]
+    async fn shell_streaming_blocks_disallowed_command() {
+        let tool = ShellTool::new(test_security(AutonomyLevel::Supervised), test_runtime());
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let args = json!({"command": "rm -rf /"});
+
+        let result = tool
+            .execute_streaming(args, tx)
+            .await
+            .expect("disallowed streaming command should return a result");
+        assert!(!result.success);
     }
 }
