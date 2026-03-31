@@ -262,6 +262,15 @@ pub(crate) fn scrub_credentials(input: &str) -> String {
 /// Minimum interval between progress sends to avoid flooding the draft channel.
 pub(crate) const PROGRESS_MIN_INTERVAL_MS: u64 = 500;
 
+/// Phase of tool execution for streaming progress.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolPhase {
+    Started,
+    Running,
+    Completed,
+    Failed,
+}
+
 /// Structured event sent through the draft channel so channels can
 /// differentiate between status/progress updates and actual response content.
 #[derive(Debug, Clone)]
@@ -273,6 +282,13 @@ pub enum DraftEvent {
     Progress(String),
     /// Actual response content delta to append to the draft message.
     Content(String),
+    /// Structured tool execution progress — emitted in real-time during tool runs.
+    ToolProgress {
+        tool_name: String,
+        tool_id: String,
+        phase: ToolPhase,
+        detail: Option<String>,
+    },
 }
 
 tokio::task_local! {
@@ -2264,12 +2280,21 @@ async fn execute_one_tool(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
 ) -> Result<ToolExecutionOutcome> {
     let args_summary = truncate_with_ellipsis(&call_arguments.to_string(), 300);
     observer.record_event(&ObserverEvent::ToolCallStart {
         tool: call_name.to_string(),
         arguments: Some(args_summary),
     });
+    if let Some(tx) = on_delta {
+        let _ = tx.send(DraftEvent::ToolProgress {
+            tool_name: call_name.to_string(),
+            tool_id: String::new(),
+            phase: ToolPhase::Started,
+            detail: None,
+        }).await;
+    }
     let start = Instant::now();
 
     let static_tool = find_tool(tools_registry, call_name);
@@ -2312,6 +2337,14 @@ async fn execute_one_tool(
                 duration,
                 success: r.success,
             });
+            if let Some(tx) = on_delta {
+                let _ = tx.send(DraftEvent::ToolProgress {
+                    tool_name: call_name.to_string(),
+                    tool_id: String::new(),
+                    phase: if r.success { ToolPhase::Completed } else { ToolPhase::Failed },
+                    detail: Some(truncate_with_ellipsis(&r.output, 120)),
+                }).await;
+            }
             if r.success {
                 Ok(ToolExecutionOutcome {
                     output: scrub_credentials(&r.output),
@@ -2336,6 +2369,14 @@ async fn execute_one_tool(
                 duration,
                 success: false,
             });
+            if let Some(tx) = on_delta {
+                let _ = tx.send(DraftEvent::ToolProgress {
+                    tool_name: call_name.to_string(),
+                    tool_id: String::new(),
+                    phase: ToolPhase::Failed,
+                    detail: Some(truncate_with_ellipsis(&e.to_string(), 120)),
+                }).await;
+            }
             let reason = format!("Error executing {call_name}: {e}");
             Ok(ToolExecutionOutcome {
                 output: reason.clone(),
@@ -2467,6 +2508,7 @@ async fn execute_tools_parallel(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let futures: Vec<_> = tool_calls
         .iter()
@@ -2478,6 +2520,7 @@ async fn execute_tools_parallel(
                 activated_tools,
                 observer,
                 cancellation_token,
+                on_delta,
             )
         })
         .collect();
@@ -2492,6 +2535,7 @@ async fn execute_tools_sequential(
     activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     observer: &dyn Observer,
     cancellation_token: Option<&CancellationToken>,
+    on_delta: Option<&tokio::sync::mpsc::Sender<DraftEvent>>,
 ) -> Result<Vec<ToolExecutionOutcome>> {
     let mut outcomes = Vec::with_capacity(tool_calls.len());
 
@@ -2504,6 +2548,7 @@ async fn execute_tools_sequential(
                 activated_tools,
                 observer,
                 cancellation_token,
+                on_delta,
             )
             .await?,
         );
@@ -3419,6 +3464,7 @@ pub(crate) async fn run_tool_call_loop(
                 activated_tools,
                 observer,
                 cancellation_token.as_ref(),
+                on_delta.as_ref(),
             )
             .await?
         } else {
@@ -3428,6 +3474,7 @@ pub(crate) async fn run_tool_call_loop(
                 activated_tools,
                 observer,
                 cancellation_token.as_ref(),
+                on_delta.as_ref(),
             )
             .await?
         };
@@ -4502,6 +4549,7 @@ pub async fn run(
                             print!("{text}");
                             let _ = std::io::stdout().flush();
                         }
+                        DraftEvent::ToolProgress { .. } => {}
                     }
                 }
             });
@@ -5396,7 +5444,7 @@ mod tests {
 
         let observer = NoopObserver;
         let result =
-            execute_one_tool("unknown_tool", call_arguments, &[], None, &observer, None).await;
+            execute_one_tool("unknown_tool", call_arguments, &[], None, &observer, None, None).await;
         assert!(result.is_ok(), "execute_one_tool should not panic or error");
 
         let outcome = result.unwrap();
@@ -5424,6 +5472,7 @@ mod tests {
             &[],
             Some(&activated),
             &observer,
+            None,
             None,
         )
         .await
@@ -7279,7 +7328,7 @@ mod tests {
                 DraftEvent::Clear => {
                     visible_deltas.clear();
                 }
-                DraftEvent::Progress(_) => {}
+                DraftEvent::Progress(_) | DraftEvent::ToolProgress { .. } => {}
                 DraftEvent::Content(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -7350,7 +7399,7 @@ mod tests {
                 DraftEvent::Clear => {
                     visible_deltas.clear();
                 }
-                DraftEvent::Progress(_) => {}
+                DraftEvent::Progress(_) | DraftEvent::ToolProgress { .. } => {}
                 DraftEvent::Content(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -7425,7 +7474,7 @@ mod tests {
                 DraftEvent::Clear => {
                     visible_deltas.clear();
                 }
-                DraftEvent::Progress(_) => {}
+                DraftEvent::Progress(_) | DraftEvent::ToolProgress { .. } => {}
                 DraftEvent::Content(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -7509,7 +7558,7 @@ mod tests {
                 DraftEvent::Clear => {
                     visible_deltas.clear();
                 }
-                DraftEvent::Progress(_) => {}
+                DraftEvent::Progress(_) | DraftEvent::ToolProgress { .. } => {}
                 DraftEvent::Content(text) => {
                     visible_deltas.push_str(&text);
                 }
@@ -9526,7 +9575,7 @@ Let me check the result."#;
             .iter()
             .filter_map(|d| match d {
                 DraftEvent::Progress(t) | DraftEvent::Content(t) => Some(t.as_str()),
-                DraftEvent::Clear => None,
+                DraftEvent::Clear | DraftEvent::ToolProgress { .. } => None,
             })
             .collect();
 
