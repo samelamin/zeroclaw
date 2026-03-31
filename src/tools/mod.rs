@@ -78,6 +78,7 @@ pub mod node_capabilities;
 pub mod node_tool;
 pub mod notion_tool;
 pub mod opencode_cli;
+pub mod output_formatter;
 pub mod pdf_read;
 pub mod pipeline;
 pub mod poll;
