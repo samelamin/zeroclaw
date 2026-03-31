@@ -2420,6 +2420,11 @@ fn recover_prompt_too_long(history: &mut Vec<ChatMessage>, error_msg: &str) -> R
 }
 
 /// Build a continuation prompt for max-output-tokens truncation recovery.
+///
+/// TODO: Wire this into the response path once `stop_reason` / `finish_reason`
+/// is exposed on the chat response. Requires detecting `"length"` stop reason
+/// and injecting the continuation prompt before the next LLM call (up to
+/// MAX_OUTPUT_CONTINUATION_ATTEMPTS times). Currently staged for a follow-up PR.
 #[allow(dead_code)]
 fn build_continuation_prompt(truncated_response: &str) -> ChatMessage {
     ChatMessage::user(format!(
