@@ -301,6 +301,44 @@ impl Tool for FileEditTool {
     }
 }
 
+/// Remove backup files older than the specified duration.
+/// Called best-effort — errors are logged but don't propagate.
+pub async fn cleanup_old_backups(workspace_dir: &std::path::Path, max_age: std::time::Duration) {
+    let backup_dir = workspace_dir.join(".zeroclaw").join("backups");
+    let mut entries = match tokio::fs::read_dir(&backup_dir).await {
+        Ok(e) => e,
+        Err(_) => return, // no backup dir — nothing to clean
+    };
+
+    let now = std::time::SystemTime::now();
+    let mut removed = 0u32;
+
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let metadata = match entry.metadata().await {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = match metadata.modified() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if let Ok(age) = now.duration_since(modified) {
+            if age > max_age {
+                if tokio::fs::remove_file(entry.path()).await.is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+    }
+
+    if removed > 0 {
+        tracing::info!(removed, "Cleaned up old file edit backups");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -942,5 +980,36 @@ mod tests {
         assert!(!tmp_path.exists(), "temp file should be cleaned up");
 
         let _ = tokio::fs::remove_dir_all(&dir).await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_old_backups_removes_stale_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backup_dir = tmp.path().join(".zeroclaw").join("backups");
+        tokio::fs::create_dir_all(&backup_dir).await.unwrap();
+
+        // Create a "backup" file
+        let backup_file = backup_dir.join("test.abc123");
+        tokio::fs::write(&backup_file, "old backup content").await.unwrap();
+
+        // With max_age of 0, everything is "old"
+        super::cleanup_old_backups(tmp.path(), std::time::Duration::from_secs(0)).await;
+
+        assert!(!backup_file.exists(), "Stale backup should be removed");
+    }
+
+    #[tokio::test]
+    async fn cleanup_old_backups_keeps_recent_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let backup_dir = tmp.path().join(".zeroclaw").join("backups");
+        tokio::fs::create_dir_all(&backup_dir).await.unwrap();
+
+        let backup_file = backup_dir.join("test.abc123");
+        tokio::fs::write(&backup_file, "recent backup").await.unwrap();
+
+        // With max_age of 1 hour, recent files should be kept
+        super::cleanup_old_backups(tmp.path(), std::time::Duration::from_secs(3600)).await;
+
+        assert!(backup_file.exists(), "Recent backup should be kept");
     }
 }
