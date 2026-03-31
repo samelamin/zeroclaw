@@ -3,12 +3,12 @@
 //! Supports multiple transports: stdio (spawn local process), HTTP, and SSE.
 
 use std::collections::HashMap;
-#[cfg(not(target_has_atomic = "64"))]
 use std::sync::atomic::AtomicU32;
 #[cfg(target_has_atomic = "64")]
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::json;
@@ -31,6 +31,86 @@ const DEFAULT_TOOL_TIMEOUT_SECS: u64 = 180;
 /// Maximum allowed tool call timeout (seconds) — hard safety ceiling.
 const MAX_TOOL_TIMEOUT_SECS: u64 = 600;
 
+// ── Circuit breaker ───────────────────────────────────────────────────────
+
+/// Circuit breaker for MCP server health tracking.
+/// Tracks consecutive failures and backs off when a server is unhealthy.
+pub(crate) struct CircuitBreaker {
+    consecutive_failures: AtomicU32,
+    #[cfg(target_has_atomic = "64")]
+    last_failure_epoch_ms: AtomicU64,
+    #[cfg(not(target_has_atomic = "64"))]
+    last_failure_epoch_ms: AtomicU32,
+    /// Number of consecutive failures before the circuit opens.
+    failure_threshold: u32,
+    /// Backoff duration in milliseconds after circuit opens.
+    backoff_ms: u64,
+}
+
+impl CircuitBreaker {
+    pub fn new(failure_threshold: u32, backoff_ms: u64) -> Self {
+        Self {
+            consecutive_failures: AtomicU32::new(0),
+            #[cfg(target_has_atomic = "64")]
+            last_failure_epoch_ms: AtomicU64::new(0),
+            #[cfg(not(target_has_atomic = "64"))]
+            last_failure_epoch_ms: AtomicU32::new(0),
+            failure_threshold,
+            backoff_ms,
+        }
+    }
+
+    /// Record a successful call — resets the failure counter.
+    pub fn record_success(&self) {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+    }
+
+    /// Record a failed call — increments failure counter and updates timestamp.
+    pub fn record_failure(&self) {
+        self.consecutive_failures.fetch_add(1, Ordering::Relaxed);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        #[cfg(target_has_atomic = "64")]
+        self.last_failure_epoch_ms.store(now, Ordering::Relaxed);
+        #[cfg(not(target_has_atomic = "64"))]
+        self.last_failure_epoch_ms
+            .store(now as u32, Ordering::Relaxed);
+    }
+
+    /// Check if the circuit is open (server considered unhealthy).
+    /// Returns true if we should skip this server.
+    pub fn is_open(&self) -> bool {
+        let failures = self.consecutive_failures.load(Ordering::Relaxed);
+        if failures < self.failure_threshold {
+            return false;
+        }
+        // Check if backoff period has elapsed
+        #[cfg(target_has_atomic = "64")]
+        let last = self.last_failure_epoch_ms.load(Ordering::Relaxed);
+        #[cfg(not(target_has_atomic = "64"))]
+        let last = self.last_failure_epoch_ms.load(Ordering::Relaxed) as u64;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        // If backoff hasn't elapsed, circuit is still open
+        now.saturating_sub(last) < self.backoff_ms
+    }
+
+    /// Get the number of consecutive failures.
+    pub fn failure_count(&self) -> u32 {
+        self.consecutive_failures.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for CircuitBreaker {
+    fn default() -> Self {
+        Self::new(3, 30_000) // 3 failures, 30s backoff
+    }
+}
+
 // ── Internal server state ──────────────────────────────────────────────────
 
 struct McpServerInner {
@@ -49,6 +129,9 @@ struct McpServerInner {
 #[derive(Clone)]
 pub struct McpServer {
     inner: Arc<Mutex<McpServerInner>>,
+    /// Server name cached outside the mutex for circuit breaker logging.
+    server_name: Arc<String>,
+    circuit_breaker: Arc<CircuitBreaker>,
 }
 
 impl McpServer {
@@ -137,14 +220,17 @@ impl McpServer {
             tools: tool_list.tools,
         };
 
+        let name = inner.config.name.clone();
         tracing::info!(
             "MCP server `{}` connected — {} tool(s) available",
-            inner.config.name,
+            name,
             tool_count
         );
 
         Ok(Self {
             inner: Arc::new(Mutex::new(inner)),
+            server_name: Arc::new(name),
+            circuit_breaker: Arc::new(CircuitBreaker::default()),
         })
     }
 
@@ -164,6 +250,22 @@ impl McpServer {
         tool_name: &str,
         arguments: serde_json::Value,
     ) -> Result<serde_json::Value> {
+        // Check circuit breaker before acquiring the lock.
+        if self.circuit_breaker.is_open() {
+            let failures = self.circuit_breaker.failure_count();
+            tracing::warn!(
+                server = %self.server_name,
+                failures,
+                "MCP server circuit open — skipping call"
+            );
+            return Err(anyhow!(
+                "MCP server '{}' is temporarily unavailable \
+                 (circuit open after {} consecutive failures)",
+                self.server_name,
+                failures
+            ));
+        }
+
         let mut inner = self.inner.lock().await;
         let id = inner.next_id.fetch_add(1, Ordering::Relaxed) as u64;
         let req = JsonRpcRequest::new(
@@ -180,7 +282,7 @@ impl McpServer {
             .unwrap_or(DEFAULT_TOOL_TIMEOUT_SECS)
             .min(MAX_TOOL_TIMEOUT_SECS);
 
-        let resp = timeout(
+        let result = timeout(
             Duration::from_secs(tool_timeout),
             inner.transport.send_and_recv(&req),
         )
@@ -197,11 +299,23 @@ impl McpServer {
                 "MCP server `{}` error during tool call `{tool_name}`",
                 inner.config.name
             )
-        })?;
+        });
 
-        if let Some(err) = resp.error {
-            bail!("MCP tool `{tool_name}` error {}: {}", err.code, err.message);
+        match &result {
+            Ok(resp) if resp.error.is_some() => {
+                self.circuit_breaker.record_failure();
+                let err = resp.error.as_ref().unwrap();
+                bail!("MCP tool `{tool_name}` error {}: {}", err.code, err.message);
+            }
+            Ok(_) => {
+                self.circuit_breaker.record_success();
+            }
+            Err(_) => {
+                self.circuit_breaker.record_failure();
+            }
         }
+
+        let resp = result?;
         Ok(resp.result.unwrap_or(serde_json::Value::Null))
     }
 }
@@ -415,5 +529,57 @@ mod tests {
         assert_eq!(registry.server_count(), 0);
         assert_eq!(registry.tool_count(), 0);
         assert!(registry.is_empty());
+    }
+
+    // ── Circuit breaker tests ─────────────────────────────────────────────
+
+    #[test]
+    fn circuit_breaker_stays_closed_under_threshold() {
+        let cb = CircuitBreaker::new(3, 30_000);
+        cb.record_failure();
+        cb.record_failure();
+        assert!(!cb.is_open());
+    }
+
+    #[test]
+    fn circuit_breaker_opens_at_threshold() {
+        let cb = CircuitBreaker::new(3, 60_000); // long backoff so it stays open
+        cb.record_failure();
+        cb.record_failure();
+        cb.record_failure();
+        assert!(cb.is_open());
+    }
+
+    #[test]
+    fn circuit_breaker_resets_on_success() {
+        let cb = CircuitBreaker::new(3, 60_000);
+        cb.record_failure();
+        cb.record_failure();
+        cb.record_success();
+        assert_eq!(cb.failure_count(), 0);
+        cb.record_failure();
+        cb.record_failure();
+        cb.record_failure();
+        // Now it should be open
+        assert!(cb.is_open());
+    }
+
+    #[test]
+    fn circuit_breaker_closes_after_backoff() {
+        let cb = CircuitBreaker::new(3, 1); // 1ms backoff
+        cb.record_failure();
+        cb.record_failure();
+        cb.record_failure();
+        std::thread::sleep(std::time::Duration::from_millis(10));
+        assert!(!cb.is_open()); // backoff elapsed
+    }
+
+    #[test]
+    fn circuit_breaker_default_values() {
+        let cb = CircuitBreaker::default();
+        assert_eq!(cb.failure_threshold, 3);
+        assert_eq!(cb.backoff_ms, 30_000);
+        assert_eq!(cb.failure_count(), 0);
+        assert!(!cb.is_open());
     }
 }
