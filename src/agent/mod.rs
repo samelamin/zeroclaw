@@ -12,6 +12,7 @@ pub mod memory_loader;
 pub mod microcompactor;
 pub mod personality;
 pub mod prompt;
+pub mod session_state;
 pub mod thinking;
 pub mod tool_executor;
 
