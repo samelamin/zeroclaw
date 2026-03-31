@@ -129,6 +129,36 @@ impl RouterProvider {
         (self.default_index, self.default_model.clone())
     }
 
+    /// Resolve model based on estimated task complexity.
+    /// Low complexity (< 30): use cost-optimized route (cheapest capable model)
+    /// Medium complexity (30-70): use default route
+    /// High complexity (> 70): use default route (most capable)
+    pub fn resolve_by_complexity(
+        &self,
+        complexity: u32,
+        prices: &HashMap<String, ModelPricing>,
+        needs_vision: bool,
+        needs_tools: bool,
+    ) -> Option<(usize, String)> {
+        if complexity < 30 {
+            // Try cost-optimized first for simple tasks
+            let result = self.resolve_cost_optimized(
+                "hint:cost-optimized",
+                prices,
+                needs_vision,
+                needs_tools,
+            );
+            // Only use cost-optimized if it didn't fall back to default
+            if result.1 != self.default_model {
+                tracing::debug!(complexity, "Using cost-optimized model for simple task");
+                return Some(result);
+            }
+        }
+        // For medium/high complexity or if cost-optimized fails, use default
+        tracing::debug!(complexity, "Using default model");
+        None // caller falls through to default provider
+    }
+
     /// Resolve a model parameter to a (provider, actual_model) pair.
     ///
     /// If the model starts with "hint:", look up the hint in the route table.
