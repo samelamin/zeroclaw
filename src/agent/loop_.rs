@@ -2257,6 +2257,258 @@ fn maybe_inject_channel_delivery_defaults(
     }
 }
 
+async fn execute_one_tool(
+    call_name: &str,
+    call_arguments: serde_json::Value,
+    tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<ToolExecutionOutcome> {
+    let args_summary = truncate_with_ellipsis(&call_arguments.to_string(), 300);
+    observer.record_event(&ObserverEvent::ToolCallStart {
+        tool: call_name.to_string(),
+        arguments: Some(args_summary),
+    });
+    let start = Instant::now();
+
+    let static_tool = find_tool(tools_registry, call_name);
+    let activated_arc = if static_tool.is_none() {
+        activated_tools.and_then(|at| at.lock().unwrap().get_resolved(call_name))
+    } else {
+        None
+    };
+    let Some(tool) = static_tool.or(activated_arc.as_deref()) else {
+        let reason = format!("Unknown tool: {call_name}");
+        let duration = start.elapsed();
+        observer.record_event(&ObserverEvent::ToolCall {
+            tool: call_name.to_string(),
+            duration,
+            success: false,
+        });
+        return Ok(ToolExecutionOutcome {
+            output: reason.clone(),
+            success: false,
+            error_reason: Some(scrub_credentials(&reason)),
+            duration,
+        });
+    };
+
+    let tool_future = tool.execute(call_arguments);
+    let tool_result = if let Some(token) = cancellation_token {
+        tokio::select! {
+            () = token.cancelled() => return Err(ToolLoopCancelled.into()),
+            result = tool_future => result,
+        }
+    } else {
+        tool_future.await
+    };
+
+    match tool_result {
+        Ok(r) => {
+            let duration = start.elapsed();
+            observer.record_event(&ObserverEvent::ToolCall {
+                tool: call_name.to_string(),
+                duration,
+                success: r.success,
+            });
+            if r.success {
+                Ok(ToolExecutionOutcome {
+                    output: scrub_credentials(&r.output),
+                    success: true,
+                    error_reason: None,
+                    duration,
+                })
+            } else {
+                let reason = r.error.unwrap_or(r.output);
+                Ok(ToolExecutionOutcome {
+                    output: format!("Error: {reason}"),
+                    success: false,
+                    error_reason: Some(scrub_credentials(&reason)),
+                    duration,
+                })
+            }
+        }
+        Err(e) => {
+            let duration = start.elapsed();
+            observer.record_event(&ObserverEvent::ToolCall {
+                tool: call_name.to_string(),
+                duration,
+                success: false,
+            });
+            let reason = format!("Error executing {call_name}: {e}");
+            Ok(ToolExecutionOutcome {
+                output: reason.clone(),
+                success: false,
+                error_reason: Some(scrub_credentials(&reason)),
+                duration,
+            })
+        }
+    }
+}
+
+struct ToolExecutionOutcome {
+    output: String,
+    success: bool,
+    error_reason: Option<String>,
+    duration: Duration,
+}
+
+// ── LLM Error Recovery ──────────────────────────────────────────────────
+// Multi-stage recovery for common LLM failures, following Claude Code's
+// pattern of inline recovery in the query loop with extracted helpers.
+
+/// Action to take after a recovery attempt.
+#[derive(Debug)]
+enum RecoveryAction {
+    /// Retry the LLM call with the (possibly modified) history.
+    Retry,
+    /// Give up — surface the error to the caller.
+    GiveUp(String),
+}
+
+/// Attempt staged recovery from a prompt-too-long / context_length_exceeded error.
+///
+/// Stages:
+/// 1. Microcompact (clear old tool results)
+/// 2. Emergency truncation (drop oldest half of non-system messages)
+/// 3. Give up
+fn recover_prompt_too_long(
+    history: &mut Vec<ChatMessage>,
+    error_msg: &str,
+) -> RecoveryAction {
+    tracing::warn!("Prompt too long — attempting staged recovery");
+
+    // Stage 1: Microcompact
+    let mc = crate::agent::microcompactor::microcompact(
+        history,
+        &crate::agent::microcompactor::MicrocompactionConfig {
+            protect_recent_turns: 2, // aggressive: only protect last 2
+            max_result_chars: 200,
+            preview_chars: 100,
+            ..Default::default()
+        },
+    );
+    if mc.cleared_count > 0 {
+        tracing::info!(
+            cleared = mc.cleared_count,
+            reclaimed = mc.chars_reclaimed,
+            "Stage 1 recovery: microcompacted"
+        );
+        return RecoveryAction::Retry;
+    }
+
+    // Stage 2: Emergency truncation — drop oldest half of non-system messages
+    let non_system_start = if history.first().map_or(false, |m| m.role == "system") {
+        1
+    } else {
+        0
+    };
+    let non_system_count = history.len() - non_system_start;
+    if non_system_count > 2 {
+        let drop_count = non_system_count / 2;
+        history.drain(non_system_start..non_system_start + drop_count);
+        tracing::info!(
+            dropped = drop_count,
+            remaining = history.len(),
+            "Stage 2 recovery: emergency truncation"
+        );
+        return RecoveryAction::Retry;
+    }
+
+    // Stage 3: Give up
+    RecoveryAction::GiveUp(format!(
+        "Prompt too long after all recovery stages: {error_msg}"
+    ))
+}
+
+/// Build a continuation prompt for max-output-tokens truncation recovery.
+#[allow(dead_code)]
+fn build_continuation_prompt(truncated_response: &str) -> ChatMessage {
+    ChatMessage::user(format!(
+        "Your previous response was truncated. Here is what you wrote so far:\n\n\
+         {truncated_response}\n\n\
+         Please continue exactly from where you left off."
+    ))
+}
+
+fn should_execute_tools_in_parallel(
+    tool_calls: &[ParsedToolCall],
+    approval: Option<&ApprovalManager>,
+) -> bool {
+    if tool_calls.len() <= 1 {
+        return false;
+    }
+
+    // tool_search activates deferred MCP tools into ActivatedToolSet.
+    // Running tool_search in parallel with the tools it activates causes a
+    // race condition where the tool lookup happens before activation completes.
+    // Force sequential execution whenever tool_search is in the batch.
+    if tool_calls.iter().any(|call| call.name == "tool_search") {
+        return false;
+    }
+
+    if let Some(mgr) = approval {
+        if tool_calls.iter().any(|call| mgr.needs_approval(&call.name)) {
+            // Approval-gated calls must keep sequential handling so the caller can
+            // enforce CLI prompt/deny policy consistently.
+            return false;
+        }
+    }
+
+    true
+}
+
+async fn execute_tools_parallel(
+    tool_calls: &[ParsedToolCall],
+    tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<Vec<ToolExecutionOutcome>> {
+    let futures: Vec<_> = tool_calls
+        .iter()
+        .map(|call| {
+            execute_one_tool(
+                &call.name,
+                call.arguments.clone(),
+                tools_registry,
+                activated_tools,
+                observer,
+                cancellation_token,
+            )
+        })
+        .collect();
+
+    let results = futures_util::future::join_all(futures).await;
+    results.into_iter().collect()
+}
+
+async fn execute_tools_sequential(
+    tool_calls: &[ParsedToolCall],
+    tools_registry: &[Box<dyn Tool>],
+    activated_tools: Option<&std::sync::Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    observer: &dyn Observer,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<Vec<ToolExecutionOutcome>> {
+    let mut outcomes = Vec::with_capacity(tool_calls.len());
+
+    for call in tool_calls {
+        outcomes.push(
+            execute_one_tool(
+                &call.name,
+                call.arguments.clone(),
+                tools_registry,
+                activated_tools,
+                observer,
+                cancellation_token,
+            )
+            .await?,
+        );
+    }
+
+    Ok(outcomes)
+}
 // ── Agent Tool-Call Loop ──────────────────────────────────────────────────
 // Core agentic iteration: send conversation to the LLM, parse any tool
 // calls from the response, execute them, append results to history, and
@@ -2821,32 +3073,20 @@ pub(crate) async fn run_tool_call_loop(
                     }),
                 );
 
-                // Context overflow recovery: trim history and retry
+                // ── Staged recovery for prompt-too-long errors ──
                 if crate::providers::reliable::is_context_window_exceeded(&e) {
-                    tracing::warn!(
-                        iteration = iteration + 1,
-                        "Context window exceeded, attempting in-loop recovery"
-                    );
-
-                    // Step 1: fast-trim old tool results (cheap)
-                    let chars_saved = fast_trim_tool_results(history, 4);
-                    if chars_saved > 0 {
-                        tracing::info!(
-                            chars_saved,
-                            "Context recovery: trimmed old tool results, retrying"
-                        );
-                        continue;
+                    match recover_prompt_too_long(
+                        history,
+                        &safe_error,
+                    ) {
+                        RecoveryAction::Retry => {
+                            tracing::info!("Prompt-too-long recovery succeeded, retrying");
+                            continue; // retry the LLM call with trimmed history
+                        }
+                        RecoveryAction::GiveUp(msg) => {
+                            return Err(anyhow::anyhow!("{msg}"));
+                        }
                     }
-
-                    // Step 2: emergency drop oldest non-system messages
-                    let dropped = emergency_history_trim(history, 4);
-                    if dropped > 0 {
-                        tracing::info!(dropped, "Context recovery: dropped old messages, retrying");
-                        continue;
-                    }
-
-                    // Nothing left to trim — truly unrecoverable
-                    tracing::error!("Context overflow unrecoverable: no trimmable messages");
                 }
 
                 return Err(e);
