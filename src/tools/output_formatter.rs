@@ -108,10 +108,13 @@ mod tests {
     #[test]
     fn large_output_truncated() {
         let output = "line\n".repeat(10_000); // way over limit when chars > MAX_OUTPUT_CHARS
-        // Force truncation by using a smaller threshold for testing
-        // Since we can't easily change the const, just verify the function exists
-        // and handles the logic correctly
-        assert!(output.len() < MAX_OUTPUT_CHARS || truncate_output(&output, "test").len() < output.len());
+                                              // Force truncation by using a smaller threshold for testing
+                                              // Since we can't easily change the const, just verify the function exists
+                                              // and handles the logic correctly
+        assert!(
+            output.len() < MAX_OUTPUT_CHARS
+                || truncate_output(&output, "test").len() < output.len()
+        );
     }
 
     #[test]

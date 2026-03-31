@@ -55,20 +55,22 @@ impl ProviderRateLimiter {
         // Check backoff first
         if let Some(until) = inner.backoff_until {
             if now < until {
-                return Err(until - now);
+                return Err(until.saturating_duration_since(now));
             }
             // Backoff expired, clear it
             inner.backoff_until = None;
         }
 
         // Prune old timestamps outside the window
-        let cutoff = now - inner.window;
+        let cutoff = now.checked_sub(inner.window).unwrap_or(now);
         inner.request_times.retain(|t| *t > cutoff);
 
         // Check if under limit
         if inner.request_times.len() >= inner.max_requests as usize {
             let oldest = inner.request_times[0];
-            let wait = inner.window - (now - oldest);
+            let wait = inner
+                .window
+                .saturating_sub(now.saturating_duration_since(oldest));
             return Err(wait);
         }
 
@@ -113,8 +115,10 @@ impl ProviderRateLimiter {
     pub fn stats(&self) -> RateLimiterStats {
         let inner = self.inner.lock().unwrap();
         let now = Instant::now();
-        let cutoff = now - inner.window;
-        let active_requests = inner.request_times.iter().filter(|t| **t > cutoff).count() as u32;
+        let cutoff = now.checked_sub(inner.window).unwrap_or(now);
+        let active_requests =
+            u32::try_from(inner.request_times.iter().filter(|t| **t > cutoff).count())
+                .unwrap_or(u32::MAX);
         RateLimiterStats {
             active_requests,
             max_requests: inner.max_requests,

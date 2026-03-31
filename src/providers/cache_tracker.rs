@@ -53,8 +53,9 @@ impl CacheTracker {
     /// Record token usage from an LLM call and detect cache breaks.
     ///
     /// A cache break is detected when:
-    /// - cache_read_tokens drops by >5% compared to previous turn, OR
-    /// - cache_read_tokens drops by >2000 absolute tokens
+    /// * `cache_read_tokens` drops by >5% compared to previous turn, OR
+    /// * `cache_read_tokens` drops by >2000 absolute tokens
+    ///
     /// AND we had a previous baseline to compare against.
     pub fn record(
         &self,
@@ -94,7 +95,7 @@ impl CacheTracker {
 
         let hit_rate = if inner.total_calls > 1 {
             let hits = inner.total_calls - 1 - inner.total_breaks;
-            (hits as f64 / (inner.total_calls - 1) as f64) * 100.0
+            (f64::from(hits) / f64::from(inner.total_calls - 1)) * 100.0
         } else {
             100.0
         };
@@ -118,7 +119,7 @@ impl CacheTracker {
         let inner = self.inner.lock().unwrap();
         if inner.total_calls > 1 {
             let hits = inner.total_calls - 1 - inner.total_breaks;
-            (hits as f64 / (inner.total_calls - 1) as f64) * 100.0
+            (f64::from(hits) / f64::from(inner.total_calls - 1)) * 100.0
         } else {
             100.0
         }
@@ -193,7 +194,7 @@ mod tests {
         tracker.record(1000, 790, 210); // hit
         tracker.record(1000, 100, 900); // break
         tracker.record(1000, 780, 220); // hit
-        // 2 hits, 1 break out of 3 comparisons = 66.67%
+                                        // 2 hits, 1 break out of 3 comparisons = 66.67%
         let rate = tracker.hit_rate();
         assert!((rate - 66.67).abs() < 1.0);
     }
