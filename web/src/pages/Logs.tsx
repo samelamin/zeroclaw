@@ -8,6 +8,8 @@ import {
 } from 'lucide-react';
 import type { SSEEvent } from '@/types/api';
 import { SSEClient } from '@/lib/sse';
+import { getToken } from '@/lib/auth';
+import { apiOrigin, basePath } from '@/lib/basePath';
 import { t } from '@/lib/i18n';
 
 function formatTimestamp(ts?: string): string {
@@ -82,6 +84,32 @@ export default function Logs() {
   useEffect(() => { pausedRef.current = paused; }, [paused]);
 
   useEffect(() => {
+    // Fetch recent event history so logs are visible even if the tab was closed
+    const token = getToken();
+    const headers: Record<string, string> = {};
+    if (token) headers['Authorization'] = `Bearer ${token}`;
+
+    fetch(`${apiOrigin}${basePath}/api/events/history`, { headers })
+      .then((r) => (r.ok ? r.json() : Promise.reject(r.status)))
+      .then(({ events }: { events: SSEEvent[] }) => {
+        if (!Array.isArray(events) || events.length === 0) return;
+        const historical: LogEntry[] = events.map((evt, i) => ({
+          id: `hist-${i}`,
+          event: { ...evt, type: evt.type ?? 'unknown' },
+        }));
+        setEntries((prev) => {
+          // Deduplicate: keep history entries older than the earliest existing entry
+          const earliest = prev[0]?.event.timestamp;
+          const fresh = earliest
+            ? historical.filter((e) => !e.event.timestamp || e.event.timestamp < earliest)
+            : historical;
+          const merged = [...fresh, ...prev];
+          return merged.length > 500 ? merged.slice(-500) : merged;
+        });
+        entryIdRef.current += events.length;
+      })
+      .catch(() => {}); // History is best-effort
+
     const client = new SSEClient();
 
     client.onConnect = () => {
