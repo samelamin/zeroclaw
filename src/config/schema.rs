@@ -12370,7 +12370,6 @@ default_temperature = 0.7
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
-            platform_type: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -12392,7 +12391,6 @@ default_temperature = 0.7
             draft_update_interval_ms: 1000,
             multi_message_delay_ms: 800,
             stall_timeout_secs: 0,
-            platform_type: None,
         };
         let json = serde_json::to_string(&dc).unwrap();
         let parsed: DiscordConfig = serde_json::from_str(&json).unwrap();
@@ -14998,7 +14996,6 @@ default_model = "persisted-profile"
             allowed_users: vec!["user_a".into(), "*".into()],
             proxy_url: None,
             bot_name: None,
-            platform_type: None,
         };
 
         let json = serde_json::to_string(&nc).unwrap();

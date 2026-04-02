@@ -59,7 +59,7 @@ pub async fn serve_stdio(config: &McpServerConfig) -> anyhow::Result<()> {
 
 /// Serve MCP over HTTP+SSE.
 pub async fn serve_http(config: &McpServerConfig) -> anyhow::Result<()> {
-    use axum::{routing::get, routing::post, Router};
+    use axum::{Router, routing::get, routing::post};
     use std::net::SocketAddr;
 
     let security = Arc::new(SecurityPolicy {

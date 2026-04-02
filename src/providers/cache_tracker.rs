@@ -194,7 +194,7 @@ mod tests {
         tracker.record(1000, 790, 210); // hit
         tracker.record(1000, 100, 900); // break
         tracker.record(1000, 780, 220); // hit
-                                        // 2 hits, 1 break out of 3 comparisons = 66.67%
+        // 2 hits, 1 break out of 3 comparisons = 66.67%
         let rate = tracker.hit_rate();
         assert!((rate - 66.67).abs() < 1.0);
     }

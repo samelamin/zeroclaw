@@ -4,7 +4,6 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-#[cfg(not(target_has_atomic = "64"))]
 use std::sync::atomic::AtomicU32;
 #[cfg(target_has_atomic = "64")]
 use std::sync::atomic::AtomicU64;

@@ -1,11 +1,11 @@
 //! JSON-RPC request handlers for the MCP server.
 
 use crate::tools::mcp_protocol::{
-    JsonRpcError, JsonRpcRequest, JsonRpcResponse, INVALID_PARAMS, JSONRPC_VERSION,
+    INVALID_PARAMS, JSONRPC_VERSION, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
     MCP_PROTOCOL_VERSION, METHOD_NOT_FOUND,
 };
 use crate::tools::traits::Tool;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Route a JSON-RPC request to the appropriate handler.
 pub async fn handle_request(req: &JsonRpcRequest, tools: &[Box<dyn Tool>]) -> JsonRpcResponse {
@@ -74,7 +74,7 @@ async fn handle_tools_call(req: &JsonRpcRequest, tools: &[Box<dyn Tool>]) -> Jso
     let tool = match tools.iter().find(|t| t.name() == tool_name) {
         Some(t) => t,
         None => {
-            return error_response(req, METHOD_NOT_FOUND, &format!("Unknown tool: {tool_name}"))
+            return error_response(req, METHOD_NOT_FOUND, &format!("Unknown tool: {tool_name}"));
         }
     };
 

@@ -41,6 +41,7 @@ const STREAM_TOOL_MARKER_WINDOW_CHARS: usize = 512;
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
 // History management moved to `super::history`.
+#[allow(unused_imports)]
 pub(crate) use super::history::{
     emergency_history_trim, estimate_history_tokens, fast_trim_tool_results,
     load_interactive_session_history, save_interactive_session_history, trim_history,
@@ -409,11 +410,9 @@ fn build_hardware_context(
     context
 }
 
-// Tool execution moved to `super::tool_execution`.
-pub(crate) use super::tool_execution::{
-    ToolExecutionOutcome, execute_tools_parallel, execute_tools_sequential,
-    should_execute_tools_in_parallel,
-};
+// Tool execution helpers — the enhanced versions with retry/recovery live
+// inline below.  We only import `find_tool` from the extracted module.
+use super::tool_execution::find_tool;
 
 fn parse_arguments_value(raw: Option<&serde_json::Value>) -> serde_json::Value {
     match raw {
@@ -3199,9 +3198,12 @@ pub(crate) async fn run_tool_call_loop(
                 if let Some(ref rc) = reasoning_content {
                     if !rc.is_empty() {
                         if let Some(ref tx) = on_delta {
-                            let _ = tx.send(DraftEvent::Progress(
-                                format!("[Thinking] {}", truncate_with_ellipsis(rc, 500))
-                            )).await;
+                            let _ = tx
+                                .send(DraftEvent::Progress(format!(
+                                    "[Thinking] {}",
+                                    truncate_with_ellipsis(rc, 500)
+                                )))
+                                .await;
                         }
                         tracing::debug!(
                             reasoning_len = rc.len(),
@@ -3271,7 +3273,9 @@ pub(crate) async fn run_tool_call_loop(
                         RecoveryAction::Retry => {
                             tracing::info!("Prompt-too-long recovery succeeded, retrying");
                             tool_cache = ToolResultCache::new();
-                            tracing::debug!("Post-compact: tool_cache cleared after prompt-too-long recovery");
+                            tracing::debug!(
+                                "Post-compact: tool_cache cleared after prompt-too-long recovery"
+                            );
                             continue; // retry the LLM call with trimmed history
                         }
                         RecoveryAction::GiveUp(msg) => {
@@ -4908,7 +4912,9 @@ pub async fn run(
                             after = result.tokens_after,
                             "Context compression complete"
                         );
-                        tracing::debug!("Post-compact: caches invalidated after context compression");
+                        tracing::debug!(
+                            "Post-compact: caches invalidated after context compression"
+                        );
                     }
                     Ok(_) => {} // No compression needed
                     Err(e) => {
@@ -5627,16 +5633,8 @@ mod tests {
             .expect("should produce a sample whose byte index 300 is not a char boundary");
 
         let observer = NoopObserver;
-        let result = execute_one_tool(
-            "unknown_tool",
-            call_arguments,
-            &[],
-            None,
-            &observer,
-            None,
-            None,
-        )
-        .await;
+        let result =
+            execute_one_tool("unknown_tool", call_arguments, &[], None, &observer, None).await;
         assert!(result.is_ok(), "execute_one_tool should not panic or error");
 
         let outcome = result.unwrap();
@@ -5664,7 +5662,6 @@ mod tests {
             &[],
             Some(&activated),
             &observer,
-            None,
             None,
         )
         .await

@@ -771,6 +771,9 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     dm_mention_patterns: vec![],
                     group_mention_patterns: vec![],
                     proxy_url: None,
+                    platform_type: None,
+                    webhook_forward_url: None,
+                    webhook_forward_secret: None,
                 });
             }
         }
