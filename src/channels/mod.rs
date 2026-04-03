@@ -2474,6 +2474,9 @@ async fn process_channel_message(
                     "sender": msg.sender,
                     "message": msg.content,
                     "channel": "whatsapp",
+                    "reply_to": msg.reply_target,
+                    "message_id": msg.id,
+                    "timestamp": msg.timestamp,
                 });
                 let client = reqwest::Client::builder()
                     .timeout(std::time::Duration::from_secs(30))
@@ -2519,6 +2522,14 @@ async fn process_channel_message(
                             sender = %msg.sender,
                             status = %resp.status(),
                             "Webhook forward returned error"
+                        );
+                        None
+                    }
+                    Err(e) if e.is_timeout() => {
+                        tracing::warn!(
+                            channel = "whatsapp",
+                            sender = %msg.sender,
+                            "Webhook timed out after 30s — reply expected via HTTP send API"
                         );
                         None
                     }
@@ -3794,9 +3805,27 @@ async fn run_message_dispatch_loop(
             msg
         };
 
-        let permit = match Arc::clone(&semaphore).acquire_owned().await {
+        let permit = match Arc::clone(&semaphore).try_acquire_owned() {
             Ok(permit) => permit,
-            Err(_) => break,
+            Err(_) => {
+                // At capacity — show typing so customer knows we're alive.
+                if let Some(ch) = ctx.channels_by_name.get(&msg.channel).or_else(|| {
+                    msg.channel
+                        .split_once(':')
+                        .and_then(|(base, _)| ctx.channels_by_name.get(base))
+                }) {
+                    let _ = ch.start_typing(&msg.reply_target).await;
+                }
+                tracing::info!(
+                    channel = %msg.channel,
+                    sender = %msg.sender,
+                    "Message queued — at in-flight limit, waiting for capacity"
+                );
+                match Arc::clone(&semaphore).acquire_owned().await {
+                    Ok(permit) => permit,
+                    Err(_) => break,
+                }
+            }
         };
 
         let worker_ctx = Arc::clone(&ctx);
