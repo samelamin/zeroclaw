@@ -1734,16 +1734,25 @@ impl Channel for WhatsAppWebChannel {
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     interval.tick().await;
-                    // Best-effort presence keepalive.
-                    let _ = keepalive_client.presence().set_available().await;
-                    keepalive_last_event.store(
-                        std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap_or_default()
-                            .as_secs(),
-                        std::sync::atomic::Ordering::Relaxed,
-                    );
-                    tracing::debug!("WhatsApp Web: presence keepalive tick");
+                    // Only update the liveness timestamp on a successful send so
+                    // the watchdog can detect a dead socket. If the WebSocket has
+                    // silently died, presence() will fail and last_event_at stays
+                    // stale — the 120s watchdog then fires and triggers reconnect.
+                    match keepalive_client.presence().set_available().await {
+                        Ok(_) => {
+                            keepalive_last_event.store(
+                                std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_secs(),
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            tracing::debug!("WhatsApp Web: presence keepalive tick");
+                        }
+                        Err(e) => {
+                            tracing::warn!("WhatsApp Web: presence keepalive failed ({e}) — liveness watchdog will trigger reconnect");
+                        }
+                    }
                 }
             });
 
