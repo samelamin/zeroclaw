@@ -3,7 +3,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 /// How much autonomy the agent has
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -169,6 +169,130 @@ impl Default for PerSenderTracker {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Team-level budget aggregation
+// ---------------------------------------------------------------------------
+
+/// Aggregate budget tracker for team (multi-sender) cost control.
+///
+/// Naseyma teams spin up multiple agents/senders that each have individual
+/// per-sender rate limits. The team budget provides a shared ceiling across
+/// all senders belonging to the same team, preventing aggregate overspend.
+#[derive(Debug)]
+pub struct TeamBudgetTracker {
+    /// Team identifier (e.g. Naseyma team slug).
+    team_id: String,
+    /// Maximum cost in cents per day for the entire team.
+    max_cost_cents: u32,
+    /// Running cost total, reset daily.
+    spent_cents: parking_lot::Mutex<TeamSpend>,
+}
+
+#[derive(Debug, Clone)]
+struct TeamSpend {
+    cents: u32,
+    /// Day number (days since UNIX epoch) when the counter was last reset.
+    reset_day: u64,
+}
+
+/// Result of attempting to record a cost against the team budget.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeamBudgetVerdict {
+    /// Cost recorded, team still within budget.
+    Allowed { remaining_cents: u32 },
+    /// Cost would exceed team budget. Action should be blocked.
+    Exceeded { spent_cents: u32, max_cents: u32 },
+}
+
+impl TeamBudgetTracker {
+    /// Create a new tracker for `team_id` with the given daily cap.
+    pub fn new(team_id: impl Into<String>, max_cost_cents: u32) -> Self {
+        Self {
+            team_id: team_id.into(),
+            max_cost_cents,
+            spent_cents: parking_lot::Mutex::new(TeamSpend {
+                cents: 0,
+                reset_day: Self::current_day(),
+            }),
+        }
+    }
+
+    /// The team identifier this tracker belongs to.
+    pub fn team_id(&self) -> &str {
+        &self.team_id
+    }
+
+    /// The configured daily budget cap in cents.
+    pub fn max_cost_cents(&self) -> u32 {
+        self.max_cost_cents
+    }
+
+    /// Returns the current day number (days since UNIX epoch).
+    fn current_day() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() / 86400)
+            .unwrap_or(0)
+    }
+
+    /// Ensure the spend counter is current; reset if the day has rolled over.
+    fn maybe_reset(spend: &mut TeamSpend) {
+        let today = Self::current_day();
+        if spend.reset_day != today {
+            spend.cents = 0;
+            spend.reset_day = today;
+        }
+    }
+
+    /// Record `cents` of spend against the team budget.
+    ///
+    /// If the new total would exceed `max_cost_cents` the cost is **not**
+    /// recorded and [`TeamBudgetVerdict::Exceeded`] is returned. On a day
+    /// boundary the counter is automatically reset before evaluation.
+    pub fn record_cost(&self, cents: u32) -> TeamBudgetVerdict {
+        let mut spend = self.spent_cents.lock();
+        Self::maybe_reset(&mut spend);
+
+        let new_total = spend.cents.saturating_add(cents);
+        if new_total > self.max_cost_cents {
+            TeamBudgetVerdict::Exceeded {
+                spent_cents: spend.cents,
+                max_cents: self.max_cost_cents,
+            }
+        } else {
+            spend.cents = new_total;
+            TeamBudgetVerdict::Allowed {
+                remaining_cents: self.max_cost_cents - new_total,
+            }
+        }
+    }
+
+    /// How many cents remain in today's budget.
+    pub fn remaining_cents(&self) -> u32 {
+        let mut spend = self.spent_cents.lock();
+        Self::maybe_reset(&mut spend);
+        self.max_cost_cents.saturating_sub(spend.cents)
+    }
+
+    /// How many cents have been recorded today.
+    pub fn spent_today(&self) -> u32 {
+        let mut spend = self.spent_cents.lock();
+        Self::maybe_reset(&mut spend);
+        spend.cents
+    }
+}
+
+impl Clone for TeamBudgetTracker {
+    fn clone(&self) -> Self {
+        let spend = self.spent_cents.lock();
+        Self {
+            team_id: self.team_id.clone(),
+            max_cost_cents: self.max_cost_cents,
+            spent_cents: parking_lot::Mutex::new(spend.clone()),
+        }
+    }
+}
+
 /// Security policy enforced on all tool executions
 #[derive(Debug, Clone)]
 pub struct SecurityPolicy {
@@ -185,6 +309,9 @@ pub struct SecurityPolicy {
     pub shell_env_passthrough: Vec<String>,
     pub shell_timeout_secs: u64,
     pub tracker: PerSenderTracker,
+    /// Optional team-level budget tracker. When `Some`, aggregate cost across
+    /// all senders in the team is enforced in addition to per-sender limits.
+    pub team_budget: Option<TeamBudgetTracker>,
 }
 
 /// Default allowed commands for Unix platforms.
@@ -318,6 +445,7 @@ impl Default for SecurityPolicy {
             shell_env_passthrough: vec![],
             shell_timeout_secs: 60,
             tracker: PerSenderTracker::new(),
+            team_budget: None,
         }
     }
 }
@@ -1607,6 +1735,7 @@ impl SecurityPolicy {
             shell_env_passthrough: autonomy_config.shell_env_passthrough.clone(),
             shell_timeout_secs: autonomy_config.shell_timeout_secs,
             tracker: PerSenderTracker::new(),
+            team_budget: None,
         }
     }
 
@@ -3411,5 +3540,97 @@ mod tests {
         let t = PerSenderTracker::new();
         // Key "ghost" has never been recorded — should not be exhausted at max=1
         assert!(!t.is_exhausted("ghost", 1));
+    }
+
+    // -----------------------------------------------------------------------
+    // TeamBudgetTracker tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn team_budget_record_within_budget_returns_allowed() {
+        let tracker = TeamBudgetTracker::new("team-alpha", 1000);
+        let verdict = tracker.record_cost(200);
+        assert_eq!(
+            verdict,
+            TeamBudgetVerdict::Allowed {
+                remaining_cents: 800
+            }
+        );
+    }
+
+    #[test]
+    fn team_budget_record_exceeding_budget_returns_exceeded() {
+        let tracker = TeamBudgetTracker::new("team-beta", 500);
+        // First spend is fine
+        assert_eq!(
+            tracker.record_cost(400),
+            TeamBudgetVerdict::Allowed {
+                remaining_cents: 100
+            }
+        );
+        // Second spend would push total to 600 > 500
+        assert_eq!(
+            tracker.record_cost(200),
+            TeamBudgetVerdict::Exceeded {
+                spent_cents: 400,
+                max_cents: 500,
+            }
+        );
+        // The failed record should NOT have been applied
+        assert_eq!(tracker.spent_today(), 400);
+    }
+
+    #[test]
+    fn team_budget_day_rollover_resets_counter() {
+        let tracker = TeamBudgetTracker::new("team-gamma", 1000);
+        // Spend some budget
+        tracker.record_cost(600);
+        assert_eq!(tracker.spent_today(), 600);
+
+        // Simulate a day rollover by manually rewinding the reset_day
+        {
+            let mut spend = tracker.spent_cents.lock();
+            spend.reset_day = spend.reset_day.saturating_sub(1);
+        }
+
+        // After the day boundary, counter should auto-reset
+        assert_eq!(tracker.spent_today(), 0);
+        assert_eq!(tracker.remaining_cents(), 1000);
+
+        // New recording should work from zero
+        assert_eq!(
+            tracker.record_cost(300),
+            TeamBudgetVerdict::Allowed {
+                remaining_cents: 700
+            }
+        );
+    }
+
+    #[test]
+    fn team_budget_remaining_decreases_with_spend() {
+        let tracker = TeamBudgetTracker::new("team-delta", 1000);
+        assert_eq!(tracker.remaining_cents(), 1000);
+
+        tracker.record_cost(100);
+        assert_eq!(tracker.remaining_cents(), 900);
+
+        tracker.record_cost(400);
+        assert_eq!(tracker.remaining_cents(), 500);
+    }
+
+    #[test]
+    fn team_budget_none_means_no_enforcement() {
+        let policy = SecurityPolicy::default();
+        assert!(
+            policy.team_budget.is_none(),
+            "default SecurityPolicy should have no team budget"
+        );
+    }
+
+    #[test]
+    fn team_budget_accessors() {
+        let tracker = TeamBudgetTracker::new("slug-123", 4200);
+        assert_eq!(tracker.team_id(), "slug-123");
+        assert_eq!(tracker.max_cost_cents(), 4200);
     }
 }

@@ -2696,6 +2696,10 @@ async fn process_channel_message(
                 tracing::info!(%reason, "incoming message dropped by hook");
                 return;
             }
+            crate::hooks::HookResult::HardDeny(reason) => {
+                tracing::warn!(%reason, "HARD DENY: incoming message blocked by hook");
+                return;
+            }
             crate::hooks::HookResult::Continue(modified) => modified,
         }
     } else {
@@ -3394,6 +3398,15 @@ async fn process_channel_message(
                 {
                     crate::hooks::HookResult::Cancel(reason) => {
                         tracing::info!(%reason, "outgoing message suppressed by hook");
+                        if let (Some(channel), Some(draft_id)) =
+                            (target_channel.as_ref(), draft_message_id.as_deref())
+                        {
+                            let _ = channel.cancel_draft(&msg.reply_target, draft_id).await;
+                        }
+                        return;
+                    }
+                    crate::hooks::HookResult::HardDeny(reason) => {
+                        tracing::warn!(%reason, "HARD DENY: outgoing message blocked by hook");
                         if let (Some(channel), Some(draft_id)) =
                             (target_channel.as_ref(), draft_message_id.as_deref())
                         {

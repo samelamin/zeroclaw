@@ -3,7 +3,7 @@ use std::time::Duration;
 use futures_util::{FutureExt, future::join_all};
 use serde_json::Value;
 use std::panic::AssertUnwindSafe;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::channels::traits::ChannelMessage;
 use crate::providers::traits::{ChatMessage, ChatResponse};
@@ -142,6 +142,13 @@ impl HookRunner {
                     );
                     return HookResult::Cancel(reason);
                 }
+                Ok(HookResult::HardDeny(reason)) => {
+                    warn!(
+                        hook = hook_name,
+                        reason, "HARD DENY: before_model_resolve blocked by hook"
+                    );
+                    return HookResult::HardDeny(reason);
+                }
                 Err(_) => {
                     tracing::error!(
                         hook = hook_name,
@@ -167,6 +174,13 @@ impl HookRunner {
                         reason, "before_prompt_build cancelled by hook"
                     );
                     return HookResult::Cancel(reason);
+                }
+                Ok(HookResult::HardDeny(reason)) => {
+                    warn!(
+                        hook = hook_name,
+                        reason, "HARD DENY: before_prompt_build blocked by hook"
+                    );
+                    return HookResult::HardDeny(reason);
                 }
                 Err(_) => {
                     tracing::error!(
@@ -201,6 +215,13 @@ impl HookRunner {
                     );
                     return HookResult::Cancel(reason);
                 }
+                Ok(HookResult::HardDeny(reason)) => {
+                    warn!(
+                        hook = hook_name,
+                        reason, "HARD DENY: before_llm_call blocked by hook"
+                    );
+                    return HookResult::HardDeny(reason);
+                }
                 Err(_) => {
                     tracing::error!(
                         hook = hook_name,
@@ -234,6 +255,13 @@ impl HookRunner {
                     );
                     return HookResult::Cancel(reason);
                 }
+                Ok(HookResult::HardDeny(reason)) => {
+                    warn!(
+                        hook = hook_name,
+                        reason, "HARD DENY: before_tool_call blocked by hook"
+                    );
+                    return HookResult::HardDeny(reason);
+                }
                 Err(_) => {
                     tracing::error!(
                         hook = hook_name,
@@ -262,6 +290,13 @@ impl HookRunner {
                         reason, "on_message_received cancelled by hook"
                     );
                     return HookResult::Cancel(reason);
+                }
+                Ok(HookResult::HardDeny(reason)) => {
+                    warn!(
+                        hook = hook_name,
+                        reason, "HARD DENY: on_message_received blocked by hook"
+                    );
+                    return HookResult::HardDeny(reason);
                 }
                 Err(_) => {
                     tracing::error!(
@@ -301,6 +336,13 @@ impl HookRunner {
                         reason, "on_message_sending cancelled by hook"
                     );
                     return HookResult::Cancel(reason);
+                }
+                Ok(HookResult::HardDeny(reason)) => {
+                    warn!(
+                        hook = hook_name,
+                        reason, "HARD DENY: on_message_sending blocked by hook"
+                    );
+                    return HookResult::HardDeny(reason);
                 }
                 Err(_) => {
                     tracing::error!(
@@ -413,6 +455,25 @@ mod tests {
         }
     }
 
+    /// A modifying hook that hard-denies before_prompt_build.
+    struct HardDenyPromptHook {
+        name: String,
+        priority: i32,
+    }
+
+    #[async_trait]
+    impl HookHandler for HardDenyPromptHook {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn priority(&self) -> i32 {
+            self.priority
+        }
+        async fn before_prompt_build(&self, _prompt: String) -> HookResult<String> {
+            HookResult::HardDeny("security policy violation".into())
+        }
+    }
+
     #[test]
     fn register_and_sort_by_priority() {
         let mut runner = HookRunner::new();
@@ -478,6 +539,26 @@ mod tests {
         match runner.run_before_prompt_build("hello".into()).await {
             HookResult::Continue(result) => assert_eq!(result, "HELLO_done"),
             HookResult::Cancel(_) => panic!("should not cancel"),
+            HookResult::HardDeny(_) => panic!("should not hard deny"),
         }
+    }
+
+    #[tokio::test]
+    async fn modifying_hook_can_hard_deny() {
+        let mut runner = HookRunner::new();
+        runner.register(Box::new(HardDenyPromptHook {
+            name: "security".into(),
+            priority: 10,
+        }));
+        runner.register(Box::new(UppercasePromptHook {
+            name: "upper".into(),
+            priority: 0,
+        }));
+
+        let result = runner.run_before_prompt_build("hello".into()).await;
+        assert!(result.is_hard_deny());
+        assert!(result.is_cancel()); // HardDeny is also a cancellation
+        assert!(!result.is_soft_cancel());
+        assert_eq!(result.reason(), Some("security policy violation"));
     }
 }

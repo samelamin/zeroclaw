@@ -3459,6 +3459,44 @@ pub(crate) async fn run_tool_call_loop(
                         ));
                         continue;
                     }
+                    crate::hooks::HookResult::HardDeny(reason) => {
+                        tracing::warn!(tool = %call.name, %reason, "HARD DENY: tool call blocked by hook");
+                        let denied = format!("HARD DENY by hook: {reason}");
+                        runtime_trace::record_event(
+                            "tool_call_result",
+                            Some(channel_name),
+                            Some(provider_name),
+                            Some(model),
+                            Some(&turn_id),
+                            Some(false),
+                            Some(&denied),
+                            serde_json::json!({
+                                "iteration": iteration + 1,
+                                "tool": call.name,
+                                "arguments": scrub_credentials(&tool_args.to_string()),
+                            }),
+                        );
+                        if let Some(ref tx) = on_delta {
+                            let _ = tx
+                                .send(DraftEvent::Progress(format!(
+                                    "\u{1f6d1} {}: {}\n",
+                                    call.name,
+                                    truncate_with_ellipsis(&scrub_credentials(&denied), 200)
+                                )))
+                                .await;
+                        }
+                        ordered_results[idx] = Some((
+                            call.name.clone(),
+                            call.tool_call_id.clone(),
+                            ToolExecutionOutcome {
+                                output: denied,
+                                success: false,
+                                error_reason: Some(scrub_credentials(&reason)),
+                                duration: Duration::ZERO,
+                            },
+                        ));
+                        continue;
+                    }
                     crate::hooks::HookResult::Continue((name, args)) => {
                         tool_name = name;
                         tool_args = args;
