@@ -6899,9 +6899,15 @@ pub struct WhatsAppConfig {
     pub message_coalesce_max_ms: u64,
 }
 
-fn default_wa_coalesce_ms() -> u64 { 300 }
-fn default_wa_coalesce_extend_ms() -> u64 { 1000 }
-fn default_wa_coalesce_max_ms() -> u64 { 5000 }
+fn default_wa_coalesce_ms() -> u64 {
+    300
+}
+fn default_wa_coalesce_extend_ms() -> u64 {
+    1000
+}
+fn default_wa_coalesce_max_ms() -> u64 {
+    5000
+}
 
 impl ChannelConfig for WhatsAppConfig {
     fn name() -> &'static str {
@@ -12936,6 +12942,9 @@ channel_ids = ["C123", "D456"]
             platform_type: None,
             webhook_forward_url: None,
             webhook_forward_secret: None,
+            message_coalesce_ms: default_wa_coalesce_ms(),
+            message_coalesce_extend_ms: default_wa_coalesce_extend_ms(),
+            message_coalesce_max_ms: default_wa_coalesce_max_ms(),
         };
         assert!(wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "cloud");
@@ -12963,6 +12972,9 @@ channel_ids = ["C123", "D456"]
             platform_type: None,
             webhook_forward_url: None,
             webhook_forward_secret: None,
+            message_coalesce_ms: default_wa_coalesce_ms(),
+            message_coalesce_extend_ms: default_wa_coalesce_extend_ms(),
+            message_coalesce_max_ms: default_wa_coalesce_max_ms(),
         };
         assert!(!wc.is_ambiguous_config());
         assert_eq!(wc.backend_type(), "web");
@@ -13001,6 +13013,9 @@ channel_ids = ["C123", "D456"]
                 platform_type: None,
                 webhook_forward_url: None,
                 webhook_forward_secret: None,
+                message_coalesce_ms: default_wa_coalesce_ms(),
+                message_coalesce_extend_ms: default_wa_coalesce_extend_ms(),
+                message_coalesce_max_ms: default_wa_coalesce_max_ms(),
             }),
             linq: None,
             wati: None,

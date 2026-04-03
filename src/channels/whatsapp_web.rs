@@ -909,7 +909,9 @@ impl WhatsAppWebChannel {
     pub fn health_info(&self) -> serde_json::Value {
         let has_handle = self.bot_handle.lock().is_some();
         let has_client = self.client.lock().is_some();
-        let last_event = self.last_event_at.load(std::sync::atomic::Ordering::Relaxed);
+        let last_event = self
+            .last_event_at
+            .load(std::sync::atomic::Ordering::Relaxed);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -1775,7 +1777,10 @@ impl Channel for WhatsAppWebChannel {
                                 ts.remove(chat);
                             }
                         }
-                        tracing::debug!(count = stale.len(), "WhatsApp Web: cleared stale typing indicators");
+                        tracing::debug!(
+                            count = stale.len(),
+                            "WhatsApp Web: cleared stale typing indicators"
+                        );
                     }
                 }
             });
@@ -1924,7 +1929,9 @@ impl Channel for WhatsAppWebChannel {
         }
 
         // Verify the stream received an event recently (within 2x liveness timeout).
-        let last = self.last_event_at.load(std::sync::atomic::Ordering::Relaxed);
+        let last = self
+            .last_event_at
+            .load(std::sync::atomic::Ordering::Relaxed);
         if last == 0 {
             // Bot just started, haven't received first event yet — assume healthy.
             return true;
