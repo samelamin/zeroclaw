@@ -255,9 +255,57 @@ impl RusqliteStore {
                 device_id INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (jid, device_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS message_dedup (
+                message_id TEXT PRIMARY KEY,
+                processed_at INTEGER NOT NULL
             );",
         ))?;
         Ok(())
+    }
+
+    /// Check if a message ID has already been processed (24h window).
+    pub fn has_seen_message(&self, message_id: &str) -> bool {
+        let conn = self.conn.lock();
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(86400);
+        conn.query_row(
+            "SELECT 1 FROM message_dedup WHERE message_id = ?1 AND processed_at > ?2",
+            rusqlite::params![message_id, cutoff as i64],
+            |_| Ok(()),
+        )
+        .is_ok()
+    }
+
+    /// Mark a message ID as processed.
+    pub fn mark_message_seen(&self, message_id: &str) {
+        let conn = self.conn.lock();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO message_dedup (message_id, processed_at) VALUES (?1, ?2)",
+            rusqlite::params![message_id, now as i64],
+        );
+    }
+
+    /// Prune dedup entries older than 24 hours.
+    pub fn prune_dedup(&self) {
+        let conn = self.conn.lock();
+        let cutoff = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+            .saturating_sub(86400);
+        let _ = conn.execute(
+            "DELETE FROM message_dedup WHERE processed_at < ?1",
+            rusqlite::params![cutoff as i64],
+        );
     }
 }
 

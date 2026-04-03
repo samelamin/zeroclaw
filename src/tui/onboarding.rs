@@ -792,6 +792,9 @@ fn apply_tui_selections_to_config(app: &App, config: &mut Config) {
                     platform_type: None,
                     webhook_forward_url: None,
                     webhook_forward_secret: None,
+                    message_coalesce_ms: 300,
+                    message_coalesce_extend_ms: 1000,
+                    message_coalesce_max_ms: 5000,
                 });
             }
         }

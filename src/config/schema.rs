@@ -6888,7 +6888,20 @@ pub struct WhatsAppConfig {
     /// Shared secret sent as `X-Internal-Secret` header with forwarded webhooks.
     #[serde(default)]
     pub webhook_forward_secret: Option<String>,
+    /// Initial coalesce window (ms) for multi-message bursts. Default: 300.
+    #[serde(default = "default_wa_coalesce_ms")]
+    pub message_coalesce_ms: u64,
+    /// Extension per additional message during coalesce window (ms). Default: 1000.
+    #[serde(default = "default_wa_coalesce_extend_ms")]
+    pub message_coalesce_extend_ms: u64,
+    /// Maximum coalesce window (ms). Default: 5000.
+    #[serde(default = "default_wa_coalesce_max_ms")]
+    pub message_coalesce_max_ms: u64,
 }
+
+fn default_wa_coalesce_ms() -> u64 { 300 }
+fn default_wa_coalesce_extend_ms() -> u64 { 1000 }
+fn default_wa_coalesce_max_ms() -> u64 { 5000 }
 
 impl ChannelConfig for WhatsAppConfig {
     fn name() -> &'static str {
@@ -12819,6 +12832,9 @@ channel_ids = ["C123", "D456"]
             platform_type: None,
             webhook_forward_url: None,
             webhook_forward_secret: None,
+            message_coalesce_ms: default_wa_coalesce_ms(),
+            message_coalesce_extend_ms: default_wa_coalesce_extend_ms(),
+            message_coalesce_max_ms: default_wa_coalesce_max_ms(),
         };
         let json = serde_json::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = serde_json::from_str(&json).unwrap();
@@ -12850,6 +12866,9 @@ channel_ids = ["C123", "D456"]
             platform_type: None,
             webhook_forward_url: None,
             webhook_forward_secret: None,
+            message_coalesce_ms: default_wa_coalesce_ms(),
+            message_coalesce_extend_ms: default_wa_coalesce_extend_ms(),
+            message_coalesce_max_ms: default_wa_coalesce_max_ms(),
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();
@@ -12886,6 +12905,9 @@ channel_ids = ["C123", "D456"]
             platform_type: None,
             webhook_forward_url: None,
             webhook_forward_secret: None,
+            message_coalesce_ms: default_wa_coalesce_ms(),
+            message_coalesce_extend_ms: default_wa_coalesce_extend_ms(),
+            message_coalesce_max_ms: default_wa_coalesce_max_ms(),
         };
         let toml_str = toml::to_string(&wc).unwrap();
         let parsed: WhatsAppConfig = toml::from_str(&toml_str).unwrap();

@@ -4622,6 +4622,9 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                         platform_type: None,
                         webhook_forward_url: None,
                         webhook_forward_secret: None,
+                        message_coalesce_ms: existing_wa.map(|w| w.message_coalesce_ms).unwrap_or(300),
+                        message_coalesce_extend_ms: existing_wa.map(|w| w.message_coalesce_extend_ms).unwrap_or(1000),
+                        message_coalesce_max_ms: existing_wa.map(|w| w.message_coalesce_max_ms).unwrap_or(5000),
                     });
 
                     println!(
@@ -4741,6 +4744,9 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                     platform_type: None,
                     webhook_forward_url: None,
                     webhook_forward_secret: None,
+                    message_coalesce_ms: existing_wa.map(|w| w.message_coalesce_ms).unwrap_or(300),
+                    message_coalesce_extend_ms: existing_wa.map(|w| w.message_coalesce_extend_ms).unwrap_or(1000),
+                    message_coalesce_max_ms: existing_wa.map(|w| w.message_coalesce_max_ms).unwrap_or(5000),
                 });
             }
             ChannelMenuChoice::Linq => {
