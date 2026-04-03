@@ -2658,14 +2658,14 @@ async fn process_channel_message(
                     }
                 };
 
-                // Stop typing before delivering the reply so the user sees the
-                // transition from "typing…" → message rather than both at once.
-                typing_token.cancel();
-                if let Some(task) = typing_task {
-                    let _ = task.await;
-                }
-
                 if let Some(reply) = webhook_reply {
+                    // Webhook returned a synchronous reply — stop typing then
+                    // deliver it so the user sees "typing…" → message cleanly.
+                    typing_token.cancel();
+                    if let Some(task) = typing_task {
+                        let _ = task.await;
+                    }
+
                     let target_channel = ctx.channels_by_name.get("whatsapp").cloned();
                     if let Some(channel) = target_channel {
                         let send_msg = traits::SendMessage::new(reply, msg.reply_target.clone());
@@ -2684,6 +2684,12 @@ async fn process_channel_message(
                         }
                     }
                 }
+                // No sync reply — the external service will call POST
+                // /api/channels/whatsapp/send when its reply is ready.
+                // Keep the typing task alive so the indicator stays visible
+                // until send() issues send_paused right before the message.
+                // The 120s safety timeout in WhatsAppWebChannel will clean up
+                // if the external service never calls back.
                 return; // Don't process with local LLM
             }
         }
