@@ -541,6 +541,7 @@ impl EmailChannel {
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: email.attachments,
+                real_phone: None,
             };
 
             if tx.send(msg).await.is_err() {

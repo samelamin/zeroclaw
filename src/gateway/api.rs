@@ -1526,8 +1526,21 @@ pub(super) async fn handle_whatsapp_web_send(
         return e.into_response();
     }
 
-    let channel = match &state.whatsapp_web {
-        Some(ch) => ch.clone(),
+    // Use the live persistent channel from the channels supervisor.
+    // We deliberately do NOT fall back to cold-send: opening a second Baileys
+    // session from the same session file kicks the persistent connection off
+    // WhatsApp's servers, breaking inbound message delivery.
+    let channel = match crate::channels::get_live_whatsapp_channel() {
+        Some(ch) if ch.is_connected() => ch,
+        Some(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "WhatsApp Web channel is reconnecting — retry in a moment"
+                })),
+            )
+                .into_response();
+        }
         None => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,

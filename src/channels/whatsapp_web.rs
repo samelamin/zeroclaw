@@ -1607,7 +1607,12 @@ impl Channel for WhatsAppWebChannel {
                                         timestamp: chrono::Utc::now().timestamp() as u64,
                                         thread_ts: None,
                                         interruption_scope_id: None,
-                    attachments: vec![],
+                                        attachments: vec![],
+                                        // When the sender uses a LID, Baileys can resolve
+                                        // it to the real E.164 phone number. Include it
+                                        // so the webhook receiver can build the mapping
+                                        // without needing a prior outbound send.
+                                        real_phone: mapped_phone.clone(),
                                     })
                                     .await
                                 {
@@ -1925,6 +1930,10 @@ impl Channel for WhatsAppWebChannel {
         }
 
         Ok(())
+    }
+
+    fn is_connected(&self) -> bool {
+        self.client.lock().is_some()
     }
 
     async fn health_check(&self) -> bool {

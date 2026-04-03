@@ -26,8 +26,6 @@ use crate::channels::{
     Channel, GmailPushChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel,
     WhatsAppChannel, session_backend::SessionBackend, session_sqlite::SqliteSessionBackend,
 };
-#[cfg(feature = "whatsapp-web")]
-use crate::channels::WhatsAppWebChannel;
 use crate::config::Config;
 use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -599,30 +597,11 @@ pub async fn run_gateway(
         })
         .map(Arc::from);
 
-    // WhatsApp Web channel for the send API (if configured).
-    // The channel is not started via listen() here — send() automatically falls
-    // back to cold_send(), which opens a one-shot session using the saved
-    // credentials. This is the same path used by `zeroclaw channel send`.
-    #[cfg(feature = "whatsapp-web")]
-    let whatsapp_web_channel: Option<Arc<dyn crate::channels::traits::Channel>> = config
-        .channels_config
-        .whatsapp
-        .as_ref()
-        .filter(|wa| wa.is_web_config())
-        .map(|wa| {
-            Arc::new(WhatsAppWebChannel::new(
-                wa.session_path.clone().unwrap_or_default(),
-                wa.pair_phone.clone(),
-                wa.pair_code.clone(),
-                wa.allowed_numbers.clone(),
-                wa.mention_only,
-                wa.mode.clone(),
-                wa.dm_policy.clone(),
-                wa.group_policy.clone(),
-                wa.self_chat_mode,
-            )) as Arc<dyn crate::channels::traits::Channel>
-        });
-    #[cfg(not(feature = "whatsapp-web"))]
+    // WhatsApp Web sends go through the live persistent channel registered by
+    // the channels supervisor (see crate::channels::get_live_whatsapp_channel).
+    // We do NOT create a cold channel here — cold Baileys sessions share the
+    // same session file as the persistent connection and kick it off WhatsApp's
+    // servers the moment they connect.
     let whatsapp_web_channel: Option<Arc<dyn crate::channels::traits::Channel>> = None;
 
     // Linq channel (if configured)
@@ -2678,6 +2657,7 @@ mod tests {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            real_phone: None,
         };
 
         let key = whatsapp_memory_key(&msg);

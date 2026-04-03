@@ -22,6 +22,10 @@ pub struct ChannelMessage {
     /// Channels populate this when they receive media alongside a text message.
     /// Defaults to empty — existing channels are unaffected.
     pub attachments: Vec<super::media_pipeline::MediaAttachment>,
+    /// The sender's real E.164 phone number when the platform uses opaque IDs.
+    /// Set by WhatsApp Web when Baileys can resolve the LID to a real number.
+    /// Included in webhook forward payloads as `real_phone`.
+    pub real_phone: Option<String>,
 }
 
 /// Message to send through a channel
@@ -116,6 +120,14 @@ pub trait Channel: Send + Sync {
     /// Stop any active typing indicator.
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Whether this channel currently has an active live connection.
+    /// Stateless HTTP-based channels always return true.
+    /// WebSocket-backed channels (e.g. WhatsApp Web) return false when
+    /// their persistent client is not yet connected or has disconnected.
+    fn is_connected(&self) -> bool {
+        true
     }
 
     /// Whether this channel supports progressive message updates via draft edits.
@@ -257,6 +269,7 @@ mod tests {
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+            real_phone: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -275,6 +288,7 @@ mod tests {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            real_phone: None,
         };
 
         let cloned = message.clone();
