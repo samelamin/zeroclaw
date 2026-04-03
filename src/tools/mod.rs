@@ -103,6 +103,7 @@ pub mod sop_execute;
 pub mod sop_list;
 pub mod sop_status;
 pub mod swarm;
+pub mod task_planner;
 pub mod text_browser;
 pub mod tool_search;
 pub mod traits;
