@@ -279,6 +279,9 @@ enum ChannelRuntimeCommand {
     SetModel(String),
     ShowConfig,
     NewSession,
+    CheckpointSave(Option<String>),
+    CheckpointRestore(String),
+    CheckpointList,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -402,6 +405,7 @@ struct ChannelRuntimeContext {
     max_tool_result_chars: usize,
     context_token_budget: usize,
     debouncer: Arc<debounce::MessageDebouncer>,
+    checkpoint_store: Option<Arc<dyn crate::agent::checkpoint::CheckpointStore>>,
 }
 
 #[derive(Clone)]
@@ -803,6 +807,23 @@ fn parse_runtime_command(channel_name: &str, content: &str) -> Option<ChannelRun
         "/config" if supports_runtime_model_switch(channel_name) => {
             Some(ChannelRuntimeCommand::ShowConfig)
         }
+        "/save" => {
+            let label = parts.collect::<Vec<_>>().join(" ").trim().to_string();
+            Some(ChannelRuntimeCommand::CheckpointSave(if label.is_empty() {
+                None
+            } else {
+                Some(label)
+            }))
+        }
+        "/restore" => {
+            let arg = parts.collect::<Vec<_>>().join(" ").trim().to_string();
+            if arg.is_empty() {
+                None // require an argument
+            } else {
+                Some(ChannelRuntimeCommand::CheckpointRestore(arg))
+            }
+        }
+        "/checkpoints" => Some(ChannelRuntimeCommand::CheckpointList),
         _ => None,
     }
 }
@@ -1845,6 +1866,99 @@ async fn handle_runtime_command_if_needed(
             }
             mark_sender_for_new_session(ctx, &sender_key);
             "Conversation history cleared. Starting fresh.".to_string()
+        }
+        ChannelRuntimeCommand::CheckpointSave(label) => {
+            let Some(ref store) = ctx.checkpoint_store else {
+                return true; // checkpointing disabled — silently consume
+            };
+            let history: Vec<crate::providers::traits::ChatMessage> = {
+                let histories = ctx
+                    .conversation_histories
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                histories.peek(&sender_key).cloned().unwrap_or_default()
+            };
+            let cp = crate::agent::checkpoint::create_checkpoint(
+                &sender_key,
+                label.as_deref(),
+                &history,
+                None,
+            );
+            match store.save(&cp).await {
+                Ok(id) => {
+                    let lbl = label
+                        .as_deref()
+                        .map(|l| format!(" (label: `{l}`)"))
+                        .unwrap_or_default();
+                    format!("Checkpoint saved `{id}`{lbl} — {} turns.", history.len())
+                }
+                Err(e) => format!("Failed to save checkpoint: {e}"),
+            }
+        }
+        ChannelRuntimeCommand::CheckpointRestore(arg) => {
+            let Some(ref store) = ctx.checkpoint_store else {
+                return true;
+            };
+            // Try loading by ID first, then search by label.
+            let checkpoint = match store.load(&arg).await {
+                Ok(Some(cp)) => Some(cp),
+                _ => {
+                    // Search by label in this session's checkpoints.
+                    match store.list(&sender_key).await {
+                        Ok(cps) => cps
+                            .into_iter()
+                            .find(|c| c.label.as_deref() == Some(arg.as_str())),
+                        Err(_) => None,
+                    }
+                }
+            };
+            match checkpoint {
+                Some(cp) => {
+                    let turn_count = cp.history.len();
+                    let label_info = cp
+                        .label
+                        .as_deref()
+                        .map(|l| format!(" (label: `{l}`)"))
+                        .unwrap_or_default();
+                    // Replace conversation history.
+                    {
+                        let mut histories = ctx
+                            .conversation_histories
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        histories.put(sender_key.clone(), cp.history);
+                    }
+                    format!(
+                        "Restored checkpoint `{}`{label_info} — {turn_count} turns.",
+                        cp.id
+                    )
+                }
+                None => format!("No checkpoint found matching `{arg}`."),
+            }
+        }
+        ChannelRuntimeCommand::CheckpointList => {
+            let Some(ref store) = ctx.checkpoint_store else {
+                return true;
+            };
+            match store.list(&sender_key).await {
+                Ok(cps) if cps.is_empty() => "No checkpoints saved for this session.".to_string(),
+                Ok(cps) => {
+                    let mut lines = vec![format!("{} checkpoint(s):", cps.len())];
+                    for cp in &cps {
+                        let label = cp
+                            .label
+                            .as_deref()
+                            .map(|l| format!(" [{l}]"))
+                            .unwrap_or_default();
+                        lines.push(format!(
+                            "  `{}`{} — {} turns ({})",
+                            cp.id, label, cp.turn_count, cp.created_at
+                        ));
+                    }
+                    lines.join("\n")
+                }
+                Err(e) => format!("Failed to list checkpoints: {e}"),
+            }
         }
     };
 
@@ -3399,6 +3513,33 @@ async fn process_channel_message(
             // keep_tool_context_turns to prevent unbounded growth.
             if keep_tool_turns > 0 {
                 strip_old_tool_context(ctx.as_ref(), &history_key, keep_tool_turns);
+            }
+
+            // Auto-checkpoint when enabled and the user turn count is a
+            // multiple of the configured interval.
+            if let Some(ref cp_store) = ctx.checkpoint_store {
+                let interval = ctx.prompt_config.agent.checkpoint.auto_interval;
+                if interval > 0 {
+                    let snapshot: Vec<crate::providers::traits::ChatMessage> = {
+                        let histories = ctx
+                            .conversation_histories
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        histories.peek(&history_key).cloned().unwrap_or_default()
+                    };
+                    let user_count = snapshot.iter().filter(|m| m.role == "user").count();
+                    if user_count > 0 && user_count % interval == 0 {
+                        let cp = crate::agent::checkpoint::create_checkpoint(
+                            &history_key,
+                            Some(&format!("auto-turn-{user_count}")),
+                            &snapshot,
+                            None,
+                        );
+                        if let Err(e) = cp_store.save(&cp).await {
+                            tracing::debug!("Auto-checkpoint failed: {e}");
+                        }
+                    }
+                }
             }
 
             // Fire-and-forget LLM-driven memory consolidation.
@@ -5745,6 +5886,14 @@ pub async fn start_channels(config: Config) -> Result<()> {
         debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::from_millis(
             config.channels_config.debounce_ms,
         ))),
+        checkpoint_store: if config.agent.checkpoint.enabled {
+            Some(
+                Arc::new(crate::agent::checkpoint::InMemoryCheckpointStore::new())
+                    as Arc<dyn crate::agent::checkpoint::CheckpointStore>,
+            )
+        } else {
+            None
+        },
     });
 
     // Hydrate in-memory conversation histories from persisted JSONL session files.
@@ -6179,6 +6328,7 @@ mod tests {
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -6303,6 +6453,7 @@ mod tests {
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         };
 
         append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
@@ -6384,6 +6535,7 @@ mod tests {
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         };
 
         assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
@@ -6482,6 +6634,7 @@ mod tests {
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         };
 
         assert!(rollback_orphan_user_turn(
@@ -7081,6 +7234,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -7171,6 +7325,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -7275,6 +7430,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -7364,6 +7520,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -7463,6 +7620,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -7583,6 +7741,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -7684,6 +7843,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -7800,6 +7960,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -7904,6 +8065,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -7998,6 +8160,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -8215,6 +8378,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -8327,6 +8491,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -8458,6 +8623,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -8586,6 +8752,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -8692,6 +8859,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -8779,6 +8947,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -8866,6 +9035,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -9658,6 +9828,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -9799,6 +9970,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -9983,6 +10155,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -10099,6 +10272,7 @@ BTC is currently around $65,000 based on latest tool output."#
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -10686,6 +10860,7 @@ This is an example JSON object for profile settings."#;
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         // Simulate a photo attachment message with [IMAGE:] marker.
@@ -10782,6 +10957,7 @@ This is an example JSON object for profile settings."#;
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -10912,6 +11088,7 @@ This is an example JSON object for profile settings."#;
             debouncer: Arc::new(debounce::MessageDebouncer::new(std::time::Duration::ZERO)),
             media_pipeline: crate::config::MediaPipelineConfig::default(),
             transcription_config: crate::config::TranscriptionConfig::default(),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -11086,6 +11263,7 @@ This is an example JSON object for profile settings."#;
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -11206,6 +11384,7 @@ This is an example JSON object for profile settings."#;
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -11318,6 +11497,7 @@ This is an example JSON object for profile settings."#;
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -11450,6 +11630,7 @@ This is an example JSON object for profile settings."#;
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         process_channel_message(
@@ -11723,6 +11904,7 @@ This is an example JSON object for profile settings."#;
             max_tool_result_chars: 0,
             context_token_budget: 0,
             debouncer: Arc::new(debounce::MessageDebouncer::new(Duration::ZERO)),
+            checkpoint_store: None,
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);

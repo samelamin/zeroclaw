@@ -1385,10 +1385,50 @@ pub struct AgentConfig {
     /// Microcompaction config for surgical tool-result trimming before LLM calls.
     #[serde(default)]
     pub microcompaction: crate::agent::microcompactor::MicrocompactionConfig,
+
+    /// Conversation checkpointing configuration.
+    #[serde(default)]
+    pub checkpoint: CheckpointConfig,
 }
 
 fn default_max_tool_result_chars() -> usize {
     50_000
+}
+
+// ── Checkpoint defaults ──────────────────────────────────────────
+
+fn default_checkpoint_enabled() -> bool {
+    false
+}
+fn default_checkpoint_auto_interval() -> usize {
+    0
+}
+fn default_checkpoint_max_per_session() -> usize {
+    50
+}
+
+/// Conversation checkpointing configuration (`checkpoint` sub-section of `[agent]`).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct CheckpointConfig {
+    /// Enable conversation checkpointing. Default: `false`.
+    #[serde(default = "default_checkpoint_enabled")]
+    pub enabled: bool,
+    /// Auto-checkpoint every N user messages. `0` disables auto-checkpointing. Default: `0`.
+    #[serde(default = "default_checkpoint_auto_interval")]
+    pub auto_interval: usize,
+    /// Maximum checkpoints retained per session. Default: `50`.
+    #[serde(default = "default_checkpoint_max_per_session")]
+    pub max_per_session: usize,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_checkpoint_enabled(),
+            auto_interval: default_checkpoint_auto_interval(),
+            max_per_session: default_checkpoint_max_per_session(),
+        }
+    }
 }
 
 fn default_keep_tool_context_turns() -> usize {
@@ -1437,6 +1477,7 @@ impl Default for AgentConfig {
             max_tool_result_chars: default_max_tool_result_chars(),
             keep_tool_context_turns: default_keep_tool_context_turns(),
             microcompaction: crate::agent::microcompactor::MicrocompactionConfig::default(),
+            checkpoint: CheckpointConfig::default(),
         }
     }
 }
