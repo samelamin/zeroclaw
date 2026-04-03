@@ -99,6 +99,9 @@ pub struct WhatsAppWebChannel {
     /// Platform type shown in WhatsApp's Linked Devices list.
     /// Stored as a string; converted to `wa_rs_proto` type at connect time.
     platform_type: Option<String>,
+    /// Timestamp of the last event received from the WhatsApp Web socket.
+    /// Used by the liveness watchdog and health check to detect silent stream death.
+    last_event_at: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl WhatsAppWebChannel {
@@ -163,6 +166,7 @@ impl WhatsAppWebChannel {
             dm_mention_patterns: Arc::new(Vec::new()),
             group_mention_patterns: Arc::new(Vec::new()),
             platform_type: None,
+            last_event_at: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -1243,6 +1247,7 @@ impl Channel for WhatsAppWebChannel {
             let bot_phone_clone = self.bot_phone.clone();
             let wa_dm_mention_patterns = self.dm_mention_patterns.clone();
             let wa_group_mention_patterns = self.group_mention_patterns.clone();
+            let last_event_at_clone = self.last_event_at.clone();
 
             let platform = Self::resolve_platform_type(self.platform_type.as_deref())
                 .unwrap_or(wa_rs_proto::whatsapp::device_props::PlatformType::Desktop);
@@ -1267,7 +1272,17 @@ impl Channel for WhatsAppWebChannel {
                     let bot_phone_inner = bot_phone_clone.clone();
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
                     let wa_group_mention_patterns = wa_group_mention_patterns.clone();
+                    let last_event_at = last_event_at_clone.clone();
                     async move {
+                        // Record that we received an event — liveness watchdog reads this.
+                        last_event_at.store(
+                            std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_secs(),
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+
                         match event {
                             Event::Message(msg, info) => {
                                 let sender_jid = info.source.sender.clone();
@@ -1536,7 +1551,14 @@ impl Channel for WhatsAppWebChannel {
                                 let _ = logout_tx.send(());
                             }
                             Event::StreamError(stream_error) => {
-                                tracing::error!("WhatsApp Web stream error: {:?}", stream_error);
+                                tracing::error!(
+                                    "WhatsApp Web stream error (triggering reconnect): {:?}",
+                                    stream_error
+                                );
+                                // StreamError means the WebSocket died — trigger reconnect.
+                                // Without this, the bot task stays alive but deaf: no events
+                                // arrive, the select! never resolves, and the stream is dead.
+                                let _ = logout_tx.send(());
                             }
                             Event::PairingCode { code, .. } => {
                                 tracing::info!("WhatsApp Web pair code received");
@@ -1599,11 +1621,27 @@ impl Channel for WhatsAppWebChannel {
             // Store the bot handle for later shutdown
             *self.bot_handle.lock() = Some(bot_handle);
 
+            // Seed liveness timestamp so the watchdog doesn't fire immediately.
+            self.last_event_at.store(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+
             // Drop the outer sender so logout_rx.recv() returns Err when the
             // bot task ends without emitting LoggedOut (e.g. crash/panic).
             drop(logout_tx);
 
-            // Wait for a logout signal or process shutdown.
+            // Liveness watchdog: if no events arrive within this window the
+            // WebSocket is considered dead and we trigger a reconnect.
+            // WhatsApp servers send keepalive pings roughly every 30-60 s,
+            // so 120 s without any event is a strong signal the stream died.
+            const LIVENESS_TIMEOUT_SECS: u64 = 120;
+            let liveness_check = self.last_event_at.clone();
+
+            // Wait for a logout signal, liveness timeout, or process shutdown.
             let should_reconnect = select! {
                 res = logout_rx.recv() => {
                     // Both Ok(()) and Err (sender dropped) mean the session ended.
@@ -1613,6 +1651,36 @@ impl Channel for WhatsAppWebChannel {
                 _ = tokio::signal::ctrl_c() => {
                     tracing::info!("WhatsApp Web channel received Ctrl+C");
                     false
+                }
+                _ = async {
+                    // Poll every 30 s, checking how long since the last event.
+                    let mut interval = tokio::time::interval(
+                        std::time::Duration::from_secs(30),
+                    );
+                    interval.set_missed_tick_behavior(
+                        tokio::time::MissedTickBehavior::Skip,
+                    );
+                    loop {
+                        interval.tick().await;
+                        let last = liveness_check.load(
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs();
+                        if last > 0 && now.saturating_sub(last) > LIVENESS_TIMEOUT_SECS {
+                            tracing::warn!(
+                                last_event_secs_ago = now.saturating_sub(last),
+                                timeout = LIVENESS_TIMEOUT_SECS,
+                                "WhatsApp Web liveness watchdog: no events received — \
+                                 stream appears dead, triggering reconnect"
+                            );
+                            break;
+                        }
+                    }
+                } => {
+                    true
                 }
             };
 
@@ -1681,8 +1749,26 @@ impl Channel for WhatsAppWebChannel {
     }
 
     async fn health_check(&self) -> bool {
-        let bot_handle_guard = self.bot_handle.lock();
-        bot_handle_guard.is_some()
+        // Check that the bot handle exists AND the stream is alive.
+        // A handle can exist while the stream is silently dead.
+        let has_handle = self.bot_handle.lock().is_some();
+        if !has_handle {
+            return false;
+        }
+
+        // Verify the stream received an event recently (within 2x liveness timeout).
+        let last = self.last_event_at.load(std::sync::atomic::Ordering::Relaxed);
+        if last == 0 {
+            // Bot just started, haven't received first event yet — assume healthy.
+            return true;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        // Allow 240s (2x watchdog timeout) before reporting unhealthy.
+        // The watchdog will trigger reconnect at 120s, so this gives it time.
+        now.saturating_sub(last) < 240
     }
 
     async fn start_typing(&self, recipient: &str) -> Result<()> {
