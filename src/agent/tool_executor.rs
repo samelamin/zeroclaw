@@ -6,7 +6,8 @@
 
 use crate::tools::{Tool, ToolResult};
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 // ── Retry Policy ────────────────────────────────────────────────────
 
@@ -67,17 +68,65 @@ fn is_retryable(result: &ToolResult) -> bool {
     !non_retryable.iter().any(|pat| error_text.contains(pat))
 }
 
+// ── Circuit Breaker ────────────────────────────────────────────────
+
+/// Configuration for the per-tool circuit breaker.
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerConfig {
+    /// Number of failures within the window before the breaker opens. Default: 5.
+    pub failure_threshold: usize,
+    /// Rolling window in seconds. Failures older than this are discarded. Default: 60.
+    pub window_secs: u64,
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self {
+            failure_threshold: 5,
+            window_secs: 60,
+        }
+    }
+}
+
+/// Tracks failure timestamps for a single tool.
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerState {
+    /// Timestamps of recent failures (within the rolling window).
+    failures: Vec<Instant>,
+    /// When the breaker tripped (became open). `None` if closed.
+    opened_at: Option<Instant>,
+    /// Whether we are in half-open state (allowing a single probe request).
+    half_open: bool,
+}
+
+impl CircuitBreakerState {
+    fn new() -> Self {
+        Self {
+            failures: Vec::new(),
+            opened_at: None,
+            half_open: false,
+        }
+    }
+}
+
 // ── Executor ────────────────────────────────────────────────────────
 
 /// Tool executor wrapping `Tool::execute()` with retry and timeout.
 pub struct ToolExecutor {
     default_timeout: Duration,
     policies: HashMap<String, ToolRetryPolicy>,
+    breaker_config: CircuitBreakerConfig,
+    breaker_state: Arc<Mutex<HashMap<String, CircuitBreakerState>>>,
 }
 
 impl ToolExecutor {
     /// Create a new executor with default policies for known tools.
     pub fn new() -> Self {
+        Self::new_with_circuit_breaker(CircuitBreakerConfig::default())
+    }
+
+    /// Create a new executor with a custom circuit breaker configuration.
+    pub fn new_with_circuit_breaker(config: CircuitBreakerConfig) -> Self {
         let mut policies = HashMap::new();
 
         for name in &["file_read", "content_search", "glob_search"] {
@@ -104,11 +153,45 @@ impl ToolExecutor {
         Self {
             default_timeout: Duration::from_secs(60),
             policies,
+            breaker_config: config,
+            breaker_state: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Execute a tool with retry policy.
+    /// Execute a tool with retry policy and circuit breaker.
     pub async fn execute(&self, tool: &dyn Tool, args: serde_json::Value) -> ToolResult {
+        let tool_name = tool.name().to_string();
+        let window = Duration::from_secs(self.breaker_config.window_secs);
+
+        // ── Check circuit breaker ──────────────────────────────────
+        {
+            let mut states = self.breaker_state.lock().unwrap();
+            let state = states
+                .entry(tool_name.clone())
+                .or_insert_with(CircuitBreakerState::new);
+
+            if let Some(opened_at) = state.opened_at {
+                if opened_at.elapsed() >= window {
+                    // Window expired — transition to half-open (allow one probe).
+                    state.half_open = true;
+                    state.opened_at = None;
+                } else {
+                    // Breaker is still open.
+                    return ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Tool '{}': circuit breaker open ({} failures in {}s window)",
+                            tool_name,
+                            self.breaker_config.failure_threshold,
+                            self.breaker_config.window_secs,
+                        )),
+                    };
+                }
+            }
+        }
+
+        // ── Normal execution with retry ────────────────────────────
         let policy = self.policies.get(tool.name()).cloned().unwrap_or_default();
 
         let mut last_result = ToolResult {
@@ -140,7 +223,7 @@ impl ToolExecutor {
             };
 
             if last_result.success || !is_retryable(&last_result) {
-                return last_result;
+                break;
             }
 
             if attempt + 1 >= max_attempts {
@@ -158,6 +241,42 @@ impl ToolExecutor {
                 "Tool failed, retrying"
             );
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
+        }
+
+        // ── Update circuit breaker state ───────────────────────────
+        {
+            let mut states = self.breaker_state.lock().unwrap();
+            let state = states
+                .entry(tool_name.clone())
+                .or_insert_with(CircuitBreakerState::new);
+
+            if last_result.success {
+                // Success resets all failure tracking.
+                state.failures.clear();
+                state.half_open = false;
+                state.opened_at = None;
+            } else {
+                let now = Instant::now();
+
+                if state.half_open {
+                    // Probe failed — re-open the breaker.
+                    state.half_open = false;
+                    state.opened_at = Some(now);
+                } else {
+                    // Record failure and prune old entries.
+                    state.failures.push(now);
+                    state.failures.retain(|t| now.duration_since(*t) < window);
+
+                    if state.failures.len() >= self.breaker_config.failure_threshold {
+                        state.opened_at = Some(now);
+                        tracing::warn!(
+                            tool = %tool_name,
+                            failures = state.failures.len(),
+                            "Circuit breaker tripped"
+                        );
+                    }
+                }
+            }
         }
 
         last_result
@@ -287,6 +406,148 @@ mod tests {
         let result = executor.execute(&tool, serde_json::json!({})).await;
         assert!(!result.success);
         assert!(result.error.unwrap().contains("connection reset"));
+    }
+
+    /// A tool that always fails (for circuit breaker tests).
+    struct AlwaysFails {
+        name: String,
+    }
+
+    impl AlwaysFails {
+        fn new(name: &str) -> Self {
+            Self {
+                name: name.to_string(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Tool for AlwaysFails {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn description(&self) -> &str {
+            "always fails"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("connection reset".into()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_trips_after_threshold() {
+        let executor = ToolExecutor::new_with_circuit_breaker(CircuitBreakerConfig {
+            failure_threshold: 5,
+            window_secs: 60,
+        });
+        let tool = AlwaysFails::new("cb_test_tool");
+
+        // First 5 calls should execute (and fail normally).
+        for i in 0..5 {
+            let result = executor.execute(&tool, serde_json::json!({})).await;
+            assert!(!result.success, "call {i} should fail");
+            assert!(
+                !result
+                    .error
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("circuit breaker open"),
+                "call {i} should NOT be circuit-breaker blocked"
+            );
+        }
+
+        // 6th call should be blocked by the circuit breaker.
+        let result = executor.execute(&tool, serde_json::json!({})).await;
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("circuit breaker open"),
+            "6th call should be blocked by circuit breaker"
+        );
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_recovers_after_window() {
+        let executor = ToolExecutor::new_with_circuit_breaker(CircuitBreakerConfig {
+            failure_threshold: 5,
+            window_secs: 1,
+        });
+        let tool = FailNThenSucceed::new("cb_recover_tool", 5);
+
+        // Trip the breaker with 5 failures.
+        for _ in 0..5 {
+            executor.execute(&tool, serde_json::json!({})).await;
+        }
+
+        // Confirm breaker is open.
+        let result = executor.execute(&tool, serde_json::json!({})).await;
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("circuit breaker open"),
+            "breaker should be open"
+        );
+
+        // Wait for the window to expire.
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        // Next call should go through (half-open probe) and succeed
+        // because FailNThenSucceed has exhausted its failures.
+        let result = executor.execute(&tool, serde_json::json!({})).await;
+        assert!(
+            !result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("circuit breaker open"),
+            "breaker should allow probe after window expires"
+        );
+    }
+
+    #[tokio::test]
+    async fn circuit_breaker_resets_on_success() {
+        let executor = ToolExecutor::new_with_circuit_breaker(CircuitBreakerConfig {
+            failure_threshold: 5,
+            window_secs: 60,
+        });
+
+        // Fail twice, then succeed (resets counter).
+        let tool1 = FailNThenSucceed::new("cb_reset_tool", 2);
+        for _ in 0..2 {
+            executor.execute(&tool1, serde_json::json!({})).await;
+        }
+        // Third call succeeds (resets breaker state).
+        let result = executor.execute(&tool1, serde_json::json!({})).await;
+        assert!(result.success, "should succeed and reset breaker");
+
+        // Fail twice more — total since reset is 2 (below threshold of 5).
+        let tool2 = AlwaysFails::new("cb_reset_tool");
+        for _ in 0..2 {
+            executor.execute(&tool2, serde_json::json!({})).await;
+        }
+
+        // Next call should NOT be blocked (only 2 failures since reset).
+        let result = executor.execute(&tool2, serde_json::json!({})).await;
+        assert!(
+            !result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("circuit breaker open"),
+            "breaker should NOT be open — only 2 failures since last reset"
+        );
     }
 
     #[test]
