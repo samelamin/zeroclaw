@@ -531,28 +531,46 @@ struct Choice {
     message: ResponseMessage,
 }
 
-/// Remove `<think>...</think>` blocks from model output.
-/// Some reasoning models (e.g. MiniMax) embed their chain-of-thought inline
-/// in the `content` field rather than a separate `reasoning_content` field.
-/// The resulting `<think>` tags must be stripped before returning to the user.
-fn strip_think_tags(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut rest = s;
+/// Extract visible text and reasoning content from a model response.
+/// Models like MiniMax embed chain-of-thought in `<think>...</think>` blocks
+/// inline in the `content` field rather than a separate `reasoning_content` field.
+/// Returns `(visible_text, Option<reasoning_content>)`.
+fn extract_content_and_reasoning(raw: &str) -> (String, Option<String>) {
+    let mut visible = String::with_capacity(raw.len());
+    let mut reasoning = String::new();
+    let mut rest = raw;
     loop {
         if let Some(start) = rest.find("<think>") {
-            result.push_str(&rest[..start]);
-            if let Some(end) = rest[start..].find("</think>") {
-                rest = &rest[start + end + "</think>".len()..];
+            visible.push_str(&rest[..start]);
+            let after_open = &rest[start + "<think>".len()..];
+            if let Some(end) = after_open.find("</think>") {
+                reasoning.push_str(&after_open[..end]);
+                reasoning.push('\n');
+                rest = &after_open[end + "</think>".len()..];
             } else {
-                // Unclosed tag: drop the rest to avoid leaking partial reasoning.
+                // Unclosed tag: capture remaining as reasoning, drop from visible.
+                reasoning.push_str(after_open);
                 break;
             }
         } else {
-            result.push_str(rest);
+            visible.push_str(rest);
             break;
         }
     }
-    result.trim().to_string()
+    let visible = visible.trim().to_string();
+    let reasoning = reasoning.trim().to_string();
+    let reasoning = if reasoning.is_empty() {
+        None
+    } else {
+        Some(reasoning)
+    };
+    (visible, reasoning)
+}
+
+/// Convenience wrapper: strip `<think>` blocks and return only the visible text.
+/// Used in code paths that cannot propagate reasoning content (e.g. `chat_with_history`).
+fn strip_think_tags(s: &str) -> String {
+    extract_content_and_reasoning(s).0
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -600,6 +618,48 @@ impl ResponseMessage {
             .as_ref()
             .map(|c| strip_think_tags(c))
             .filter(|c| !c.is_empty())
+    }
+
+    /// Extract visible text and merged reasoning content.
+    /// Returns `(Option<visible_text>, Option<reasoning_content>)`.
+    ///
+    /// Reasoning is composed of:
+    /// 1. Any `<think>...</think>` blocks extracted from `content`
+    /// 2. The existing `reasoning_content` field from the API response
+    ///
+    /// When both sources provide reasoning, they are concatenated with a newline.
+    fn extract_text_and_reasoning(&self) -> (Option<String>, Option<String>) {
+        let (visible, inline_reasoning) =
+            if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
+                let (vis, reasoning) = extract_content_and_reasoning(content);
+                let vis = if vis.is_empty() { None } else { Some(vis) };
+                (vis, reasoning)
+            } else {
+                (None, None)
+            };
+
+        // If visible text is empty, fall back to reasoning_content (stripped of think tags)
+        let visible = visible.or_else(|| {
+            self.reasoning_content
+                .as_ref()
+                .map(|c| strip_think_tags(c))
+                .filter(|c| !c.is_empty())
+        });
+
+        // Merge inline reasoning with the API-level reasoning_content field
+        let merged_reasoning = match (&inline_reasoning, &self.reasoning_content) {
+            (Some(inline), Some(api)) => {
+                let mut merged = inline.clone();
+                merged.push('\n');
+                merged.push_str(api);
+                Some(merged)
+            }
+            (Some(inline), None) => Some(inline.clone()),
+            (None, Some(api)) => Some(api.clone()),
+            (None, None) => None,
+        };
+
+        (visible, merged_reasoning)
     }
 }
 
@@ -1552,8 +1612,7 @@ impl OpenAiCompatibleProvider {
     }
 
     fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
-        let text = message.effective_content_optional();
-        let reasoning_content = message.reasoning_content.clone();
+        let (text, reasoning_content) = message.extract_text_and_reasoning();
         let tool_calls = message
             .tool_calls
             .unwrap_or_default()
@@ -1957,8 +2016,7 @@ impl Provider for OpenAiCompatibleProvider {
             .next()
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
-        let text = choice.message.effective_content_optional();
-        let reasoning_content = choice.message.reasoning_content;
+        let (text, reasoning_content) = choice.message.extract_text_and_reasoning();
         let tool_calls = choice
             .message
             .tool_calls
@@ -3145,6 +3203,46 @@ mod tests {
         assert_eq!(strip_think_tags(input), "visible");
     }
 
+    // ----------------------------------------------------------
+    // extract_content_and_reasoning tests
+    // ----------------------------------------------------------
+
+    #[test]
+    fn extract_content_and_reasoning_single_block() {
+        let (text, reasoning) =
+            extract_content_and_reasoning("<think>reasoning</think>visible text");
+        assert_eq!(text, "visible text");
+        assert_eq!(reasoning.as_deref(), Some("reasoning"));
+    }
+
+    #[test]
+    fn extract_content_and_reasoning_multiple_blocks() {
+        let (text, reasoning) = extract_content_and_reasoning("<think>a</think>X<think>b</think>Y");
+        assert_eq!(text, "XY");
+        assert_eq!(reasoning.as_deref(), Some("a\nb"));
+    }
+
+    #[test]
+    fn extract_content_and_reasoning_no_tags() {
+        let (text, reasoning) = extract_content_and_reasoning("plain text");
+        assert_eq!(text, "plain text");
+        assert!(reasoning.is_none());
+    }
+
+    #[test]
+    fn extract_content_and_reasoning_unclosed_tag() {
+        let (text, reasoning) = extract_content_and_reasoning("visible<think>hidden");
+        assert_eq!(text, "visible");
+        assert_eq!(reasoning.as_deref(), Some("hidden"));
+    }
+
+    #[test]
+    fn extract_content_and_reasoning_only_think_tags() {
+        let (text, reasoning) = extract_content_and_reasoning("<think>all reasoning</think>");
+        assert_eq!(text, "");
+        assert_eq!(reasoning.as_deref(), Some("all reasoning"));
+    }
+
     #[test]
     fn native_tool_schema_unsupported_detection_is_precise() {
         assert!(OpenAiCompatibleProvider::is_native_tool_schema_unsupported(
@@ -3629,6 +3727,52 @@ mod tests {
         let input = "Visible<think>hidden tail";
         let output = strip_think_tags(input);
         assert_eq!(output, "Visible");
+    }
+
+    #[test]
+    fn extract_text_and_reasoning_merges_inline_and_api_reasoning() {
+        let json = r#"{"choices":[{"message":{"content":"<think>inline thought</think>Hello","reasoning_content":"api reasoning"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        let (text, reasoning) = msg.extract_text_and_reasoning();
+        assert_eq!(text.as_deref(), Some("Hello"));
+        let reasoning = reasoning.unwrap();
+        assert!(reasoning.contains("inline thought"));
+        assert!(reasoning.contains("api reasoning"));
+    }
+
+    #[test]
+    fn extract_text_and_reasoning_inline_only() {
+        let json = r#"{"choices":[{"message":{"content":"<think>thought</think>visible"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        let (text, reasoning) = msg.extract_text_and_reasoning();
+        assert_eq!(text.as_deref(), Some("visible"));
+        assert_eq!(reasoning.as_deref(), Some("thought"));
+    }
+
+    #[test]
+    fn extract_text_and_reasoning_api_reasoning_only() {
+        let json =
+            r#"{"choices":[{"message":{"content":"Hello","reasoning_content":"api only"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        let (text, reasoning) = msg.extract_text_and_reasoning();
+        assert_eq!(text.as_deref(), Some("Hello"));
+        assert_eq!(reasoning.as_deref(), Some("api only"));
+    }
+
+    #[test]
+    fn extract_text_and_reasoning_content_only_think_falls_back() {
+        // Content is only think tags -> visible is empty -> falls back to reasoning_content
+        let json = r#"{"choices":[{"message":{"content":"<think>secret</think>","reasoning_content":"Fallback text"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        let (text, reasoning) = msg.extract_text_and_reasoning();
+        assert_eq!(text.as_deref(), Some("Fallback text"));
+        let reasoning = reasoning.unwrap();
+        assert!(reasoning.contains("secret"));
+        assert!(reasoning.contains("Fallback text"));
     }
 
     // ----------------------------------------------------------
