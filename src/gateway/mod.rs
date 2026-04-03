@@ -26,6 +26,8 @@ use crate::channels::{
     Channel, GmailPushChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel,
     WhatsAppChannel, session_backend::SessionBackend, session_sqlite::SqliteSessionBackend,
 };
+#[cfg(feature = "whatsapp-web")]
+use crate::channels::WhatsAppWebChannel;
 use crate::config::Config;
 use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
@@ -597,6 +599,32 @@ pub async fn run_gateway(
         })
         .map(Arc::from);
 
+    // WhatsApp Web channel for the send API (if configured).
+    // The channel is not started via listen() here — send() automatically falls
+    // back to cold_send(), which opens a one-shot session using the saved
+    // credentials. This is the same path used by `zeroclaw channel send`.
+    #[cfg(feature = "whatsapp-web")]
+    let whatsapp_web_channel: Option<Arc<dyn crate::channels::traits::Channel>> = config
+        .channels_config
+        .whatsapp
+        .as_ref()
+        .filter(|wa| wa.is_web_config())
+        .map(|wa| {
+            Arc::new(WhatsAppWebChannel::new(
+                wa.session_path.clone().unwrap_or_default(),
+                wa.pair_phone.clone(),
+                wa.pair_code.clone(),
+                wa.allowed_numbers.clone(),
+                wa.mention_only,
+                wa.mode.clone(),
+                wa.dm_policy.clone(),
+                wa.group_policy.clone(),
+                wa.self_chat_mode,
+            )) as Arc<dyn crate::channels::traits::Channel>
+        });
+    #[cfg(not(feature = "whatsapp-web"))]
+    let whatsapp_web_channel: Option<Arc<dyn crate::channels::traits::Channel>> = None;
+
     // Linq channel (if configured)
     let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
         Arc::new(LinqChannel::new(
@@ -850,7 +878,7 @@ pub async fn run_gateway(
         idempotency_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
-        whatsapp_web: None,
+        whatsapp_web: whatsapp_web_channel,
         linq: linq_channel,
         linq_signing_secret,
         nextcloud_talk: nextcloud_talk_channel,
