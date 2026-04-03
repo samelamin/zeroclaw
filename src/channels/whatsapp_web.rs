@@ -102,6 +102,10 @@ pub struct WhatsAppWebChannel {
     /// Timestamp of the last event received from the WhatsApp Web socket.
     /// Used by the liveness watchdog and health check to detect silent stream death.
     last_event_at: Arc<std::sync::atomic::AtomicU64>,
+    /// Dedup store for preventing duplicate message processing across restarts.
+    dedup_store: Arc<Mutex<Option<Arc<super::whatsapp_storage::RusqliteStore>>>>,
+    /// Chats currently showing typing indicator, with start time.
+    typing_started: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
 }
 
 impl WhatsAppWebChannel {
@@ -167,6 +171,8 @@ impl WhatsAppWebChannel {
             group_mention_patterns: Arc::new(Vec::new()),
             platform_type: None,
             last_event_at: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            dedup_store: Arc::new(Mutex::new(None)),
+            typing_started: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -898,6 +904,28 @@ impl WhatsAppWebChannel {
 
         Ok(())
     }
+
+    /// Structured health information for the /health endpoint.
+    pub fn health_info(&self) -> serde_json::Value {
+        let has_handle = self.bot_handle.lock().is_some();
+        let has_client = self.client.lock().is_some();
+        let last_event = self.last_event_at.load(std::sync::atomic::Ordering::Relaxed);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        serde_json::json!({
+            "ws_open": has_handle && has_client,
+            "last_event_at": if last_event > 0 { Some(last_event) } else { None },
+            "last_event_secs_ago": if last_event > 0 {
+                Some(now.saturating_sub(last_event))
+            } else {
+                None
+            },
+            "healthy": has_handle && (last_event == 0 || now.saturating_sub(last_event) < 240),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1158,6 +1186,12 @@ impl Channel for WhatsAppWebChannel {
             // Fall through to send text normally (voice chat gets BOTH)
         }
 
+        // Stop typing before sending — transition from "typing…" → message.
+        let _ = client.chatstate().send_paused(&to).await;
+        if let Ok(mut ts) = self.typing_started.lock() {
+            ts.remove(&message.recipient);
+        }
+
         // Send text message
         let outgoing = wa_rs_proto::whatsapp::Message {
             conversation: Some(message.content.clone()),
@@ -1199,6 +1233,7 @@ impl Channel for WhatsAppWebChannel {
             // Initialize storage backend
             let storage = RusqliteStore::new(&expanded_session_path)?;
             let backend = Arc::new(storage);
+            *self.dedup_store.lock() = Some(Arc::clone(&backend));
 
             // Check if we have a saved device to load
             let mut device = Device::new(backend.clone());
@@ -1248,6 +1283,8 @@ impl Channel for WhatsAppWebChannel {
             let wa_dm_mention_patterns = self.dm_mention_patterns.clone();
             let wa_group_mention_patterns = self.group_mention_patterns.clone();
             let last_event_at_clone = self.last_event_at.clone();
+            let dedup_store_clone = self.dedup_store.clone();
+            let typing_started_clone = self.typing_started.clone();
 
             let platform = Self::resolve_platform_type(self.platform_type.as_deref())
                 .unwrap_or(wa_rs_proto::whatsapp::device_props::PlatformType::Desktop);
@@ -1273,6 +1310,8 @@ impl Channel for WhatsAppWebChannel {
                     let wa_dm_mention_patterns = wa_dm_mention_patterns.clone();
                     let wa_group_mention_patterns = wa_group_mention_patterns.clone();
                     let last_event_at = last_event_at_clone.clone();
+                    let dedup_store = dedup_store_clone.clone();
+                    let typing_started_inner = typing_started_clone.clone();
                     async move {
                         // Record that we received an event — liveness watchdog reads this.
                         last_event_at.store(
@@ -1285,6 +1324,63 @@ impl Channel for WhatsAppWebChannel {
 
                         match event {
                             Event::Message(msg, info) => {
+                                // ── Dedup: skip already-processed messages (24h window) ──
+                                let msg_id_str = info.id.clone();
+                                if let Some(ref ds) = *dedup_store.lock() {
+                                    if ds.has_seen_message(&msg_id_str) {
+                                        tracing::debug!(
+                                            "WhatsApp Web: duplicate message {}, skipping",
+                                            msg_id_str
+                                        );
+                                        return;
+                                    }
+                                    ds.mark_message_seen(&msg_id_str);
+                                }
+
+                                // ── Read receipt: blue ticks signal the system is alive ──
+                                // TODO: wa-rs 0.2.0 does not expose a public send_read_receipt
+                                // method. Uncomment when the API adds one.
+                                // {
+                                //     let receipt_chat = info.source.chat.clone();
+                                //     let receipt_sender = info.source.sender.clone();
+                                //     let receipt_id = info.id.clone();
+                                //     let receipt_client = client.clone();
+                                //     tokio::spawn(async move {
+                                //         if let Err(e) = receipt_client
+                                //             .send_read_receipt(
+                                //                 &receipt_chat,
+                                //                 &receipt_sender,
+                                //                 &[receipt_id],
+                                //             )
+                                //             .await
+                                //         {
+                                //             tracing::debug!(
+                                //                 "WhatsApp Web: read receipt failed: {e}"
+                                //             );
+                                //         }
+                                //     });
+                                // }
+
+                                // ── Start typing immediately ──
+                                {
+                                    let typing_chat = info.source.chat.clone();
+                                    let typing_client = client.clone();
+                                    if let Ok(mut ts) = typing_started_inner.lock() {
+                                        ts.insert(typing_chat.to_string(), std::time::Instant::now());
+                                    }
+                                    tokio::spawn(async move {
+                                        if let Err(e) = typing_client
+                                            .chatstate()
+                                            .send_composing(&typing_chat)
+                                            .await
+                                        {
+                                            tracing::debug!(
+                                                "WhatsApp Web: start typing failed: {e}"
+                                            );
+                                        }
+                                    });
+                                }
+
                                 let sender_jid = info.source.sender.clone();
                                 let sender_alt = info.source.sender_alt.clone();
                                 let sender = sender_jid.user().to_string();
@@ -1630,6 +1726,74 @@ impl Channel for WhatsAppWebChannel {
                 std::sync::atomic::Ordering::Relaxed,
             );
 
+            // Presence keepalive: send available every 4 minutes.
+            let keepalive_client = bot.client();
+            let keepalive_last_event = self.last_event_at.clone();
+            let keepalive_task = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(240));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    // Best-effort presence keepalive.
+                    let _ = keepalive_client.presence().set_available().await;
+                    keepalive_last_event.store(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                    tracing::debug!("WhatsApp Web: presence keepalive tick");
+                }
+            });
+
+            // Typing safety timeout: clear phantom typing after 120s.
+            let typing_cleanup_client = bot.client();
+            let typing_cleanup_started = self.typing_started.clone();
+            let typing_cleanup_task = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    let stale: Vec<String> = typing_cleanup_started
+                        .lock()
+                        .map(|ts| {
+                            ts.iter()
+                                .filter(|(_, started)| started.elapsed().as_secs() > 120)
+                                .map(|(chat, _)| chat.clone())
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    for chat_str in &stale {
+                        if let Ok(jid) = chat_str.parse() {
+                            let _ = typing_cleanup_client.chatstate().send_paused(&jid).await;
+                        }
+                    }
+                    if !stale.is_empty() {
+                        if let Ok(mut ts) = typing_cleanup_started.lock() {
+                            for chat in &stale {
+                                ts.remove(chat);
+                            }
+                        }
+                        tracing::debug!(count = stale.len(), "WhatsApp Web: cleared stale typing indicators");
+                    }
+                }
+            });
+
+            // Dedup prune: clean old entries every hour.
+            let prune_store = self.dedup_store.clone();
+            let prune_task = tokio::spawn(async move {
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    interval.tick().await;
+                    if let Some(ref store) = *prune_store.lock() {
+                        store.prune_dedup();
+                        tracing::debug!("WhatsApp Web: pruned stale dedup entries");
+                    }
+                }
+            });
+
             // Drop the outer sender so logout_rx.recv() returns Err when the
             // bot task ends without emitting LoggedOut (e.g. crash/panic).
             drop(logout_tx);
@@ -1692,6 +1856,9 @@ impl Channel for WhatsAppWebChannel {
                 // we delete session files.
                 let _ = handle.await;
             }
+            keepalive_task.abort();
+            typing_cleanup_task.abort();
+            prune_task.abort();
 
             // Drop bot/device so the SQLite connection is closed
             // before we remove session files (releases WAL/SHM locks).
