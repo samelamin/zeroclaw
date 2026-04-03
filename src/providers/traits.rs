@@ -92,6 +92,8 @@ impl ChatResponse {
 pub struct ChatRequest<'a> {
     pub messages: &'a [ChatMessage],
     pub tools: Option<&'a [ToolSpec]>,
+    /// Optional thinking level to control reasoning depth for thinking models.
+    pub thinking_level: Option<crate::agent::thinking::ThinkingLevel>,
 }
 
 /// A tool result to feed back to the LLM.
@@ -864,6 +866,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: Some(&tools),
+            thinking_level: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -881,6 +884,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: None,
+            thinking_level: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -981,6 +985,7 @@ mod tests {
                 ChatMessage::system("BASE_SYSTEM_PROMPT"),
             ],
             tools: Some(&tools),
+            thinking_level: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -1003,6 +1008,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::system("BASE"), ChatMessage::user("Hello")],
             tools: Some(&tools),
+            thinking_level: None,
         };
 
         let response = provider.chat(request, "model", 0.7).await.unwrap();
@@ -1025,6 +1031,7 @@ mod tests {
         let request = ChatRequest {
             messages: &[ChatMessage::user("Hello")],
             tools: Some(&tools),
+            thinking_level: None,
         };
 
         let err = provider.chat(request, "model", 0.7).await.unwrap_err();
@@ -1073,6 +1080,7 @@ mod tests {
             ChatRequest {
                 messages: &[ChatMessage::user("hi")],
                 tools: None,
+                thinking_level: None,
             },
             "model",
             0.0,

@@ -2032,6 +2032,7 @@ async fn consume_provider_streaming_response(
         ChatRequest {
             messages,
             tools: request_tools,
+            thinking_level: None,
         },
         model,
         temperature,
@@ -3015,6 +3016,7 @@ pub(crate) async fn run_tool_call_loop(
                             ChatRequest {
                                 messages: &prepared_messages.messages,
                                 tools: request_tools,
+                                thinking_level: None,
                             },
                             active_model,
                             temperature,
@@ -3037,6 +3039,7 @@ pub(crate) async fn run_tool_call_loop(
                 ChatRequest {
                     messages: &prepared_messages.messages,
                     tools: request_tools,
+                    thinking_level: None,
                 },
                 active_model,
                 temperature,
@@ -3885,6 +3888,7 @@ pub(crate) async fn run_tool_call_loop(
     let summary_request = crate::providers::ChatRequest {
         messages: history,
         tools: None, // No tools — force a text response
+        thinking_level: None,
     };
     match provider.chat(summary_request, model, temperature).await {
         Ok(resp) => {

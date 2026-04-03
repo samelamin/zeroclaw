@@ -1184,6 +1184,7 @@ mod tests {
             ChatRequest {
                 messages: &messages,
                 tools: Some(&tools),
+                thinking_level: None,
             },
             "hint:reasoning",
             0.0,
