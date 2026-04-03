@@ -4186,16 +4186,18 @@ pub async fn run(
     });
 
     // ── Hardware RAG (datasheet retrieval when peripherals + datasheet_dir) ──
-    let hardware_rag: Option<crate::rag::HardwareRag> = config
-        .peripherals
-        .datasheet_dir
-        .as_ref()
-        .filter(|d| !d.trim().is_empty())
-        .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
-        .and_then(Result::ok)
-        .filter(|r: &crate::rag::HardwareRag| !r.is_empty());
-    if let Some(ref rag) = hardware_rag {
-        tracing::info!(chunks = rag.len(), "Hardware RAG loaded");
+    let hardware_rag: Option<crate::rag::HardwareRag> =
+        (|| -> Option<crate::rag::HardwareRag> {
+            let dir = config.peripherals.datasheet_dir.as_deref()?.trim();
+            if dir.is_empty() {
+                return None;
+            }
+            let rag = crate::rag::HardwareRag::load(&config.workspace_dir, dir).ok()?;
+            if rag.is_empty() { None } else { Some(rag) }
+        })();
+    if let Some(rag) = &hardware_rag {
+        let chunk_count: usize = crate::rag::HardwareRag::len(rag);
+        tracing::info!(chunks = chunk_count, "Hardware RAG loaded");
     }
 
     let board_names: Vec<String> = config
@@ -5141,14 +5143,15 @@ pub async fn process_message(
         &provider_runtime_options,
     )?;
 
-    let hardware_rag: Option<crate::rag::HardwareRag> = config
-        .peripherals
-        .datasheet_dir
-        .as_ref()
-        .filter(|d| !d.trim().is_empty())
-        .map(|dir| crate::rag::HardwareRag::load(&config.workspace_dir, dir.trim()))
-        .and_then(Result::ok)
-        .filter(|r: &crate::rag::HardwareRag| !r.is_empty());
+    let hardware_rag: Option<crate::rag::HardwareRag> =
+        (|| -> Option<crate::rag::HardwareRag> {
+            let dir = config.peripherals.datasheet_dir.as_deref()?.trim();
+            if dir.is_empty() {
+                return None;
+            }
+            let rag = crate::rag::HardwareRag::load(&config.workspace_dir, dir).ok()?;
+            if rag.is_empty() { None } else { Some(rag) }
+        })();
     let board_names: Vec<String> = config
         .peripherals
         .boards

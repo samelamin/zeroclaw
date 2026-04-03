@@ -4619,7 +4619,7 @@ fn setup_channels(existing: Option<ChannelsConfig>) -> Result<ChannelsConfig> {
                             .map(|w| w.group_mention_patterns.clone())
                             .unwrap_or_default(),
                         proxy_url: existing_wa.and_then(|w| w.proxy_url.clone()),
-                        platform_type: None,
+                        platform_type: existing_wa.and_then(|w| w.platform_type.clone()),
                         webhook_forward_url: None,
                         webhook_forward_secret: None,
                         message_coalesce_ms: existing_wa

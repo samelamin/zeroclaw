@@ -1493,7 +1493,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             Ok(())
         }
         crate::SkillCommands::Test { name, verbose } => {
-            let results = if let Some(ref skill_name) = name {
+            let results = if let Some(skill_name) = name.as_deref() {
                 // Test a single skill
                 let source_path = PathBuf::from(skill_name);
                 let target = if source_path.exists() {

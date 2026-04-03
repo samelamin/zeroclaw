@@ -34,8 +34,6 @@ use parking_lot::Mutex;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::select;
-use wa_rs_proto::whatsapp::device_props::PlatformType;
-
 /// WhatsApp Web channel using wa-rs with custom rusqlite storage
 ///
 /// # Status: Functional Implementation
