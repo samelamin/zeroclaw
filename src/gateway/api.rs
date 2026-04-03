@@ -1507,6 +1507,45 @@ pub async fn handle_claude_code_hook(
     Json(serde_json::json!({ "ok": true }))
 }
 
+// ── WhatsApp Web send ────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub(super) struct WhatsAppWebSendBody {
+    pub recipient: String,
+    pub message: String,
+}
+
+/// `POST /api/channels/whatsapp/send` — send a message via the live WhatsApp Web
+/// daemon connection (Baileys-backed). Returns 503 if no channel is wired up yet.
+pub(super) async fn handle_whatsapp_web_send(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<WhatsAppWebSendBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let channel = match &state.whatsapp_web {
+        Some(ch) => ch.clone(),
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "WhatsApp Web channel is not connected"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let msg = crate::channels::traits::SendMessage::new(body.message, body.recipient);
+    match channel.send(&msg).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => error_response(&e, "Failed to send WhatsApp Web message").into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1606,6 +1645,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,

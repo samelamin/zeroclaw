@@ -337,6 +337,8 @@ pub struct AppState {
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
+    /// Live WhatsApp Web channel instance (Baileys-backed daemon connection)
+    pub whatsapp_web: Option<Arc<dyn crate::channels::traits::Channel>>,
     pub linq: Option<Arc<LinqChannel>>,
     /// Linq webhook signing secret for signature verification
     pub linq_signing_secret: Option<Arc<str>>,
@@ -848,6 +850,7 @@ pub async fn run_gateway(
         idempotency_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
+        whatsapp_web: None,
         linq: linq_channel,
         linq_signing_secret,
         nextcloud_talk: nextcloud_talk_channel,
@@ -957,6 +960,10 @@ pub async fn run_gateway(
         )
         .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
         .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
+        .route(
+            "/api/channels/whatsapp/send",
+            post(api::handle_whatsapp_web_send),
+        )
         // ── Pairing + Device management API ──
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
         .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
@@ -2339,6 +2346,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2410,6 +2418,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2805,6 +2814,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2884,6 +2894,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2975,6 +2986,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -3038,6 +3050,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -3106,6 +3119,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -3179,6 +3193,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -3249,6 +3264,7 @@ mod tests {
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: Some(channel),
