@@ -71,6 +71,9 @@ pub struct Agent {
     /// When MCP deferred loading is enabled, tools are activated via `tool_search`
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    /// Optional per-request system prompt override. When set, replaces the
+    /// dynamically built system prompt so callers can inject dynamic context.
+    system_prompt_override: Option<String>,
 }
 
 pub struct AgentBuilder {
@@ -99,6 +102,7 @@ pub struct AgentBuilder {
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
+    system_prompt_override: Option<String>,
 }
 
 impl AgentBuilder {
@@ -129,6 +133,7 @@ impl AgentBuilder {
             security_summary: None,
             autonomy_level: None,
             activated_tools: None,
+            system_prompt_override: None,
         }
     }
 
@@ -325,6 +330,7 @@ impl AgentBuilder {
                 .autonomy_level
                 .unwrap_or(crate::security::AutonomyLevel::Supervised),
             activated_tools: self.activated_tools,
+            system_prompt_override: self.system_prompt_override,
         })
     }
 }
@@ -346,6 +352,16 @@ impl Agent {
         self.memory_session_id = session_id;
     }
 
+    /// Override the system prompt for this agent instance.
+    ///
+    /// When set, the dynamic system prompt built from config/tools/skills is
+    /// replaced by the provided string. Useful for injecting per-business
+    /// context (facts, content blocks) at runtime.
+    pub fn with_system_prompt(mut self, prompt: String) -> Self {
+        self.system_prompt_override = Some(prompt);
+        self
+    }
+
     /// Hydrate the agent with prior chat messages (e.g. from a session backend).
     ///
     /// Ensures a system prompt is prepended if history is empty, then appends all
@@ -353,10 +369,16 @@ impl Agent {
     /// to avoid duplicating the system prompt.
     pub fn seed_history(&mut self, messages: &[ChatMessage]) {
         if self.history.is_empty() {
-            if let Ok(sys) = self.build_system_prompt() {
-                self.history
-                    .push(ConversationMessage::Chat(ChatMessage::system(sys)));
-            }
+            let sys = if let Some(ref override_prompt) = self.system_prompt_override {
+                override_prompt.clone()
+            } else {
+                match self.build_system_prompt() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                }
+            };
+            self.history
+                .push(ConversationMessage::Chat(ChatMessage::system(sys)));
         }
         for msg in messages {
             if msg.role != "system" {
@@ -731,7 +753,11 @@ impl Agent {
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
         if self.history.is_empty() {
-            let system_prompt = self.build_system_prompt()?;
+            let system_prompt = if let Some(ref override_prompt) = self.system_prompt_override {
+                override_prompt.clone()
+            } else {
+                self.build_system_prompt()?
+            };
             self.history
                 .push(ConversationMessage::Chat(ChatMessage::system(
                     system_prompt,
@@ -912,7 +938,11 @@ impl Agent {
     ) -> Result<String> {
         // ── Preamble (identical to turn) ───────────────────────────────
         if self.history.is_empty() {
-            let system_prompt = self.build_system_prompt()?;
+            let system_prompt = if let Some(ref override_prompt) = self.system_prompt_override {
+                override_prompt.clone()
+            } else {
+                self.build_system_prompt()?
+            };
             self.history
                 .push(ConversationMessage::Chat(ChatMessage::system(
                     system_prompt,
