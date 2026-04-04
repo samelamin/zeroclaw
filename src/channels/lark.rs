@@ -1029,6 +1029,7 @@ impl LarkChannel {
                         thread_ts: None,
                         interruption_scope_id: None,
                     attachments: vec![],
+            real_phone: None,
                     };
 
                     tracing::debug!("Lark WS: message in {}", lark_msg.chat_id);
@@ -1556,6 +1557,7 @@ impl LarkChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            real_phone: None,
         }]
     }
 
@@ -1772,6 +1774,7 @@ impl LarkChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            real_phone: None,
         });
 
         messages
