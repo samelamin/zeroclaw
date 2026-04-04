@@ -1559,6 +1559,53 @@ pub(super) async fn handle_whatsapp_web_send(
     }
 }
 
+// ── WhatsApp Web typing ──────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub(super) struct WhatsAppTypingBody {
+    pub recipient: String,
+}
+
+/// `POST /api/channels/whatsapp/typing` — send a "composing" chatstate to the
+/// given recipient. Naseyma calls this before/during inference so the customer
+/// sees a typing indicator. Returns 503 if channel not live.
+pub(super) async fn handle_whatsapp_typing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<WhatsAppTypingBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let channel = match crate::channels::get_live_whatsapp_channel() {
+        Some(ch) if ch.is_connected() => ch,
+        Some(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "WhatsApp Web channel is reconnecting"
+                })),
+            )
+                .into_response();
+        }
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "WhatsApp Web channel is not connected"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match channel.start_typing(&body.recipient).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => error_response(&e, "Failed to send typing indicator").into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
