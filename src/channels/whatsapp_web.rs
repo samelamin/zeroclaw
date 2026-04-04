@@ -1978,6 +1978,14 @@ impl Channel for WhatsAppWebChannel {
             }
         }
 
+        // If send() already cleared this recipient from typing_started it means
+        // the message was delivered — don't re-enable composing after the fact.
+        if let Ok(ts) = self.typing_started.lock() {
+            if !ts.contains_key(recipient) {
+                return Ok(());
+            }
+        }
+
         let to = self.recipient_to_jid(recipient)?;
         client
             .chatstate()
