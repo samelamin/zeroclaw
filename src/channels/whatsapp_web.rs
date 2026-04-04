@@ -587,6 +587,25 @@ impl WhatsAppWebChannel {
         user_part.chars().filter(|c| c.is_ascii_digit()).collect()
     }
 
+    /// Extract the text of the message being replied to, if any.
+    /// Returns None when the message is not a reply or the quoted content has no text.
+    #[cfg(feature = "whatsapp-web")]
+    fn extract_quoted_text(msg: &wa_rs_proto::whatsapp::Message) -> Option<String> {
+        use wa_rs_core::proto_helpers::MessageExt;
+        let base = msg.get_base_message();
+        if let Some(ref ext) = base.extended_text_message {
+            if let Some(ref ctx) = ext.context_info {
+                if let Some(ref quoted) = ctx.quoted_message {
+                    let text = quoted.text_content()?.trim().to_string();
+                    if !text.is_empty() {
+                        return Some(text);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Extract mentioned JIDs from the base (unwrapped) message's context_info.
     ///
     /// Uses `get_base_message()` to see through ephemeral/view-once/edited/document wrappers,
@@ -1516,6 +1535,14 @@ impl Channel for WhatsAppWebChannel {
                                     }
                                     let text = msg.text_content().unwrap_or("");
                                     text.trim().to_string()
+                                };
+
+                                // Prepend quoted message text so the agent has full context
+                                // when the user replies to a specific message (e.g. "translate
+                                // this", "summarise", "what does this mean?").
+                                let content = match Self::extract_quoted_text(&msg) {
+                                    Some(quoted) => format!("[Quoted message: \"{quoted}\"]\n{content}"),
+                                    None => content,
                                 };
 
                                 tracing::info!(
