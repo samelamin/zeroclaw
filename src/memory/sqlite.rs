@@ -209,7 +209,19 @@ impl SqliteMemory {
                 session_id  TEXT,
                 created_at  TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_procedures_session ON procedures(session_id);",
+            CREATE INDEX IF NOT EXISTS idx_procedures_session ON procedures(session_id);
+
+            -- Outcome tracking for feedback-driven optimization
+            CREATE TABLE IF NOT EXISTS outcomes (
+                id TEXT PRIMARY KEY,
+                turn_id TEXT NOT NULL,
+                skill_used TEXT,
+                signal TEXT NOT NULL,
+                tool_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_outcomes_skill ON outcomes(skill_used);
+            CREATE INDEX IF NOT EXISTS idx_outcomes_signal ON outcomes(signal);",
         )?;
 
         // Migration: add session_id column if not present (safe to run repeatedly)
@@ -1028,8 +1040,8 @@ impl Memory for SqliteMemory {
             .filter(|m| m.role == "tool")
             .map(|m| ToolStep {
                 tool_name: m.name.clone().unwrap_or_else(|| "unknown".into()),
-                description: m.content.clone(),
-                args_summary: String::new(),
+                description: m.content.chars().take(200).collect(),
+                args_summary: m.name.clone().unwrap_or_default(),
             })
             .collect();
 
