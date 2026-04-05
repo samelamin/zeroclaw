@@ -972,6 +972,8 @@ pub async fn run_gateway(
             "/api/channels/whatsapp/send",
             post(api::handle_whatsapp_web_send),
         )
+        .route("/api/channels/whatsapp/typing", post(api::handle_whatsapp_typing))
+        .route("/api/chat", post(api::handle_http_chat))
         // ── Pairing + Device management API ──
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
         .route("/api/pair", post(api_pairing::submit_pairing_enhanced))

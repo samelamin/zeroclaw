@@ -1559,6 +1559,122 @@ pub(super) async fn handle_whatsapp_web_send(
     }
 }
 
+// ── WhatsApp Web typing ──────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub(super) struct WhatsAppTypingBody {
+    pub recipient: String,
+}
+
+/// `POST /api/channels/whatsapp/typing` — send a "composing" chatstate to the
+/// given recipient. Naseyma calls this before/during inference so the customer
+/// sees a typing indicator. Returns 503 if channel not live.
+pub(super) async fn handle_whatsapp_typing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<WhatsAppTypingBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let channel = match crate::channels::get_live_whatsapp_channel() {
+        Some(ch) if ch.is_connected() => ch,
+        Some(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "WhatsApp Web channel is reconnecting"
+                })),
+            )
+                .into_response();
+        }
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "WhatsApp Web channel is not connected"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match channel.start_typing(&body.recipient).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => error_response(&e, "Failed to send typing indicator").into_response(),
+    }
+}
+
+// ── HTTP Chat (synchronous inference) ───────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub(super) struct HttpChatBody {
+    pub message: String,
+    pub session_id: Option<String>,
+    /// Optional system prompt override — replaces the config-derived system prompt.
+    pub system_prompt: Option<String>,
+}
+
+/// `POST /api/chat` — synchronous (non-streaming) inference via ZeroClaw's native
+/// agentic loop. Returns the final text response after all tool calls complete.
+pub(super) async fn handle_http_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<HttpChatBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let mut agent = match crate::agent::Agent::from_config(&config).await {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Agent init failed: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    // Apply system prompt override if provided
+    if let Some(ref sys) = body.system_prompt {
+        agent = agent.with_system_prompt(sys.clone());
+    }
+
+    // Hydrate from persisted session if session_id provided
+    if let (Some(session_id), Some(backend)) = (&body.session_id, &state.session_backend) {
+        let session_key = format!("gw_{session_id}");
+        let messages = backend.load(&session_key);
+        if !messages.is_empty() {
+            agent.seed_history(&messages);
+        }
+        agent.set_memory_session_id(Some(session_id.clone()));
+    }
+
+    // Run synchronous turn (full agentic loop with tools)
+    match agent.turn(&body.message).await {
+        Ok(response) => {
+            // Persist to session backend if session_id provided
+            if let (Some(session_id), Some(backend)) = (&body.session_id, &state.session_backend) {
+                let session_key = format!("gw_{session_id}");
+                let user_msg = crate::providers::ChatMessage::user(&body.message);
+                let assistant_msg = crate::providers::ChatMessage::assistant(&response);
+                let _ = backend.append(&session_key, &user_msg);
+                let _ = backend.append(&session_key, &assistant_msg);
+            }
+            Json(serde_json::json!({ "text": response })).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Inference failed: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
