@@ -14,6 +14,7 @@ pub mod markdown;
 pub mod namespaced;
 pub mod none;
 pub mod policy;
+pub mod procedural;
 pub mod qdrant;
 pub mod response_cache;
 pub mod retrieval;

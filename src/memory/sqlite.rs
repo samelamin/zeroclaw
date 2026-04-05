@@ -1,5 +1,5 @@
 use super::embeddings::EmbeddingProvider;
-use super::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry};
+use super::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry, ProceduralMessage};
 use super::vector;
 use crate::config::schema::SearchMode;
 use anyhow::Context;
@@ -199,7 +199,17 @@ impl SqliteMemory {
                 created_at   TEXT NOT NULL,
                 accessed_at  TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
+            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);
+
+            -- Procedural memory: named sequences of tool steps
+            CREATE TABLE IF NOT EXISTS procedures (
+                id          TEXT PRIMARY KEY,
+                title       TEXT NOT NULL,
+                steps_json  TEXT NOT NULL,
+                session_id  TEXT,
+                created_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_procedures_session ON procedures(session_id);",
         )?;
 
         // Migration: add session_id column if not present (safe to run repeatedly)
@@ -1003,6 +1013,57 @@ impl Memory for SqliteMemory {
         tokio::task::spawn_blocking(move || conn.lock().execute_batch("SELECT 1").is_ok())
             .await
             .unwrap_or(false)
+    }
+
+    async fn store_procedural(
+        &self,
+        messages: &[ProceduralMessage],
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        use crate::memory::procedural::{ToolStep, extract_procedure};
+
+        // Collect tool-role messages into ToolSteps
+        let steps: Vec<ToolStep> = messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| ToolStep {
+                tool_name: m.name.clone().unwrap_or_else(|| "unknown".into()),
+                description: m.content.clone(),
+                args_summary: String::new(),
+            })
+            .collect();
+
+        // Derive a task description from the first non-tool message content
+        let task_description = messages
+            .iter()
+            .find(|m| m.role != "tool")
+            .map(|m| m.content.as_str())
+            .unwrap_or("Unnamed procedure");
+
+        let procedure = extract_procedure(task_description, &steps);
+
+        // Skip trivial sequences
+        if procedure.steps.is_empty() {
+            return Ok(());
+        }
+
+        let steps_json = serde_json::to_string(&procedure.steps)?;
+        let conn = self.conn.clone();
+        let title = procedure.title.clone();
+        let sid = session_id.map(String::from);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.lock();
+            let id = Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO procedures (id, title, steps_json, session_id, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, title, steps_json, sid, now],
+            )?;
+            Ok(())
+        })
+        .await?
     }
 
     async fn export(&self, filter: &ExportFilter) -> anyhow::Result<Vec<MemoryEntry>> {
