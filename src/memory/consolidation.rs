@@ -26,13 +26,17 @@ pub struct ConsolidationResult {
     /// Observed trend or pattern (when consolidation_extract_facts is enabled).
     #[serde(default)]
     pub trend: Option<String>,
+    /// Suggested skill name if this turn involved a reusable multi-step pattern.
+    #[serde(default)]
+    pub skill_suggestion: Option<String>,
 }
 
 const CONSOLIDATION_SYSTEM_PROMPT: &str = r#"You are a memory consolidation engine. Given a conversation turn, extract:
 1. "history_entry": A brief summary of what happened in this turn (1-2 sentences). Include the key topic or action.
 2. "memory_update": Any NEW facts, preferences, decisions, or commitments worth remembering long-term. Return null if nothing new was learned.
+3. "skill_suggestion": If this turn involved a repeatable multi-step workflow (e.g. updating a menu, scheduling appointments, configuring a system), suggest a short kebab-case name for this skill (e.g. "update-restaurant-menu"). Return null if the turn was a simple Q&A.
 
-Respond ONLY with valid JSON: {"history_entry": "...", "memory_update": "..." or null}
+Respond ONLY with valid JSON: {"history_entry": "...", "memory_update": "..." or null, "skill_suggestion": "..." or null}
 Do not include any text outside the JSON object."#;
 
 /// Run two-phase LLM-driven consolidation on a conversation turn.
@@ -164,6 +168,7 @@ fn parse_consolidation_response(raw: &str, fallback_text: &str) -> Consolidation
             memory_update: None,
             facts: Vec::new(),
             trend: None,
+            skill_suggestion: None,
         }
     })
 }
@@ -227,5 +232,26 @@ mod tests {
                 .is_char_boundary(result.history_entry.len())
         );
         assert!(result.history_entry.ends_with('…'));
+    }
+
+    #[test]
+    fn parse_skill_suggestion_present() {
+        let raw = r#"{"history_entry": "User updated the restaurant menu.", "memory_update": null, "skill_suggestion": "update-menu"}"#;
+        let result = parse_consolidation_response(raw, "fallback");
+        assert_eq!(result.skill_suggestion.as_deref(), Some("update-menu"));
+    }
+
+    #[test]
+    fn parse_skill_suggestion_null() {
+        let raw = r#"{"history_entry": "User asked a simple question.", "memory_update": null, "skill_suggestion": null}"#;
+        let result = parse_consolidation_response(raw, "fallback");
+        assert!(result.skill_suggestion.is_none());
+    }
+
+    #[test]
+    fn parse_skill_suggestion_absent() {
+        let raw = r#"{"history_entry": "User asked about the weather.", "memory_update": null}"#;
+        let result = parse_consolidation_response(raw, "fallback");
+        assert!(result.skill_suggestion.is_none());
     }
 }
