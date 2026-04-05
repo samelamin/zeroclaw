@@ -16,6 +16,7 @@ pub mod creator;
 pub mod discovery;
 #[cfg(feature = "skill-creation")]
 pub mod improver;
+pub mod refinement;
 pub mod testing;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
