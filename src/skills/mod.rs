@@ -13,6 +13,7 @@ use zip::ZipArchive;
 mod audit;
 #[cfg(feature = "skill-creation")]
 pub mod creator;
+pub mod discovery;
 #[cfg(feature = "skill-creation")]
 pub mod improver;
 pub mod testing;
