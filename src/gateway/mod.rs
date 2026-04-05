@@ -17,6 +17,7 @@ pub mod auth_rate_limit;
 pub mod canvas;
 pub mod nodes;
 pub mod session_queue;
+pub mod skill_export;
 pub mod sse;
 pub mod static_files;
 pub mod tls;
