@@ -86,10 +86,12 @@ impl RusqliteStore {
 
         let conn = Connection::open(&db_path)?;
 
-        // Enable WAL mode for better concurrency
+        // Enable WAL mode for better concurrency; cap page cache to avoid unbounded RSS growth.
         to_store_err!(conn.execute_batch(
             "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = NORMAL;",
+             PRAGMA synchronous = NORMAL;
+             PRAGMA cache_size = -4000;
+             PRAGMA mmap_size = 16777216;",
         ))?;
 
         let store = Self {

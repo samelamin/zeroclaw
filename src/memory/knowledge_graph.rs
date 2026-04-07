@@ -143,7 +143,9 @@ impl KnowledgeGraph {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous  = NORMAL;
-             PRAGMA foreign_keys = ON;",
+             PRAGMA foreign_keys = ON;
+             PRAGMA cache_size   = -4000;
+             PRAGMA mmap_size    = 16777216;",
         )?;
 
         conn.execute_batch(
