@@ -55,6 +55,8 @@ impl<M: Memory> AuditedMemory<M> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
+             PRAGMA cache_size = -4000;
+             PRAGMA mmap_size = 16777216;
              CREATE TABLE IF NOT EXISTS memory_audit (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  operation TEXT NOT NULL,
