@@ -57,6 +57,47 @@ impl Default for ComputerUseConfig {
     }
 }
 
+/// Playwright-MCP sidecar settings (local copy of schema struct; api_key is redacted in Debug).
+#[derive(Clone)]
+pub struct PlaywrightMcpConfig {
+    pub endpoint: String,
+    pub api_key: Option<String>,
+    pub timeout_ms: u64,
+    pub allow_remote_endpoint: bool,
+    pub browser: String,
+    pub user_agent: Option<String>,
+    pub locale: Option<String>,
+    pub timezone_id: Option<String>,
+    pub viewport: Option<String>,
+}
+
+impl std::fmt::Debug for PlaywrightMcpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlaywrightMcpConfig")
+            .field("endpoint", &self.endpoint)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("allow_remote_endpoint", &self.allow_remote_endpoint)
+            .field("browser", &self.browser)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for PlaywrightMcpConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://127.0.0.1:3000".into(),
+            api_key: None,
+            timeout_ms: 30_000,
+            allow_remote_endpoint: false,
+            browser: "chromium".into(),
+            user_agent: None,
+            locale: None,
+            timezone_id: None,
+            viewport: None,
+        }
+    }
+}
+
 /// Browser automation tool using pluggable backends.
 pub struct BrowserTool {
     security: Arc<SecurityPolicy>,
@@ -67,6 +108,7 @@ pub struct BrowserTool {
     native_webdriver_url: String,
     native_chrome_path: Option<String>,
     computer_use: ComputerUseConfig,
+    pub playwright_mcp: PlaywrightMcpConfig,
     #[cfg(feature = "browser-native")]
     native_state: tokio::sync::Mutex<native_backend::NativeBrowserState>,
 }
@@ -76,6 +118,7 @@ enum BrowserBackendKind {
     AgentBrowser,
     RustNative,
     ComputerUse,
+    PlaywrightMcp,
     Auto,
 }
 
@@ -84,6 +127,7 @@ enum ResolvedBackend {
     AgentBrowser,
     RustNative,
     ComputerUse,
+    PlaywrightMcp,
 }
 
 impl BrowserBackendKind {
@@ -93,9 +137,10 @@ impl BrowserBackendKind {
             "agent_browser" | "agentbrowser" => Ok(Self::AgentBrowser),
             "rust_native" | "native" => Ok(Self::RustNative),
             "computer_use" | "computeruse" => Ok(Self::ComputerUse),
+            "playwright_mcp" | "playwrightmcp" => Ok(Self::PlaywrightMcp),
             "auto" => Ok(Self::Auto),
             _ => anyhow::bail!(
-                "Unsupported browser backend '{raw}'. Use 'agent_browser', 'rust_native', 'computer_use', or 'auto'"
+                "Unsupported browser backend '{raw}'. Use 'agent_browser', 'rust_native', 'computer_use', 'playwright_mcp', or 'auto'"
             ),
         }
     }
@@ -105,6 +150,7 @@ impl BrowserBackendKind {
             Self::AgentBrowser => "agent_browser",
             Self::RustNative => "rust_native",
             Self::ComputerUse => "computer_use",
+            Self::PlaywrightMcp => "playwright_mcp",
             Self::Auto => "auto",
         }
     }
@@ -211,6 +257,7 @@ impl BrowserTool {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            PlaywrightMcpConfig::default(),
         )
     }
 
@@ -224,6 +271,7 @@ impl BrowserTool {
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
         computer_use: ComputerUseConfig,
+        playwright_mcp: PlaywrightMcpConfig,
     ) -> Self {
         Self {
             security,
@@ -234,6 +282,7 @@ impl BrowserTool {
             native_webdriver_url,
             native_chrome_path,
             computer_use,
+            playwright_mcp,
             #[cfg(feature = "browser-native")]
             native_state: tokio::sync::Mutex::new(native_backend::NativeBrowserState::default()),
         }
@@ -330,6 +379,45 @@ impl BrowserTool {
         Ok(endpoint_reachable(&endpoint, Duration::from_millis(500)))
     }
 
+    pub fn playwright_mcp_endpoint_url(&self) -> anyhow::Result<reqwest::Url> {
+        if self.playwright_mcp.timeout_ms == 0 {
+            anyhow::bail!("browser.playwright_mcp.timeout_ms must be > 0");
+        }
+        let endpoint = self.playwright_mcp.endpoint.trim();
+        if endpoint.is_empty() {
+            anyhow::bail!("browser.playwright_mcp.endpoint cannot be empty");
+        }
+        let parsed = reqwest::Url::parse(endpoint).map_err(|_| {
+            anyhow::anyhow!("Invalid browser.playwright_mcp.endpoint: '{endpoint}'. Expected http(s) URL")
+        })?;
+        let scheme = parsed.scheme();
+        if scheme != "http" && scheme != "https" {
+            anyhow::bail!("browser.playwright_mcp.endpoint must use http:// or https://");
+        }
+        let host = parsed.host_str().ok_or_else(|| {
+            anyhow::anyhow!("browser.playwright_mcp.endpoint must include host")
+        })?;
+        let host_is_private = is_private_host(host);
+        if !self.playwright_mcp.allow_remote_endpoint && !host_is_private {
+            anyhow::bail!(
+                "browser.playwright_mcp.endpoint host '{host}' is public. \
+                 Set browser.playwright_mcp.allow_remote_endpoint=true to allow it"
+            );
+        }
+        if self.playwright_mcp.allow_remote_endpoint && !host_is_private && scheme != "https" {
+            anyhow::bail!(
+                "browser.playwright_mcp.endpoint must use https:// when \
+                 allow_remote_endpoint=true and host is public"
+            );
+        }
+        Ok(parsed)
+    }
+
+    fn playwright_mcp_available(&self) -> anyhow::Result<bool> {
+        let endpoint = self.playwright_mcp_endpoint_url()?;
+        Ok(endpoint_reachable(&endpoint, Duration::from_millis(500)))
+    }
+
     async fn resolve_backend(&self) -> anyhow::Result<ResolvedBackend> {
         let configured = self.configured_backend()?;
 
@@ -370,6 +458,14 @@ impl BrowserTool {
                 }
                 Ok(ResolvedBackend::ComputerUse)
             }
+            BrowserBackendKind::PlaywrightMcp => {
+                if !self.playwright_mcp_available()? {
+                    anyhow::bail!(
+                        "browser.backend='playwright_mcp' but sidecar endpoint is unreachable. Check browser.playwright_mcp.endpoint and sidecar status"
+                    );
+                }
+                Ok(ResolvedBackend::PlaywrightMcp)
+            }
             BrowserBackendKind::Auto => {
                 if Self::rust_native_compiled() && self.rust_native_available() {
                     return Ok(ResolvedBackend::RustNative);
@@ -383,6 +479,12 @@ impl BrowserTool {
                     Ok(false) => None,
                     Err(err) => Some(err.to_string()),
                 };
+
+                // Try playwright_mcp as fallback
+                match self.playwright_mcp_available() {
+                    Ok(true) => return Ok(ResolvedBackend::PlaywrightMcp),
+                    Ok(false) | Err(_) => {}
+                }
 
                 if Self::rust_native_compiled() {
                     if let Some(err) = computer_use_err {
@@ -872,6 +974,43 @@ impl BrowserTool {
         })
     }
 
+    async fn execute_playwright_mcp_action(&self, action: BrowserAction) -> anyhow::Result<ToolResult> {
+        let endpoint = self.playwright_mcp_endpoint_url()?
+            .as_str()
+            .trim_end_matches('/')
+            .to_string();
+        let (tool_name, arguments) = crate::tools::playwright_mcp::action_to_mcp_tool(action)?;
+        let client = crate::tools::playwright_mcp::PlaywrightMcpClient::new(
+            endpoint,
+            self.playwright_mcp.api_key.clone(),
+            self.playwright_mcp.timeout_ms,
+        );
+        match client.call_tool_with_retry(tool_name, arguments).await {
+            Ok(value) => Ok(ToolResult {
+                success: true,
+                output: if value.is_null() {
+                    String::new()
+                } else {
+                    // Extract text from MCP content array if present
+                    if let Some(arr) = value.get("content").and_then(|c| c.as_array()) {
+                        arr.iter()
+                            .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    } else {
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    }
+                },
+                error: None,
+            }),
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+
     async fn execute_action(
         &self,
         action: BrowserAction,
@@ -880,6 +1019,7 @@ impl BrowserTool {
         match backend {
             ResolvedBackend::AgentBrowser => self.execute_agent_browser_action(action).await,
             ResolvedBackend::RustNative => self.execute_rust_native_action(action).await,
+            ResolvedBackend::PlaywrightMcp => self.execute_playwright_mcp_action(action).await,
             ResolvedBackend::ComputerUse => anyhow::bail!(
                 "Internal error: computer_use backend must be handled before BrowserAction parsing"
             ),
@@ -1990,6 +2130,7 @@ fn backend_name(backend: ResolvedBackend) -> &'static str {
         ResolvedBackend::AgentBrowser => "agent_browser",
         ResolvedBackend::RustNative => "rust_native",
         ResolvedBackend::ComputerUse => "computer_use",
+        ResolvedBackend::PlaywrightMcp => "playwright_mcp",
     }
 }
 
@@ -2366,6 +2507,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            PlaywrightMcpConfig::default(),
         );
         assert_eq!(tool.configured_backend().unwrap(), BrowserBackendKind::Auto);
     }
@@ -2382,6 +2524,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            PlaywrightMcpConfig::default(),
         );
         assert_eq!(
             tool.configured_backend().unwrap(),
@@ -2404,6 +2547,7 @@ mod tests {
                 endpoint: "http://computer-use.example.com/v1/actions".into(),
                 ..ComputerUseConfig::default()
             },
+            PlaywrightMcpConfig::default(),
         );
 
         assert!(tool.computer_use_endpoint_url().is_err());
@@ -2425,6 +2569,7 @@ mod tests {
                 allow_remote_endpoint: true,
                 ..ComputerUseConfig::default()
             },
+            PlaywrightMcpConfig::default(),
         );
 
         assert!(tool.computer_use_endpoint_url().is_ok());
@@ -2446,6 +2591,7 @@ mod tests {
                 max_coordinate_y: Some(100),
                 ..ComputerUseConfig::default()
             },
+            PlaywrightMcpConfig::default(),
         );
 
         assert!(
@@ -2653,5 +2799,48 @@ mod tests {
         } else {
             assert_eq!(cmd, "agent-browser");
         }
+    }
+
+    #[test]
+    fn playwright_mcp_backend_kind_parses_all_aliases() {
+        assert_eq!(BrowserBackendKind::parse("playwright_mcp").unwrap(), BrowserBackendKind::PlaywrightMcp);
+        assert_eq!(BrowserBackendKind::parse("playwright-mcp").unwrap(), BrowserBackendKind::PlaywrightMcp);
+    }
+
+    #[test]
+    fn playwright_mcp_endpoint_rejects_public_host_by_default() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "playwright_mcp".into(),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            PlaywrightMcpConfig {
+                endpoint: "http://playwright.external.example.com".into(),
+                ..PlaywrightMcpConfig::default()
+            },
+        );
+        assert!(tool.playwright_mcp_endpoint_url().is_err());
+    }
+
+    #[test]
+    fn playwright_mcp_endpoint_accepts_localhost() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "playwright_mcp".into(),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            PlaywrightMcpConfig::default(), // 127.0.0.1:3000
+        );
+        assert!(tool.playwright_mcp_endpoint_url().is_ok());
     }
 }

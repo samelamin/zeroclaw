@@ -1,0 +1,65 @@
+# docker-compose.playwright.yml — Playwright-MCP sidecar for ZeroClaw
+#
+# Usage (as compose override):
+#   docker compose -f docker-compose.yml -f docker-compose.playwright.yml up -d
+#
+# Then in config.toml:
+#   [browser]
+#   backend = "playwright_mcp"
+#   [browser.playwright_mcp]
+#   endpoint = "http://playwright-mcp:3000"
+#
+# Security model:
+#   - Sidecar runs as non-root (pwuser in mcr.microsoft.com/playwright image)
+#   - Port is bound to 127.0.0.1 on the host — not exposed externally
+#   - allow_remote_endpoint defaults to false in ZeroClaw config
+#   - Chrome requires SYS_ADMIN + seccomp:unconfined inside Docker;
+#     all other caps are dropped for defence-in-depth
+#   - No persistent volume — browser state is ephemeral and discarded on restart
+
+services:
+  playwright-mcp:
+    image: mcr.microsoft.com/playwright:v1.52.0-noble
+    container_name: playwright-mcp
+    restart: unless-stopped
+    user: "pwuser"
+    command: >
+      npx --yes @playwright/mcp@latest
+      --port 3000
+      --host 0.0.0.0
+      --browser ${PLAYWRIGHT_BROWSER:-chromium}
+    environment:
+      - PLAYWRIGHT_BROWSER=${PLAYWRIGHT_BROWSER:-chromium}
+      # Fingerprint overrides (optional — passed as CLI args above if set)
+      # Uncomment and set if needed:
+      # - PLAYWRIGHT_USER_AGENT=Mozilla/5.0 ...
+    ports:
+      # Bind to localhost only — sidecar is not a public service
+      - "127.0.0.1:${PLAYWRIGHT_MCP_PORT:-3000}:3000"
+    # No volumes: browser state is ephemeral
+    cap_drop:
+      - ALL
+    cap_add:
+      - SYS_ADMIN   # required by Chromium sandbox inside Docker
+    security_opt:
+      - seccomp:unconfined   # Chromium sandbox requires this inside Docker
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:3000/ || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+    networks:
+      - zeroclaw-playwright
+
+networks:
+  zeroclaw-playwright:
+    driver: bridge

@@ -2492,6 +2492,83 @@ impl Default for BrowserComputerUseConfig {
     }
 }
 
+/// Playwright-MCP sidecar configuration (`[browser.playwright_mcp]` section).
+///
+/// ZeroClaw delegates browser actions to a running `@playwright/mcp` sidecar via
+/// JSON-RPC 2.0 over HTTP POST.
+///
+/// Start the sidecar: `npx @playwright/mcp --port 3000 --browser chromium`
+/// Or: `docker compose -f docker-compose.yml -f docker-compose.playwright.yml up -d`
+///
+/// # Security
+/// By default only localhost/private network endpoints are permitted.
+/// Set `allow_remote_endpoint = true` **and** use `https://` for public deployments.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PlaywrightMcpConfig {
+    /// HTTP endpoint of the sidecar (default: `http://127.0.0.1:3000`)
+    #[serde(default = "default_playwright_mcp_endpoint")]
+    pub endpoint: String,
+    /// Optional bearer token for sidecar authentication
+    #[serde(default)]
+    pub api_key: Option<String>,
+    /// Per-call request timeout in milliseconds (default: 30 000)
+    #[serde(default = "default_playwright_mcp_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Allow a public/remote endpoint (default: false; public endpoints require https)
+    #[serde(default)]
+    pub allow_remote_endpoint: bool,
+    /// Browser engine to use: `"chromium"` | `"firefox"` | `"webkit"` (default: `"chromium"`)
+    ///
+    /// # Browser support matrix
+    /// | Engine | Headless | Screenshots | CDP | Notes |
+    /// |--------|----------|-------------|-----|-------|
+    /// | chromium | ✓ | ✓ | ✓ | Default; best tool coverage |
+    /// | firefox | ✓ | ✓ | ✗ | No CDP; good JS compat |
+    /// | webkit | ✓ | ✓ | ✗ | Safari engine; iOS testing |
+    #[serde(default = "default_playwright_mcp_browser")]
+    pub browser: String,
+    /// User-agent override for anti-fingerprinting (None = Playwright default)
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    /// Locale override (e.g. `"en-US"`) for anti-fingerprinting
+    #[serde(default)]
+    pub locale: Option<String>,
+    /// IANA timezone ID (e.g. `"America/New_York"`) for anti-fingerprinting
+    #[serde(default)]
+    pub timezone_id: Option<String>,
+    /// Viewport as `"WIDTHxHEIGHT"` (e.g. `"1280x720"`) for anti-fingerprinting
+    #[serde(default)]
+    pub viewport: Option<String>,
+}
+
+fn default_playwright_mcp_endpoint() -> String {
+    "http://127.0.0.1:3000".into()
+}
+
+fn default_playwright_mcp_timeout_ms() -> u64 {
+    30_000
+}
+
+fn default_playwright_mcp_browser() -> String {
+    "chromium".into()
+}
+
+impl Default for PlaywrightMcpConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: default_playwright_mcp_endpoint(),
+            api_key: None,
+            timeout_ms: default_playwright_mcp_timeout_ms(),
+            allow_remote_endpoint: false,
+            browser: default_playwright_mcp_browser(),
+            user_agent: None,
+            locale: None,
+            timezone_id: None,
+            viewport: None,
+        }
+    }
+}
+
 /// Browser automation configuration (`[browser]` section).
 ///
 /// Controls the `browser_open` tool and browser automation backends.
@@ -2506,7 +2583,7 @@ pub struct BrowserConfig {
     /// Browser session name (for agent-browser automation)
     #[serde(default)]
     pub session_name: Option<String>,
-    /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "auto"
+    /// Browser automation backend: "agent_browser" | "rust_native" | "computer_use" | "playwright_mcp" | "auto"
     #[serde(default = "default_browser_backend")]
     pub backend: String,
     /// Headless mode for rust-native backend
@@ -2521,6 +2598,9 @@ pub struct BrowserConfig {
     /// Computer-use sidecar configuration
     #[serde(default)]
     pub computer_use: BrowserComputerUseConfig,
+    /// Playwright-MCP sidecar configuration (`[browser.playwright_mcp]`)
+    #[serde(default)]
+    pub playwright_mcp: PlaywrightMcpConfig,
 }
 
 fn default_browser_allowed_domains() -> Vec<String> {
@@ -2546,6 +2626,7 @@ impl Default for BrowserConfig {
             native_webdriver_url: default_browser_webdriver_url(),
             native_chrome_path: None,
             computer_use: BrowserComputerUseConfig::default(),
+            playwright_mcp: PlaywrightMcpConfig::default(),
         }
     }
 }
@@ -9168,6 +9249,12 @@ impl Config {
 
             decrypt_optional_secret(
                 &store,
+                &mut config.browser.playwright_mcp.api_key,
+                "config.browser.playwright_mcp.api_key",
+            )?;
+
+            decrypt_optional_secret(
+                &store,
                 &mut config.web_search.brave_api_key,
                 "config.web_search.brave_api_key",
             )?;
@@ -10648,6 +10735,12 @@ impl Config {
             &store,
             &mut config_to_save.browser.computer_use.api_key,
             "config.browser.computer_use.api_key",
+        )?;
+
+        encrypt_optional_secret(
+            &store,
+            &mut config_to_save.browser.playwright_mcp.api_key,
+            "config.browser.playwright_mcp.api_key",
         )?;
 
         encrypt_optional_secret(
@@ -13430,6 +13523,7 @@ default_temperature = 0.7
                 max_coordinate_x: Some(3840),
                 max_coordinate_y: Some(2160),
             },
+            playwright_mcp: PlaywrightMcpConfig::default(),
         };
         let toml_str = toml::to_string(&b).unwrap();
         let parsed: BrowserConfig = toml::from_str(&toml_str).unwrap();

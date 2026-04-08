@@ -585,6 +585,15 @@ Examples:
     FlashNucleo,
 }
 
+/// Browser sidecar subcommands (`zeroclaw browser …`).
+#[derive(Subcommand, Debug, Clone)]
+pub enum BrowserCommands {
+    /// Check whether the Playwright-MCP sidecar is reachable and print config.
+    Status,
+    /// Print bootstrap instructions for the Playwright-MCP sidecar.
+    Bootstrap,
+}
+
 /// SOP management subcommands
 #[derive(Subcommand, Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SopCommands {

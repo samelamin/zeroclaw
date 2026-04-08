@@ -81,6 +81,7 @@ pub mod opencode_cli;
 pub mod output_formatter;
 pub mod pdf_read;
 pub mod pipeline;
+pub mod playwright_mcp;
 pub mod poll;
 pub mod project_intel;
 pub mod proxy_config;
@@ -117,7 +118,7 @@ pub mod wrappers;
 
 pub use ask_user::AskUserTool;
 pub use backup_tool::BackupTool;
-pub use browser::{BrowserTool, ComputerUseConfig};
+pub use browser::{BrowserTool, ComputerUseConfig, PlaywrightMcpConfig};
 #[allow(unused_imports)]
 pub use browser_delegate::{BrowserDelegateConfig, BrowserDelegateTool};
 pub use browser_open::BrowserOpenTool;
@@ -604,6 +605,17 @@ pub fn all_tools_with_runtime(
                 window_allowlist: browser_config.computer_use.window_allowlist.clone(),
                 max_coordinate_x: browser_config.computer_use.max_coordinate_x,
                 max_coordinate_y: browser_config.computer_use.max_coordinate_y,
+            },
+            PlaywrightMcpConfig {
+                endpoint: browser_config.playwright_mcp.endpoint.clone(),
+                api_key: browser_config.playwright_mcp.api_key.clone(),
+                timeout_ms: browser_config.playwright_mcp.timeout_ms,
+                allow_remote_endpoint: browser_config.playwright_mcp.allow_remote_endpoint,
+                browser: browser_config.playwright_mcp.browser.clone(),
+                user_agent: browser_config.playwright_mcp.user_agent.clone(),
+                locale: browser_config.playwright_mcp.locale.clone(),
+                timezone_id: browser_config.playwright_mcp.timezone_id.clone(),
+                viewport: browser_config.playwright_mcp.viewport.clone(),
             },
         )));
     }

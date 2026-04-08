@@ -119,8 +119,9 @@ use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
-    ChannelCommands, CronCommands, GatewayCommands, HardwareCommands, IntegrationCommands,
-    MigrateCommands, PeripheralCommands, ServiceCommands, SkillCommands, SopCommands,
+    BrowserCommands, ChannelCommands, CronCommands, GatewayCommands, HardwareCommands,
+    IntegrationCommands, MigrateCommands, PeripheralCommands, ServiceCommands, SkillCommands,
+    SopCommands,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -609,6 +610,17 @@ Examples:
         /// Download and install the companion app
         #[arg(long)]
         install: bool,
+    },
+
+    /// Manage browser sidecar (Playwright-MCP)
+    #[command(long_about = "\
+Manage the Playwright-MCP browser sidecar.\n\n\
+Examples:\n\
+  zeroclaw browser status     # check sidecar reachability\n\
+  zeroclaw browser bootstrap  # print startup instructions")]
+    Browser {
+        #[command(subcommand)]
+        browser_command: BrowserCommands,
     },
 
     /// Manage WASM plugins
@@ -1534,6 +1546,61 @@ async fn main() -> Result<()> {
         Commands::Hardware { hardware_command } => {
             hardware::handle_command(hardware_command.clone(), &config)
         }
+
+        Commands::Browser { browser_command } => match browser_command {
+            BrowserCommands::Status => {
+                let endpoint = &config.browser.playwright_mcp.endpoint;
+                let browser = &config.browser.playwright_mcp.browser;
+                let backend = &config.browser.backend;
+                // Try a TCP reachability probe
+                let url = reqwest::Url::parse(endpoint).ok();
+                let reachable = url.map_or(false, |u| {
+                    let host = u.host_str().unwrap_or("127.0.0.1");
+                    let port = u.port().unwrap_or(3000);
+                    std::net::TcpStream::connect_timeout(
+                        &format!("{host}:{port}").parse().unwrap_or("127.0.0.1:3000".parse().unwrap()),
+                        std::time::Duration::from_millis(500),
+                    ).is_ok()
+                });
+                println!("Playwright-MCP sidecar");
+                println!("  endpoint  : {endpoint}");
+                println!("  browser   : {browser}");
+                println!("  reachable : {}", if reachable { "yes" } else { "NO" });
+                println!("  backend   : {backend}");
+                if !reachable {
+                    println!();
+                    println!("To start: npx @playwright/mcp --port 3000 --browser {browser}");
+                }
+                Ok(())
+            }
+            BrowserCommands::Bootstrap => {
+                let cfg = &config.browser.playwright_mcp;
+                let mut cmd = format!("npx @playwright/mcp --port 3000 --browser {}", cfg.browser);
+                if let Some(ua) = &cfg.user_agent {
+                    cmd.push_str(&format!(" --user-agent \"{ua}\""));
+                }
+                if let Some(locale) = &cfg.locale {
+                    cmd.push_str(&format!(" --locale {locale}"));
+                }
+                if let Some(tz) = &cfg.timezone_id {
+                    cmd.push_str(&format!(" --timezone {tz}"));
+                }
+                println!("# Playwright-MCP sidecar bootstrap");
+                println!("#");
+                println!("# Option 1: npx (requires Node.js)");
+                println!("{cmd}");
+                println!();
+                println!("# Option 2: Docker Compose override");
+                println!("docker compose -f docker-compose.yml -f docker-compose.playwright.yml up -d");
+                println!();
+                println!("# Then set in config.toml:");
+                println!("[browser]");
+                println!("backend = \"playwright_mcp\"");
+                println!("[browser.playwright_mcp]");
+                println!("endpoint = \"{}\"", cfg.endpoint);
+                Ok(())
+            }
+        },
 
         Commands::Peripheral { peripheral_command } => {
             Box::pin(peripherals::handle_command(
