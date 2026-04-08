@@ -103,9 +103,12 @@ impl WebSearchTool {
             )
         })?;
 
+        // Honour both the canonical `brave_api_key` and the deprecated
+        // `api_key` alias. Canonical wins; alias is accepted for backward
+        // compatibility and triggers a WARN already emitted at load time.
         let raw_key = config
             .web_search
-            .brave_api_key
+            .resolved_brave_api_key()
             .filter(|k| !k.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Brave API key not configured"))?;
 

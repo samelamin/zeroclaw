@@ -176,6 +176,119 @@ impl<T: Tool> Tool for PathGuardedTool<T> {
     }
 }
 
+// ── LoggedTool ────────────────────────────────────────────────────────────────
+
+/// Wraps any [`Tool`] and emits structured tracing events on the
+/// execute boundary, so no tool failure is ever silent.
+///
+/// Emission contract:
+/// - DEBUG on entry, with `tool` name.
+/// - DEBUG on success (`Ok(ToolResult { success: true, .. })`), with
+///   `tool` name and `output_len`.
+/// - WARN on soft-fail (`Ok(ToolResult { success: false, .. })`),
+///   with `tool` name and the `error` string. Soft-fail is the
+///   most common failure mode because most tools catch their own
+///   errors and return a diagnostic ToolResult. Without this log,
+///   these failures are invisible in agent traces.
+/// - ERROR on hard-fail (`Err(anyhow::Error)`), with `tool` name,
+///   `error` display, and `error_chain` surfacing the full
+///   `anyhow::Error::chain()` so the IO/transport root cause is
+///   visible at a single `grep ERROR` rather than buried under
+///   anyhow context wrapping.
+///
+/// All events are emitted at `target = "tool_boundary"` so operators
+/// can filter them independently from per-tool logs.
+///
+/// Composition order (outermost first):
+///
+/// ```text
+/// LoggedTool  (outermost — logs soft-fails emitted by inner wrappers too)
+///   └─ RateLimitedTool
+///        └─ PathGuardedTool
+///             └─ <concrete tool>
+/// ```
+pub struct LoggedTool {
+    inner: Box<dyn Tool>,
+}
+
+impl LoggedTool {
+    /// Wrap a concrete tool. Accepts any `T: Tool + 'static` so call
+    /// sites don't need to pre-box.
+    pub fn new<T: Tool + 'static>(inner: T) -> Self {
+        Self {
+            inner: Box::new(inner),
+        }
+    }
+
+    /// Wrap an already-boxed tool — used by tool-registry factories
+    /// that have a `Vec<Box<dyn Tool>>` and want to blanket-log every
+    /// tool without knowing each concrete type.
+    pub fn wrap_boxed(inner: Box<dyn Tool>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl Tool for LoggedTool {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn description(&self) -> &str {
+        self.inner.description()
+    }
+
+    fn parameters_schema(&self) -> serde_json::Value {
+        self.inner.parameters_schema()
+    }
+
+    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+        let tool_name = self.inner.name().to_string();
+        tracing::debug!(
+            target: "tool_boundary",
+            tool = %tool_name,
+            "tool invocation begin"
+        );
+
+        match self.inner.execute(args).await {
+            Ok(result) => {
+                if result.success {
+                    tracing::debug!(
+                        target: "tool_boundary",
+                        tool = %tool_name,
+                        output_len = result.output.len(),
+                        "tool invocation ok"
+                    );
+                } else {
+                    tracing::warn!(
+                        target: "tool_boundary",
+                        tool = %tool_name,
+                        error = result.error.as_deref().unwrap_or("<none>"),
+                        output_len = result.output.len(),
+                        "tool invocation returned success=false"
+                    );
+                }
+                Ok(result)
+            }
+            Err(e) => {
+                let chain = e
+                    .chain()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(" | caused by: ");
+                tracing::error!(
+                    target: "tool_boundary",
+                    tool = %tool_name,
+                    error = %e,
+                    error_chain = %chain,
+                    "tool invocation raised error"
+                );
+                Err(e)
+            }
+        }
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -357,5 +470,218 @@ mod tests {
             .unwrap();
         assert!(!blocked.success);
         assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
+    // ── LoggedTool tests (§1g: tool-boundary error logger) ──────────────────
+
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Clone, Default)]
+    struct TraceCapture(Arc<StdMutex<Vec<u8>>>);
+    struct TraceCaptureWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl TraceCapture {
+        fn as_string(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TraceCapture {
+        type Writer = TraceCaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            TraceCaptureWriter(self.0.clone())
+        }
+    }
+
+    impl std::io::Write for TraceCaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn install_trace_capture() -> (TraceCapture, tracing::dispatcher::DefaultGuard) {
+        let capture = TraceCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(true)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        (capture, guard)
+    }
+
+    /// A tool that always returns Ok(ToolResult { success: false, ... }).
+    /// This is the most common failure mode — a tool that handled its
+    /// error by returning a diagnostic ToolResult rather than bubbling
+    /// up an anyhow::Error. Without a tool-boundary logger, these
+    /// silently disappear into the agent loop.
+    struct FailingTool;
+
+    #[async_trait]
+    impl Tool for FailingTool {
+        fn name(&self) -> &str {
+            "failing_tool"
+        }
+        fn description(&self) -> &str {
+            "always fails"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("simulated upstream 500".into()),
+            })
+        }
+    }
+
+    /// A tool that always raises an anyhow::Error with a source chain.
+    struct PanickingTool;
+
+    #[async_trait]
+    impl Tool for PanickingTool {
+        fn name(&self) -> &str {
+            "panicking_tool"
+        }
+        fn description(&self) -> &str {
+            "always errors"
+        }
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+        async fn execute(&self, _args: serde_json::Value) -> anyhow::Result<ToolResult> {
+            let io_err =
+                std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "kernel refused");
+            Err(anyhow::Error::new(io_err).context("failed to dial backend"))
+        }
+    }
+
+    /// RED: wrapping a tool that returns `success=false` in `LoggedTool`
+    /// MUST emit a WARN-level tracing event carrying the tool name and
+    /// the error string, so operators grepping `grep 'tool=' /var/log`
+    /// see every silent failure.
+    #[tokio::test]
+    async fn logged_tool_emits_warn_on_success_false() {
+        let (capture, guard) = install_trace_capture();
+
+        let tool = LoggedTool::new(FailingTool);
+        let result = tool
+            .execute(serde_json::json!({"any": "input"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+
+        drop(guard);
+        let logs = capture.as_string();
+
+        assert!(
+            logs.contains("WARN"),
+            "expected WARN level tracing event, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("tool_boundary"),
+            "expected 'tool_boundary' target in logs, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("failing_tool"),
+            "expected tool name in logs, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("simulated upstream 500"),
+            "expected error text from ToolResult.error, got:\n{logs}"
+        );
+    }
+
+    /// RED: wrapping a tool that raises `anyhow::Error` in `LoggedTool`
+    /// MUST emit an ERROR-level tracing event carrying the tool name,
+    /// the error message, and the full source chain (so the ConnectionRefused
+    /// from std::io is visible, not just anyhow's outer context).
+    #[tokio::test]
+    async fn logged_tool_emits_error_with_chain_on_anyhow_err() {
+        let (capture, guard) = install_trace_capture();
+
+        let tool = LoggedTool::new(PanickingTool);
+        let result = tool.execute(serde_json::json!({})).await;
+        assert!(result.is_err(), "expected Err from PanickingTool");
+
+        drop(guard);
+        let logs = capture.as_string();
+
+        assert!(
+            logs.contains("ERROR"),
+            "expected ERROR level tracing event, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("tool_boundary"),
+            "expected 'tool_boundary' target, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("panicking_tool"),
+            "expected tool name in logs, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("error_chain"),
+            "expected 'error_chain' structured field, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("kernel refused"),
+            "expected std::io root cause 'kernel refused' in chain, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("failed to dial backend"),
+            "expected anyhow context 'failed to dial backend', got:\n{logs}"
+        );
+    }
+
+    /// RED: wrapping a tool that returns `success=true` in `LoggedTool`
+    /// MUST NOT emit a WARN/ERROR event (only DEBUG). Logging every
+    /// success at WARN level would drown out real signal.
+    #[tokio::test]
+    async fn logged_tool_does_not_warn_on_success() {
+        let (capture, guard) = install_trace_capture();
+
+        let (inner, counter) = CountingTool::new();
+        let tool = LoggedTool::new(inner);
+        let result = tool.execute(serde_json::json!({})).await.unwrap();
+        assert!(result.success);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+
+        drop(guard);
+        let logs = capture.as_string();
+
+        assert!(
+            !logs.contains("WARN"),
+            "success path must not emit WARN events, got:\n{logs}"
+        );
+        assert!(
+            !logs.contains("ERROR"),
+            "success path must not emit ERROR events, got:\n{logs}"
+        );
+        // Still expect a DEBUG event so operators can trace call flow
+        // at RUST_LOG=debug.
+        assert!(
+            logs.contains("DEBUG") && logs.contains("counting"),
+            "expected DEBUG trace with tool name on success, got:\n{logs}"
+        );
+    }
+
+    /// Delegation: `LoggedTool` must pass through name/description/schema
+    /// without modification.
+    #[tokio::test]
+    async fn logged_tool_delegates_metadata() {
+        let (inner, _) = CountingTool::new();
+        let tool = LoggedTool::new(inner);
+        assert_eq!(tool.name(), "counting");
+        assert_eq!(tool.description(), "counts calls");
+        assert!(tool.parameters_schema().is_object());
     }
 }

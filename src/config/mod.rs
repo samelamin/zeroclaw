@@ -1,5 +1,6 @@
 pub mod schema;
 pub mod traits;
+pub mod validate;
 pub mod workspace;
 
 #[allow(unused_imports)]

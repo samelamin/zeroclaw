@@ -213,7 +213,7 @@ pub use weather_tool::WeatherTool;
 pub use web_fetch::WebFetchTool;
 pub use web_search_tool::WebSearchTool;
 pub use workspace_tool::WorkspaceTool;
-pub use wrappers::{PathGuardedTool, RateLimitedTool};
+pub use wrappers::{LoggedTool, PathGuardedTool, RateLimitedTool};
 
 use crate::config::{Config, DelegateAgentConfig};
 use crate::memory::Memory;
@@ -281,7 +281,15 @@ impl Tool for ArcDelegatingTool {
 }
 
 fn boxed_registry_from_arcs(tools: Vec<Arc<dyn Tool>>) -> Vec<Box<dyn Tool>> {
-    tools.into_iter().map(ArcDelegatingTool::boxed).collect()
+    // Every tool passes through `LoggedTool` at the outermost boundary so
+    // that soft-fails (`Ok(ToolResult { success: false, .. })`) and hard
+    // errors (`Err(anyhow::Error)`) are never invisible in the agent loop.
+    // See `wrappers::LoggedTool` for the emission contract.
+    tools
+        .into_iter()
+        .map(ArcDelegatingTool::boxed)
+        .map(|t| Box::new(LoggedTool::wrap_boxed(t)) as Box<dyn Tool>)
+        .collect()
 }
 
 /// Create the default tool registry
@@ -290,20 +298,25 @@ pub fn default_tools(security: Arc<SecurityPolicy>) -> Vec<Box<dyn Tool>> {
 }
 
 /// Create the default tool registry with explicit runtime adapter.
+///
+/// Every tool in the returned registry is wrapped in [`LoggedTool`] at the
+/// outermost boundary, so soft-fails and hard errors are never silent in
+/// the agent loop. Composition order (outermost first):
+/// `LoggedTool → RateLimitedTool → PathGuardedTool → <concrete>`.
 pub fn default_tools_with_runtime(
     security: Arc<SecurityPolicy>,
     runtime: Arc<dyn RuntimeAdapter>,
 ) -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(RateLimitedTool::new(
+        Box::new(LoggedTool::new(RateLimitedTool::new(
             PathGuardedTool::new(ShellTool::new(security.clone(), runtime), security.clone()),
             security.clone(),
-        )),
-        Box::new(FileReadTool::new(security.clone())),
-        Box::new(FileWriteTool::new(security.clone())),
-        Box::new(FileEditTool::new(security.clone())),
-        Box::new(GlobSearchTool::new(security.clone())),
-        Box::new(ContentSearchTool::new(security)),
+        ))),
+        Box::new(LoggedTool::new(FileReadTool::new(security.clone()))),
+        Box::new(LoggedTool::new(FileWriteTool::new(security.clone()))),
+        Box::new(LoggedTool::new(FileEditTool::new(security.clone()))),
+        Box::new(LoggedTool::new(GlobSearchTool::new(security.clone()))),
+        Box::new(LoggedTool::new(ContentSearchTool::new(security))),
     ]
 }
 
@@ -378,6 +391,60 @@ pub fn all_tools(
         root_config,
         canvas_store,
     )
+}
+
+/// Build the full tool registry for the `zeroclaw mcp` subcommand.
+///
+/// Exposes the same rich tool surface (~40 tools) as `all_tools_with_runtime`
+/// rather than the 6-tool `default_tools` subset. This is what lets
+/// customers wire ZeroClaw-as-MCP-server into Claude Desktop (or another
+/// orchestrator) and reach `web_fetch`, `http_request`, `calculator`,
+/// `memory_*`, `cron_*`, and every other tool ZeroClaw ships. Auxiliary
+/// handles (delegate, reaction, channel_map, ask_user, escalate) are
+/// intentionally dropped — they only wire into the interactive agent loop
+/// and have no meaning in the MCP server context.
+pub fn mcp_server_tools(config: &crate::config::Config) -> anyhow::Result<Vec<Box<dyn Tool>>> {
+    let security = Arc::new(SecurityPolicy::from_config(
+        &config.autonomy,
+        &config.workspace_dir,
+    ));
+    let runtime: Arc<dyn RuntimeAdapter> = Arc::new(NativeRuntime::new());
+    let memory: Arc<dyn Memory> = Arc::from(crate::memory::create_memory_with_storage_and_routes(
+        &config.memory,
+        &config.embedding_routes,
+        Some(&config.storage.provider.config),
+        &config.workspace_dir,
+        config.api_key.as_deref(),
+    )?);
+
+    let composio_key = if config.composio.enabled {
+        config.composio.api_key.as_deref()
+    } else {
+        None
+    };
+    let composio_entity_id = if config.composio.enabled {
+        Some(config.composio.entity_id.as_str())
+    } else {
+        None
+    };
+
+    let (tools, _, _, _, _, _) = all_tools_with_runtime(
+        Arc::new(config.clone()),
+        &security,
+        runtime,
+        memory,
+        composio_key,
+        composio_entity_id,
+        &config.browser,
+        &config.http_request,
+        &config.web_fetch,
+        &config.workspace_dir,
+        &config.agents,
+        config.api_key.as_deref(),
+        config,
+        None,
+    );
+    Ok(tools)
 }
 
 /// Create full tool registry including memory tools and optional Composio.
@@ -556,13 +623,28 @@ pub fn all_tools_with_runtime(
     }
 
     if http_config.enabled {
-        tool_arcs.push(Arc::new(HttpRequestTool::new(
-            security.clone(),
-            http_config.allowed_domains.clone(),
-            http_config.max_response_size,
-            http_config.timeout_secs,
-            http_config.allow_private_hosts,
-        )));
+        // §2 footgun guard: a tool that registers but fails every call is
+        // strictly worse than no tool — from the LLM's perspective it
+        // looks like a mysterious per-call error rather than a missing
+        // capability. Skip registration when `allowed_domains` is empty
+        // and emit a loud WARN pointing operators at the config key to
+        // fix, so the LLM never sees a broken tool.
+        if http_config.allowed_domains.is_empty() {
+            tracing::warn!(
+                target: "http_request",
+                "http_request: skipped registration because `http_request.allowed_domains` is empty. \
+                 Add at least one domain (e.g. [\"api.example.com\"] or [\"*\"] for all public hosts) \
+                 in config.toml under [http_request] to enable the tool."
+            );
+        } else {
+            tool_arcs.push(Arc::new(HttpRequestTool::new(
+                security.clone(),
+                http_config.allowed_domains.clone(),
+                http_config.max_response_size,
+                http_config.timeout_secs,
+                http_config.allow_private_hosts,
+            )));
+        }
     }
 
     if web_fetch_config.enabled {
@@ -588,9 +670,12 @@ pub fn all_tools_with_runtime(
 
     // Web search tool (enabled by default for GLM and other models)
     if root_config.web_search.enabled {
+        // Use resolved_brave_api_key() so both `brave_api_key` (canonical)
+        // and the deprecated `api_key` alias work at runtime. The
+        // deprecation WARN was already emitted during Config::load_or_init.
         tool_arcs.push(Arc::new(WebSearchTool::new_with_config(
             root_config.web_search.provider.clone(),
-            root_config.web_search.brave_api_key.clone(),
+            root_config.web_search.resolved_brave_api_key(),
             root_config.web_search.searxng_instance_url.clone(),
             root_config.web_search.max_results,
             root_config.web_search.timeout_secs,
@@ -1229,6 +1314,436 @@ mod tests {
             assert_eq!(spec.description, tool.description());
             assert!(spec.parameters.is_object());
         }
+    }
+
+    // ── §2: http_request empty allowed_domains footgun ──────────────────────
+    //
+    // If `http_request.enabled = true` but `http_request.allowed_domains` is
+    // empty, the previous behaviour was to register the tool anyway and
+    // fail every call at runtime with "no allowed_domains are configured".
+    // From the LLM's perspective this looks like a mysterious per-call
+    // error; from the operator's perspective the tool looks enabled but
+    // nothing works. The fix is to skip registration at factory time with
+    // a loud WARN so the LLM never sees a broken tool, and operators see
+    // an unambiguous diagnostic pointing at the config key to fix.
+    #[test]
+    fn http_request_skipped_when_enabled_but_allowed_domains_empty() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+        let http = crate::config::HttpRequestConfig {
+            enabled: true,
+            allowed_domains: vec![], // the footgun
+            ..crate::config::HttpRequestConfig::default()
+        };
+        let cfg = test_config(&tmp);
+
+        let (tools, _, _, _, _, _) = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"http_request"),
+            "http_request must be skipped when allowed_domains is empty (footgun guard), found: {names:?}"
+        );
+    }
+
+    // ── §3: MCP server full-surface tool exposure (TDD) ─────────────────────
+    //
+    // The `zeroclaw mcp` subcommand used to expose only `default_tools`
+    // (6 built-ins: shell + file_read/write/edit + glob/content search).
+    // Customers wiring ZeroClaw-as-MCP-server into Claude Desktop or another
+    // orchestrator could not reach web_fetch, http_request, calculator,
+    // memory_*, cron_*, or any of the 30+ other tools ZeroClaw ships.
+    //
+    // The fix is to introduce `mcp_server_tools(config)` that returns the
+    // same rich tool surface as `all_tools_with_runtime`, so the MCP server
+    // transport exposes everything the agent loop exposes.
+    #[test]
+    fn mcp_server_tools_exposes_full_surface_not_just_defaults() {
+        let tmp = TempDir::new().unwrap();
+        let mut config = Config::default();
+        config.workspace_dir = tmp.path().to_path_buf();
+        config.config_path = tmp.path().join("config.toml");
+        // Force deterministic, offline-friendly defaults.
+        config.browser.enabled = false;
+        config.memory.backend = "markdown".into();
+        // Markdown memory backend just needs a writable dir; ensure it.
+        std::fs::create_dir_all(tmp.path()).unwrap();
+
+        let tools = mcp_server_tools(&config)
+            .expect("mcp_server_tools should succeed with a minimal config");
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+
+        // Must include at least one tool beyond default_tools' 6.
+        assert!(
+            names.contains(&"http_request"),
+            "MCP surface must include http_request, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"web_fetch"),
+            "MCP surface must include web_fetch, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"calculator"),
+            "MCP surface must include calculator, got: {names:?}"
+        );
+        // And the default_tools entries must still be present.
+        assert!(names.contains(&"shell"));
+        assert!(names.contains(&"file_read"));
+        assert!(names.contains(&"file_write"));
+        // Surface must be strictly larger than default_tools.
+        assert!(
+            tools.len() > 6,
+            "MCP surface should be larger than 6-tool default_tools, got {}",
+            tools.len()
+        );
+    }
+
+    /// Regression guard: when `allowed_domains` is populated, http_request
+    /// MUST register normally.
+    #[test]
+    fn http_request_registered_when_allowed_domains_populated() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+        let http = crate::config::HttpRequestConfig {
+            enabled: true,
+            allowed_domains: vec!["api.example.com".into()],
+            ..crate::config::HttpRequestConfig::default()
+        };
+        let cfg = test_config(&tmp);
+
+        let (tools, _, _, _, _, _) = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            names.contains(&"http_request"),
+            "http_request MUST register when allowed_domains is populated, found: {names:?}"
+        );
+    }
+
+    // ── §8: Opt-in guardrail — claude_code + browser_delegate (TDD) ─────────
+    //
+    // `claude_code` and `browser_delegate` can exfiltrate data, spawn child
+    // Claude agents with their own tool permissions, and reach the local
+    // filesystem in ways that exceed normal tool scope. Both MUST be
+    // `enabled = false` in their default configs and MUST NOT appear in the
+    // tool registry unless the operator explicitly sets `enabled = true`.
+    //
+    // These tests are regression-guards: if someone accidentally flips the
+    // default they will fail the suite immediately, before any release cuts.
+
+    fn base_all_tools(tmp: &TempDir) -> Vec<Box<dyn Tool>> {
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+        let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(tmp);
+        let (tools, _, _, _, _, _) = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+        );
+        tools
+    }
+
+    /// RED → GREEN: `claude_code` MUST NOT appear in `all_tools` when
+    /// `claude_code.enabled = false` (the default). An accidental default
+    /// flip would expose unconstrained agent spawning to every ZeroClaw
+    /// deployment without operator consent.
+    #[test]
+    fn claude_code_absent_when_disabled_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let tools = base_all_tools(&tmp);
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"claude_code"),
+            "claude_code MUST be opt-in (enabled=false by default), but it appeared: {names:?}"
+        );
+    }
+
+    /// RED → GREEN: `browser_delegate` MUST NOT appear in `all_tools` when
+    /// `browser_delegate.enabled = false` (the default).
+    #[test]
+    fn browser_delegate_absent_when_disabled_by_default() {
+        let tmp = TempDir::new().unwrap();
+        let tools = base_all_tools(&tmp);
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            !names.contains(&"browser_delegate"),
+            "browser_delegate MUST be opt-in (enabled=false by default), but it appeared: {names:?}"
+        );
+    }
+
+    /// Regression guard: `claude_code` MUST appear when explicitly enabled.
+    #[test]
+    fn claude_code_present_when_explicitly_enabled() {
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy::default());
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            ..BrowserConfig::default()
+        };
+        let http = crate::config::HttpRequestConfig::default();
+        let mut cfg = test_config(&tmp);
+        cfg.claude_code.enabled = true;
+        let (tools, _, _, _, _, _) = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+        );
+        let names: Vec<&str> = tools.iter().map(|t| t.name()).collect();
+        assert!(
+            names.contains(&"claude_code"),
+            "claude_code MUST register when explicitly enabled, found: {names:?}"
+        );
+    }
+
+    // ── §1g: Tool-boundary logging wiring (TDD) ─────────────────────────────
+    //
+    // These tests prove that every tool returned from `default_tools` and
+    // `all_tools_with_runtime` is wrapped in `LoggedTool`, so failures are
+    // never silent in the agent loop. The detection is behavioural: install
+    // a tracing subscriber, execute a tool in a way that triggers a WARN or
+    // ERROR path, and assert that a `tool_boundary` event was emitted.
+    //
+    // A tool that bypasses `LoggedTool` would still return the same
+    // `ToolResult` but would NOT emit any `tool_boundary` event.
+
+    use std::sync::Mutex as StdMutex;
+
+    #[derive(Clone, Default)]
+    struct BoundaryTraceCapture(Arc<StdMutex<Vec<u8>>>);
+    struct BoundaryTraceCaptureWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl BoundaryTraceCapture {
+        fn as_string(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for BoundaryTraceCapture {
+        type Writer = BoundaryTraceCaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            BoundaryTraceCaptureWriter(self.0.clone())
+        }
+    }
+
+    impl std::io::Write for BoundaryTraceCaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn install_boundary_trace_capture()
+    -> (BoundaryTraceCapture, tracing::dispatcher::DefaultGuard) {
+        let capture = BoundaryTraceCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(true)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        (capture, guard)
+    }
+
+    /// RED: every tool from `default_tools` MUST be wrapped in `LoggedTool`,
+    /// so that calling `.execute()` emits a `tool_boundary` event. This is
+    /// tested by executing `file_read` with a missing path (triggers a
+    /// soft-fail WARN) and asserting the `tool_boundary` target appears in
+    /// the captured trace output.
+    #[tokio::test]
+    async fn default_tools_are_wrapped_in_logged_tool() {
+        let (capture, guard) = install_boundary_trace_capture();
+
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let tools = default_tools(security);
+
+        // Pick file_read — harmless and triggers a soft-fail when the
+        // target file does not exist.
+        let file_read = tools
+            .iter()
+            .find(|t| t.name() == "file_read")
+            .expect("default_tools must include file_read");
+        let missing = tmp.path().join("does-not-exist.txt");
+        let result = file_read
+            .execute(serde_json::json!({"path": missing.to_string_lossy()}))
+            .await
+            .expect("execute should not raise, just soft-fail");
+        assert!(
+            !result.success,
+            "reading a missing file should soft-fail, got {result:?}"
+        );
+
+        drop(guard);
+        let logs = capture.as_string();
+
+        assert!(
+            logs.contains("tool_boundary"),
+            "expected every default_tool to emit a 'tool_boundary' event (proves LoggedTool wrapping), got:\n{logs}"
+        );
+        assert!(
+            logs.contains("file_read"),
+            "expected tool name 'file_read' in boundary log, got:\n{logs}"
+        );
+    }
+
+    /// RED: every tool from `all_tools_with_runtime` (through
+    /// `boxed_registry_from_arcs`) MUST also be wrapped in `LoggedTool`.
+    /// Same detection strategy as above.
+    #[tokio::test]
+    async fn all_tools_are_wrapped_in_logged_tool() {
+        let (capture, guard) = install_boundary_trace_capture();
+
+        let tmp = TempDir::new().unwrap();
+        let security = Arc::new(SecurityPolicy {
+            autonomy: crate::security::AutonomyLevel::Full,
+            workspace_dir: tmp.path().to_path_buf(),
+            ..SecurityPolicy::default()
+        });
+        let mem_cfg = MemoryConfig {
+            backend: "markdown".into(),
+            ..MemoryConfig::default()
+        };
+        let mem: Arc<dyn Memory> =
+            Arc::from(crate::memory::create_memory(&mem_cfg, tmp.path(), None).unwrap());
+        let browser = BrowserConfig {
+            enabled: false,
+            allowed_domains: vec!["example.com".into()],
+            session_name: None,
+            ..BrowserConfig::default()
+        };
+        let http = crate::config::HttpRequestConfig::default();
+        let cfg = test_config(&tmp);
+
+        let (tools, _, _, _, _, _) = all_tools(
+            Arc::new(Config::default()),
+            &security,
+            mem,
+            None,
+            None,
+            &browser,
+            &http,
+            &crate::config::WebFetchConfig::default(),
+            tmp.path(),
+            &HashMap::new(),
+            None,
+            &cfg,
+            None,
+        );
+
+        let file_read = tools
+            .iter()
+            .find(|t| t.name() == "file_read")
+            .expect("all_tools must include file_read");
+        let missing = tmp.path().join("also-missing.txt");
+        let result = file_read
+            .execute(serde_json::json!({"path": missing.to_string_lossy()}))
+            .await
+            .expect("execute should not raise, just soft-fail");
+        assert!(!result.success);
+
+        drop(guard);
+        let logs = capture.as_string();
+
+        assert!(
+            logs.contains("tool_boundary"),
+            "expected every all_tools entry to emit a 'tool_boundary' event (proves LoggedTool wrapping), got:\n{logs}"
+        );
+        assert!(
+            logs.contains("file_read"),
+            "expected tool name 'file_read' in boundary log, got:\n{logs}"
+        );
     }
 
     #[test]

@@ -2817,9 +2817,20 @@ pub struct WebSearchConfig {
     /// Search provider: "duckduckgo" (free), "brave" (requires API key), or "searxng" (self-hosted)
     #[serde(default = "default_web_search_provider")]
     pub provider: String,
-    /// Brave Search API key (required if provider is "brave")
+    /// Brave Search API key (required if provider is "brave").
+    ///
+    /// Prefer this canonical name. The legacy alias `api_key` is still
+    /// accepted for backward compatibility but emits a deprecation warning
+    /// at startup. Use [`WebSearchConfig::resolved_brave_api_key`] to
+    /// read the effective key regardless of which field was set.
     #[serde(default)]
     pub brave_api_key: Option<String>,
+    /// **Deprecated alias for `brave_api_key`.** Accepted for backward
+    /// compatibility with configs that used `[web_search] api_key = "..."`.
+    /// Emits a WARN at startup and will be removed in a future release.
+    /// Migrate to `brave_api_key`.
+    #[serde(default, rename = "api_key")]
+    pub deprecated_api_key: Option<String>,
     /// SearXNG instance URL (required if provider is "searxng"), e.g. "https://searx.example.com"
     #[serde(default)]
     pub searxng_instance_url: Option<String>,
@@ -2849,9 +2860,33 @@ impl Default for WebSearchConfig {
             enabled: true,
             provider: default_web_search_provider(),
             brave_api_key: None,
+            deprecated_api_key: None,
             searxng_instance_url: None,
             max_results: default_web_search_max_results(),
             timeout_secs: default_web_search_timeout_secs(),
+        }
+    }
+}
+
+impl WebSearchConfig {
+    /// Return the effective Brave Search API key, accepting both the
+    /// canonical `brave_api_key` field and the legacy `api_key` alias.
+    /// The canonical field always wins. Returns `None` when neither is set.
+    pub fn resolved_brave_api_key(&self) -> Option<String> {
+        self.brave_api_key
+            .clone()
+            .or_else(|| self.deprecated_api_key.clone())
+    }
+
+    /// Emit a `WARN` if the deprecated `api_key` alias is populated.
+    /// Call this once after deserializing a user config — operators will
+    /// see the message on the first run and know to rename the field.
+    pub fn emit_deprecation_warnings(&self) {
+        if self.deprecated_api_key.is_some() && self.brave_api_key.is_none() {
+            tracing::warn!(
+                "[web_search] api_key is deprecated and will be removed in a future release. \
+                 Rename it to `brave_api_key` in your config.toml to silence this warning."
+            );
         }
     }
 }
@@ -9136,6 +9171,16 @@ impl Config {
                 &mut config.web_search.brave_api_key,
                 "config.web_search.brave_api_key",
             )?;
+            // Also decrypt the legacy alias so the key is usable even if the
+            // user hasn't migrated yet.
+            decrypt_optional_secret(
+                &store,
+                &mut config.web_search.deprecated_api_key,
+                "config.web_search.api_key",
+            )?;
+            // Emit a deprecation warning once for any config that uses the
+            // old `api_key` alias so operators know to rename it.
+            config.web_search.emit_deprecation_warnings();
 
             decrypt_optional_secret(
                 &store,
@@ -16229,5 +16274,57 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
         let config = CostConfig::default();
         assert_eq!(config.enforcement.mode, "warn");
         assert_eq!(config.enforcement.reserve_percent, 10);
+    }
+
+    // ── §6: web_search.api_key alias (TDD) ──────────────────────────────────
+    //
+    // Some users set `[web_search] api_key = "..."` instead of the canonical
+    // `brave_api_key`. The fix adds `api_key` as a serde alias so TOML parses
+    // it, and a `resolved_brave_api_key()` method that returns whichever
+    // field is populated (canonical wins), plus a deprecation WARN when only
+    // the alias is present.
+
+    #[test]
+    async fn web_search_config_api_key_alias_deserializes_from_toml() {
+        // RED: `api_key = "sk-abc"` must deserialize to a usable key even
+        // though the canonical field is `brave_api_key`.
+        let toml = r#"
+            enabled = true
+            provider = "brave"
+            api_key = "sk-abc"
+        "#;
+        let cfg: WebSearchConfig = toml::from_str(toml)
+            .expect("api_key should deserialize via alias");
+        assert_eq!(
+            cfg.resolved_brave_api_key().as_deref(),
+            Some("sk-abc"),
+            "resolved_brave_api_key() must return the api_key alias value"
+        );
+    }
+
+    #[test]
+    async fn web_search_config_canonical_brave_api_key_takes_precedence() {
+        // When both `brave_api_key` and `api_key` are set, canonical wins.
+        let toml = r#"
+            enabled = true
+            provider = "brave"
+            brave_api_key = "canonical"
+            api_key = "legacy"
+        "#;
+        let cfg: WebSearchConfig = toml::from_str(toml).unwrap();
+        assert_eq!(
+            cfg.resolved_brave_api_key().as_deref(),
+            Some("canonical"),
+            "canonical brave_api_key must win over api_key alias"
+        );
+    }
+
+    #[test]
+    async fn web_search_config_resolved_brave_api_key_none_when_both_absent() {
+        let cfg = WebSearchConfig::default();
+        assert!(
+            cfg.resolved_brave_api_key().is_none(),
+            "resolved_brave_api_key() must be None when neither field is set"
+        );
     }
 }

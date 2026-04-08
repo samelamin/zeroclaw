@@ -7,13 +7,33 @@ use crate::tools::traits::Tool;
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
+/// Build the tool registry for an MCP server instance. When the caller
+/// provided a full ZeroClaw [`crate::config::Config`] in
+/// [`McpServerConfig::config`], exposes the rich tool surface via
+/// [`crate::tools::mcp_server_tools`]. Otherwise falls back to the minimal
+/// `default_tools` set so older call sites and tests that only supply a
+/// workspace_dir keep working.
+async fn build_tools(config: &McpServerConfig) -> anyhow::Result<Vec<Box<dyn Tool>>> {
+    if config.expose_full_surface {
+        tracing::info!("MCP server: loading full ZeroClaw config and exposing full tool surface");
+        let cfg = Box::pin(crate::config::Config::load_or_init()).await?;
+        crate::tools::mcp_server_tools(&cfg)
+    } else {
+        tracing::warn!(
+            "MCP server: expose_full_surface=false, falling back to 6-tool default_tools subset. \
+             Set McpServerConfig.expose_full_surface = true to expose the full surface."
+        );
+        let security = Arc::new(SecurityPolicy {
+            workspace_dir: config.workspace_dir.clone(),
+            ..SecurityPolicy::default()
+        });
+        Ok(crate::tools::default_tools(security))
+    }
+}
+
 /// Serve MCP over stdio (stdin/stdout JSON-RPC lines).
 pub async fn serve_stdio(config: &McpServerConfig) -> anyhow::Result<()> {
-    let security = Arc::new(SecurityPolicy {
-        workspace_dir: config.workspace_dir.clone(),
-        ..SecurityPolicy::default()
-    });
-    let tools = crate::tools::default_tools(security);
+    let tools = build_tools(config).await?;
 
     let stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
@@ -62,11 +82,7 @@ pub async fn serve_http(config: &McpServerConfig) -> anyhow::Result<()> {
     use axum::{Router, routing::get, routing::post};
     use std::net::SocketAddr;
 
-    let security = Arc::new(SecurityPolicy {
-        workspace_dir: config.workspace_dir.clone(),
-        ..SecurityPolicy::default()
-    });
-    let tools: Vec<Box<dyn Tool>> = crate::tools::default_tools(security);
+    let tools: Vec<Box<dyn Tool>> = build_tools(config).await?;
     let tools: Arc<Vec<Box<dyn Tool>>> = Arc::new(tools);
 
     let app = Router::new()

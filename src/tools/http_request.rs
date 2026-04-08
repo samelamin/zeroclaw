@@ -5,6 +5,32 @@ use serde_json::json;
 use std::sync::Arc;
 use std::time::Duration;
 
+/// Walk the `std::error::Error::source()` chain of `e` and format it as
+/// ` | caused by: ` joined segments. Surfaces the IO/transport root cause
+/// buried beneath reqwest/hyper layers so operators see the real reason
+/// behind a "connection error" at a single grep instead of attaching a
+/// debugger.
+fn error_chain<E: std::error::Error + ?Sized>(e: &E) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(e.to_string());
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = e.source();
+    while let Some(s) = cur {
+        parts.push(s.to_string());
+        cur = s.source();
+    }
+    parts.join(" | caused by: ")
+}
+
+/// Same shape as [`error_chain`] but for `anyhow::Error`. anyhow has
+/// multiple `AsRef` impls so calling the generic helper is ambiguous;
+/// this one uses `anyhow::Error::chain()` directly.
+fn anyhow_error_chain(e: &anyhow::Error) -> String {
+    e.chain()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" | caused by: ")
+}
+
 /// HTTP request tool for API interactions.
 /// Supports GET, POST, PUT, DELETE methods with configurable security.
 pub struct HttpRequestTool {
@@ -120,7 +146,10 @@ impl HttpRequestTool {
         body: Option<&str>,
     ) -> anyhow::Result<reqwest::Response> {
         let timeout_secs = if self.timeout_secs == 0 {
-            tracing::warn!("http_request: timeout_secs is 0, using safe default of 30s");
+            tracing::warn!(
+                target: "http_request",
+                "http_request: timeout_secs is 0, using safe default of 30s"
+            );
             30
         } else {
             self.timeout_secs
@@ -130,7 +159,23 @@ impl HttpRequestTool {
             .connect_timeout(Duration::from_secs(10))
             .redirect(reqwest::redirect::Policy::none());
         let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.http_request");
-        let client = builder.build()?;
+        let client = match builder.build() {
+            Ok(c) => c,
+            Err(e) => {
+                let chain = error_chain(&e);
+                tracing::error!(
+                    target: "http_request",
+                    url = %url,
+                    phase = "client_build",
+                    error = %e,
+                    error_chain = %chain,
+                    "http_request reqwest client builder failed"
+                );
+                return Err(anyhow::anyhow!(
+                    "reqwest client build failed: {e} (chain: {chain})"
+                ));
+            }
+        };
 
         let mut request = client.request(method, url);
 
@@ -142,7 +187,23 @@ impl HttpRequestTool {
             request = request.body(body_str.to_string());
         }
 
-        Ok(request.send().await?)
+        match request.send().await {
+            Ok(resp) => Ok(resp),
+            Err(e) => {
+                let chain = error_chain(&e);
+                tracing::error!(
+                    target: "http_request",
+                    url = %url,
+                    phase = "send",
+                    error = %e,
+                    error_chain = %chain,
+                    "http_request network send failed"
+                );
+                Err(anyhow::anyhow!(
+                    "network send failed: {e} (chain: {chain})"
+                ))
+            }
+        }
     }
 
     fn truncate_response(&self, text: &str) -> String {
@@ -207,6 +268,29 @@ impl Tool for HttpRequestTool {
             .and_then(|v| v.as_str())
             .ok_or_else(|| anyhow::anyhow!("Missing 'url' parameter"))?;
 
+        // Debug-log the effective runtime proxy state before any outbound
+        // traffic. Operators troubleshooting a "connection error" in the
+        // field can set RUST_LOG=http_request=debug and immediately see
+        // whether the corporate egress proxy is being applied for this
+        // URL or if reqwest is going direct.
+        {
+            let service_key = "tool.http_request";
+            let proxy_cfg = crate::config::runtime_proxy_config();
+            let proxy_applies = proxy_cfg.should_apply_to_service(service_key);
+            tracing::debug!(
+                target: "http_request",
+                service_key = %service_key,
+                url = %url,
+                proxy_enabled = proxy_cfg.enabled,
+                proxy_applies = proxy_applies,
+                http_proxy = proxy_cfg.http_proxy.as_deref().unwrap_or(""),
+                https_proxy = proxy_cfg.https_proxy.as_deref().unwrap_or(""),
+                all_proxy = proxy_cfg.all_proxy.as_deref().unwrap_or(""),
+                no_proxy_count = proxy_cfg.normalized_no_proxy().len(),
+                "http_request resolved runtime proxy state"
+            );
+        }
+
         let method_str = args.get("method").and_then(|v| v.as_str()).unwrap_or("GET");
         let headers_val = args.get("headers").cloned().unwrap_or(json!({}));
         let body = args.get("body").and_then(|v| v.as_str());
@@ -230,6 +314,12 @@ impl Tool for HttpRequestTool {
         let url = match self.validate_url(url) {
             Ok(v) => v,
             Err(e) => {
+                tracing::warn!(
+                    target: "http_request",
+                    url = %url,
+                    error = %e,
+                    "http_request URL validation rejected request"
+                );
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
@@ -258,6 +348,17 @@ impl Tool for HttpRequestTool {
             Ok(response) => {
                 let status = response.status();
                 let status_code = status.as_u16();
+                let status_reason = status.canonical_reason().unwrap_or("Unknown");
+
+                if !status.is_success() {
+                    tracing::warn!(
+                        target: "http_request",
+                        url = %url,
+                        status = status_code,
+                        status_reason = %status_reason,
+                        "http_request HTTP non-2xx response"
+                    );
+                }
 
                 // Get response headers (redact sensitive ones)
                 let response_headers = response.headers().iter();
@@ -276,15 +377,23 @@ impl Tool for HttpRequestTool {
                 // Get response body with size limit
                 let response_text = match response.text().await {
                     Ok(text) => self.truncate_response(&text),
-                    Err(e) => format!("[Failed to read response body: {e}]"),
+                    Err(e) => {
+                        let chain = error_chain(&e);
+                        tracing::error!(
+                            target: "http_request",
+                            url = %url,
+                            phase = "body_read",
+                            error = %e,
+                            error_chain = %chain,
+                            "http_request body_read failure"
+                        );
+                        format!("[Failed to read response body: {e} (chain: {chain})]")
+                    }
                 };
 
                 let output = format!(
                     "Status: {} {}\nResponse Headers: {}\n\nResponse Body:\n{}",
-                    status_code,
-                    status.canonical_reason().unwrap_or("Unknown"),
-                    headers_text,
-                    response_text
+                    status_code, status_reason, headers_text, response_text
                 );
 
                 Ok(ToolResult {
@@ -297,11 +406,20 @@ impl Tool for HttpRequestTool {
                     },
                 })
             }
-            Err(e) => Ok(ToolResult {
-                success: false,
-                output: String::new(),
-                error: Some(format!("HTTP request failed: {e}")),
-            }),
+            Err(e) => {
+                // Note: execute_request() already emitted an ERROR-level
+                // tracing event with the source chain. This soft-fail is
+                // surfaced to the caller via ToolResult.error, and the
+                // tool-boundary LoggedTool wrapper will also emit a WARN
+                // with `success=false`, so operators get two ways to see
+                // the failure without double-logging the source chain.
+                let chain = anyhow_error_chain(&e);
+                Ok(ToolResult {
+                    success: false,
+                    output: String::new(),
+                    error: Some(format!("HTTP request failed: {e} (chain: {chain})")),
+                })
+            }
         }
     }
 }
@@ -1033,6 +1151,224 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("local/private")
+        );
+    }
+
+    // ── §1h: http_request structured tracing (TDD) ──────────────────────────
+    //
+    // Every error path in `execute_request` / `execute` must emit a
+    // structured tracing event so operators can see *why* an outbound HTTP
+    // call failed without attaching a debugger. The tests below install a
+    // local subscriber, invoke `execute` in each failure mode, and assert
+    // on the captured event content.
+
+    use std::sync::Mutex as StdMutex;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[derive(Clone, Default)]
+    struct HttpTraceCapture(Arc<StdMutex<Vec<u8>>>);
+    struct HttpTraceCaptureWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl HttpTraceCapture {
+        fn as_string(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for HttpTraceCapture {
+        type Writer = HttpTraceCaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            HttpTraceCaptureWriter(self.0.clone())
+        }
+    }
+
+    impl std::io::Write for HttpTraceCaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn install_http_trace_capture() -> (HttpTraceCapture, tracing::dispatcher::DefaultGuard) {
+        let capture = HttpTraceCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(true)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        (capture, guard)
+    }
+
+    /// Bind a TCP listener on an ephemeral port and drop it — returns a URL
+    /// pointing to a port that is guaranteed to refuse connections. This
+    /// deterministically triggers the network-error path inside
+    /// `execute_request` without depending on external DNS or timing.
+    fn reserved_unused_http_url() -> String {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        drop(tcp);
+        format!("http://127.0.0.1:{port}/nowhere")
+    }
+
+    fn test_tool_with_private_hosts_allowed(allowed_domains: Vec<&str>) -> HttpRequestTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            max_actions_per_hour: 1000,
+            ..SecurityPolicy::default()
+        });
+        HttpRequestTool::new(
+            security,
+            allowed_domains.into_iter().map(String::from).collect(),
+            1_000_000,
+            30,
+            true, // allow private hosts so we can point at 127.0.0.1
+        )
+    }
+
+    /// RED: when the underlying `reqwest::Client::send` returns an error
+    /// (e.g. ConnectionRefused because the port is dead), `execute` MUST
+    /// emit an ERROR-level `tracing` event on the `http_request` target
+    /// containing:
+    ///   - the URL that failed
+    ///   - the reqwest error display
+    ///   - the full `error_chain` (source-chain walk) so the std::io root
+    ///     cause is visible without attaching a debugger.
+    #[tokio::test]
+    async fn http_request_logs_error_with_source_chain_on_network_failure() {
+        let (capture, guard) = install_http_trace_capture();
+
+        let tool = test_tool_with_private_hosts_allowed(vec!["127.0.0.1"]);
+        let url = reserved_unused_http_url();
+        let result = tool
+            .execute(json!({"url": url.clone()}))
+            .await
+            .expect("execute should return soft-fail, not raise");
+        assert!(!result.success);
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("HTTP request failed"),
+            "expected soft-fail to mention 'HTTP request failed', got {:?}",
+            result.error
+        );
+
+        drop(guard);
+        let logs = capture.as_string();
+
+        assert!(
+            logs.contains("ERROR"),
+            "expected ERROR level tracing event, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("http_request"),
+            "expected 'http_request' target, got:\n{logs}"
+        );
+        assert!(
+            logs.contains(&url),
+            "expected failing URL {url} in log, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("error_chain"),
+            "expected structured 'error_chain' field in log, got:\n{logs}"
+        );
+    }
+
+    /// RED: when the HTTP response status is non-2xx, `execute` MUST emit
+    /// a WARN-level tracing event on the `http_request` target carrying
+    /// the URL and numeric status code. (The previous behaviour only
+    /// populated ToolResult.error; operators had no way to see it without
+    /// plumbing the ToolResult through their logs.)
+    #[tokio::test]
+    async fn http_request_logs_warn_on_http_non_2xx_with_status_fields() {
+        let (capture, guard) = install_http_trace_capture();
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/forbidden"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        // Allow the mock server host (127.0.0.1 via private hosts flag).
+        let tool = test_tool_with_private_hosts_allowed(vec!["*"]);
+        let url = format!("{}/forbidden", server.uri());
+        let result = tool
+            .execute(json!({"url": url.clone()}))
+            .await
+            .expect("execute should return soft-fail");
+        assert!(!result.success);
+
+        drop(guard);
+        let logs = capture.as_string();
+
+        assert!(
+            logs.contains("WARN"),
+            "expected WARN level tracing event, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("http_request"),
+            "expected 'http_request' target, got:\n{logs}"
+        );
+        assert!(
+            logs.contains(&url),
+            "expected URL in log, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("403") || logs.contains("status"),
+            "expected status code 403 in log, got:\n{logs}"
+        );
+    }
+
+    /// RED: at the start of `execute`, the tool MUST emit a DEBUG-level
+    /// tracing event capturing the effective runtime proxy state for
+    /// service_key `tool.http_request`. Without this operators cannot tell
+    /// whether a "connection error" is because the proxy is bypassing
+    /// their corporate traffic egress, and have to debug blind.
+    #[tokio::test]
+    async fn http_request_logs_debug_proxy_state_on_entry() {
+        let (capture, guard) = install_http_trace_capture();
+
+        // Use a wiremock so we reach execute_request without any 4xx/5xx
+        // noise polluting the log assertion.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/ok"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+
+        let tool = test_tool_with_private_hosts_allowed(vec!["*"]);
+        let url = format!("{}/ok", server.uri());
+        let _ = tool.execute(json!({"url": url})).await.unwrap();
+
+        drop(guard);
+        let logs = capture.as_string();
+
+        assert!(
+            logs.contains("DEBUG"),
+            "expected DEBUG tracing event at execute() entry, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("http_request"),
+            "expected 'http_request' target, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("service_key") || logs.contains("tool.http_request"),
+            "expected service_key field referencing 'tool.http_request', got:\n{logs}"
+        );
+        assert!(
+            logs.contains("proxy_enabled") || logs.contains("proxy_applies"),
+            "expected proxy state fields in log, got:\n{logs}"
         );
     }
 }

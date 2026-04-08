@@ -645,6 +645,37 @@ enum PluginCommands {
 enum ConfigCommands {
     /// Dump the full configuration JSON Schema to stdout
     Schema,
+
+    /// Validate a TOML config file for structural, deserialization, and semantic errors.
+    ///
+    /// Exits 0 if valid (warnings are printed but not fatal).
+    /// Exits 1 if any errors are found.
+    ///
+    /// Examples:
+    ///   zeroclaw config validate config.toml
+    ///   zeroclaw config validate --strict config.toml
+    Validate {
+        /// Path to the TOML config file to validate (defaults to the active config.toml).
+        #[arg(value_name = "FILE")]
+        file: Option<std::path::PathBuf>,
+
+        /// Treat unknown keys and legacy [tools.X] sections as errors instead of warnings.
+        #[arg(long)]
+        strict: bool,
+    },
+
+    /// Rewrite legacy [tools.X] sections to top-level [X] sections.
+    ///
+    /// Saves a backup as <file>.bak before writing.
+    ///
+    /// Examples:
+    ///   zeroclaw config migrate
+    ///   zeroclaw config migrate config.toml
+    Migrate {
+        /// Path to the TOML config file to migrate (defaults to the active config.toml).
+        #[arg(value_name = "FILE")]
+        file: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1099,6 +1130,15 @@ async fn main() -> Result<()> {
                     .parent()
                     .map(|p| p.to_path_buf())
                     .unwrap_or_else(|| std::path::PathBuf::from(".")),
+                // §3: opt the MCP server into the full ~40-tool surface
+                // (web_fetch, http_request, calculator, memory_*, cron_*,
+                // …) rather than the 6-tool default_tools subset. The
+                // transport will load its own `Config::load_or_init`
+                // internally — we can't pass `config` directly because
+                // the binary crate and the library crate each compile
+                // `mod config;` separately, so the `Config` types are
+                // nominally distinct.
+                expose_full_surface: true,
             };
             zeroclaw::mcp_server::serve(mcp_config).await?;
             Ok(())
@@ -1661,6 +1701,87 @@ async fn main() -> Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&schema).expect("failed to serialize JSON Schema")
                 );
+                Ok(())
+            }
+
+            ConfigCommands::Validate { file, strict } => {
+                let path = match file {
+                    Some(p) => p,
+                    None => config.config_path.clone(),
+                };
+                let toml_content = std::fs::read_to_string(&path)
+                    .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+
+                use zeroclaw::config::validate::{ValidationOutcome, validate_config_toml};
+                let outcome = validate_config_toml(&toml_content, strict);
+
+                match &outcome {
+                    ValidationOutcome::Ok { warnings } => {
+                        for w in warnings {
+                            warn!("config validate: {w}");
+                        }
+                        println!("Config valid: {}", path.display());
+                        Ok(())
+                    }
+                    ValidationOutcome::Errors { errors, warnings } => {
+                        for w in warnings {
+                            warn!("config validate: {w}");
+                        }
+                        for e in errors {
+                            eprintln!("error: {e}");
+                        }
+                        eprintln!(
+                            "\nConfig validation FAILED ({} error(s)): {}",
+                            errors.len(),
+                            path.display()
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            ConfigCommands::Migrate { file } => {
+                let path = match file {
+                    Some(p) => p,
+                    None => config.config_path.clone(),
+                };
+                let toml_content = std::fs::read_to_string(&path)
+                    .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+
+                use zeroclaw::config::validate::migrate_tools_prefix;
+                let (migrated, keys) = migrate_tools_prefix(&toml_content)
+                    .with_context(|| format!("Migration failed for: {}", path.display()))?;
+
+                if keys.is_empty() {
+                    println!("Nothing to migrate in {}", path.display());
+                    return Ok(());
+                }
+
+                // Write backup
+                let backup_path = path.with_extension(
+                    path.extension()
+                        .map(|e| format!("{}.bak", e.to_string_lossy()))
+                        .unwrap_or_else(|| "bak".into()),
+                );
+                std::fs::copy(&path, &backup_path).with_context(|| {
+                    format!(
+                        "Failed to write backup to {}",
+                        backup_path.display()
+                    )
+                })?;
+
+                std::fs::write(&path, &migrated)
+                    .with_context(|| format!("Failed to write migrated config to {}", path.display()))?;
+
+                println!(
+                    "Migrated {} key(s) in {} (backup: {}):",
+                    keys.len(),
+                    path.display(),
+                    backup_path.display()
+                );
+                for k in &keys {
+                    println!("  [tools.{k}] → [{k}]");
+                }
                 Ok(())
             }
         },

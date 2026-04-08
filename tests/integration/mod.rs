@@ -1,5 +1,6 @@
 mod agent;
 mod agent_robustness;
+mod minimax_tool_loop;
 mod backup_cron_scheduling;
 mod channel_matrix;
 mod channel_routing;
