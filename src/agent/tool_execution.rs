@@ -150,6 +150,12 @@ pub(crate) fn should_execute_tools_in_parallel(
         }
     }
 
+    // Browser calls share mutable session state and DOM refs, so batching them in
+    // parallel creates races during login-style flows.
+    if tool_calls.iter().any(|call| call.name == "browser") {
+        return false;
+    }
+
     true
 }
 

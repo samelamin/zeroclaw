@@ -2563,6 +2563,13 @@ fn should_execute_tools_in_parallel(
         }
     }
 
+    // Browser calls share a mutable page/session and often depend on refs from the
+    // immediately preceding browser call. Running them in parallel turns common
+    // login flows like "fill username" + "fill password" into session races.
+    if tool_calls.iter().any(|call| call.name == "browser") {
+        return false;
+    }
+
     // Dependency detection: if a file_write/file_edit targets a path that
     // another tool also targets, force sequential to avoid race conditions.
     {
@@ -6821,6 +6828,24 @@ mod tests {
             &calls,
             Some(&approval_mgr)
         ));
+    }
+
+    #[test]
+    fn should_execute_tools_in_parallel_returns_false_for_browser_batches() {
+        let calls = vec![
+            ParsedToolCall {
+                name: "browser".to_string(),
+                arguments: serde_json::json!({"action": "fill", "selector": "@e30", "value": "admin"}),
+                tool_call_id: None,
+            },
+            ParsedToolCall {
+                name: "browser".to_string(),
+                arguments: serde_json::json!({"action": "fill", "selector": "@e34", "value": "secret"}),
+                tool_call_id: None,
+            },
+        ];
+
+        assert!(!should_execute_tools_in_parallel(&calls, None));
     }
 
     #[test]
