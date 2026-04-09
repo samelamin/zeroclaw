@@ -467,11 +467,12 @@ impl BrowserTool {
                 Ok(ResolvedBackend::ComputerUse)
             }
             BrowserBackendKind::PlaywrightMcp => {
-                if !self.playwright_mcp_available()? {
-                    anyhow::bail!(
-                        "browser.backend='playwright_mcp' but sidecar endpoint is unreachable. Check browser.playwright_mcp.endpoint and sidecar status"
-                    );
-                }
+                // Explicit Playwright-MCP configuration should not be blocked by
+                // a best-effort startup probe. Container DNS and modern MCP
+                // sidecars can fail a shallow liveness check even though real
+                // tool calls succeed. Validate the endpoint shape/security here
+                // and let the first action surface any true runtime error.
+                self.playwright_mcp_endpoint_url()?;
                 Ok(ResolvedBackend::PlaywrightMcp)
             }
             BrowserBackendKind::Auto => {
@@ -2892,5 +2893,29 @@ mod tests {
             },
         );
         assert!(tool.playwright_mcp_endpoint_url().is_ok());
+    }
+
+    #[tokio::test]
+    async fn explicit_playwright_mcp_backend_skips_preflight_reachability_probe() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "playwright_mcp".into(),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            PlaywrightMcpConfig {
+                endpoint: "http://playwright-mcp:3000".into(),
+                ..PlaywrightMcpConfig::default()
+            },
+        );
+
+        assert_eq!(
+            tool.resolve_backend().await.unwrap(),
+            ResolvedBackend::PlaywrightMcp
+        );
     }
 }
