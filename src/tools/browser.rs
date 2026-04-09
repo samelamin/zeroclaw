@@ -394,15 +394,17 @@ impl BrowserTool {
             anyhow::bail!("browser.playwright_mcp.endpoint cannot be empty");
         }
         let parsed = reqwest::Url::parse(endpoint).map_err(|_| {
-            anyhow::anyhow!("Invalid browser.playwright_mcp.endpoint: '{endpoint}'. Expected http(s) URL")
+            anyhow::anyhow!(
+                "Invalid browser.playwright_mcp.endpoint: '{endpoint}'. Expected http(s) URL"
+            )
         })?;
         let scheme = parsed.scheme();
         if scheme != "http" && scheme != "https" {
             anyhow::bail!("browser.playwright_mcp.endpoint must use http:// or https://");
         }
-        let host = parsed.host_str().ok_or_else(|| {
-            anyhow::anyhow!("browser.playwright_mcp.endpoint must include host")
-        })?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("browser.playwright_mcp.endpoint must include host"))?;
         let host_is_private = is_private_host(host);
         if !self.playwright_mcp.allow_remote_endpoint && !host_is_private {
             anyhow::bail!(
@@ -980,8 +982,12 @@ impl BrowserTool {
         })
     }
 
-    async fn execute_playwright_mcp_action(&self, action: BrowserAction) -> anyhow::Result<ToolResult> {
-        let endpoint = self.playwright_mcp_endpoint_url()?
+    async fn execute_playwright_mcp_action(
+        &self,
+        action: BrowserAction,
+    ) -> anyhow::Result<ToolResult> {
+        let endpoint = self
+            .playwright_mcp_endpoint_url()?
             .as_str()
             .trim_end_matches('/')
             .to_string();
@@ -2237,6 +2243,12 @@ fn is_private_host(host: &str) -> bool {
         return true;
     }
 
+    // Single-label hostnames such as Docker Compose service names resolve only
+    // within local/container network scopes rather than public DNS.
+    if !bare.is_empty() && !bare.contains('.') {
+        return true;
+    }
+
     // .local TLD (mDNS)
     if bare
         .rsplit('.')
@@ -2391,6 +2403,7 @@ mod tests {
         assert!(is_private_host("localhost"));
         assert!(is_private_host("app.localhost"));
         assert!(is_private_host("printer.local"));
+        assert!(is_private_host("playwright-mcp"));
         assert!(is_private_host("127.0.0.1"));
         assert!(is_private_host("192.168.1.1"));
         assert!(is_private_host("10.0.0.1"));
@@ -2814,8 +2827,14 @@ mod tests {
 
     #[test]
     fn playwright_mcp_backend_kind_parses_all_aliases() {
-        assert_eq!(BrowserBackendKind::parse("playwright_mcp").unwrap(), BrowserBackendKind::PlaywrightMcp);
-        assert_eq!(BrowserBackendKind::parse("playwright-mcp").unwrap(), BrowserBackendKind::PlaywrightMcp);
+        assert_eq!(
+            BrowserBackendKind::parse("playwright_mcp").unwrap(),
+            BrowserBackendKind::PlaywrightMcp
+        );
+        assert_eq!(
+            BrowserBackendKind::parse("playwright-mcp").unwrap(),
+            BrowserBackendKind::PlaywrightMcp
+        );
     }
 
     #[test]
@@ -2851,6 +2870,26 @@ mod tests {
             None,
             ComputerUseConfig::default(),
             PlaywrightMcpConfig::default(), // 127.0.0.1:3000
+        );
+        assert!(tool.playwright_mcp_endpoint_url().is_ok());
+    }
+
+    #[test]
+    fn playwright_mcp_endpoint_accepts_docker_service_hostname() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "playwright_mcp".into(),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            PlaywrightMcpConfig {
+                endpoint: "http://playwright-mcp:3000".into(),
+                ..PlaywrightMcpConfig::default()
+            },
         );
         assert!(tool.playwright_mcp_endpoint_url().is_ok());
     }
