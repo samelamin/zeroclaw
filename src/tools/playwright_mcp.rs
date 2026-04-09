@@ -228,6 +228,10 @@ impl PlaywrightMcpClient {
             .timeout(Duration::from_millis(self.timeout_ms))
             // MCP StreamableHTTP transport requires both JSON and SSE accept types
             .header("Accept", "application/json, text/event-stream")
+            // Force TCP connection close after each request — playwright-mcp @0.0.70
+            // has a race condition where sessions get 404 if the same keep-alive
+            // connection is reused for multiple sequential requests.
+            .header("Connection", "close")
             .json(body);
         if let Some(key) = &self.api_key {
             req = req.bearer_auth(key);
@@ -561,80 +565,124 @@ mod tests {
         assert!(args["selector"].as_str().unwrap().contains("button"));
     }
 
-    // PlaywrightMcpClient HTTP tests
+    // ── PlaywrightMcpClient HTTP tests ─────────────────────────────────────
+    //
+    // All tests against a mock MCP server must simulate the full StreamableHTTP
+    // handshake: initialize (returns mcp-session-id) → notifications/initialized → tools/call.
+    // The client sends three POST /mcp requests per fresh session.
+
+    fn make_session_id() -> Arc<tokio::sync::Mutex<Option<String>>> {
+        Arc::new(tokio::sync::Mutex::new(None))
+    }
+
+    fn sse_body(json: &str) -> String {
+        format!("event: message\ndata: {json}\n\n")
+    }
+
+    fn init_response() -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200)
+            .append_header("mcp-session-id", "test-session")
+            .append_header("Content-Type", "text/event-stream")
+            .set_body_string(sse_body(r#"{"jsonrpc":"2.0","id":1,"result":{"capabilities":{},"protocolVersion":"2024-11-05","serverInfo":{"name":"test","version":"1"}}}"#))
+    }
+
+    fn notif_response() -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(202)
+    }
+
+    fn tool_ok_response(id: u64) -> wiremock::ResponseTemplate {
+        wiremock::ResponseTemplate::new(200)
+            .append_header("Content-Type", "text/event-stream")
+            .set_body_string(sse_body(&format!(
+                r#"{{"jsonrpc":"2.0","id":{id},"result":{{"content":[{{"type":"text","text":"done"}}]}}}}"#
+            )))
+    }
+
     #[tokio::test]
-    async fn client_posts_to_message_endpoint() {
+    async fn client_calls_tool_via_mcp_endpoint() {
         use wiremock::{MockServer, Mock, ResponseTemplate, matchers::{method, path}};
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let server = MockServer::start().await;
+        let req_count = Arc::new(AtomicUsize::new(0));
+        let rc = req_count.clone();
         Mock::given(method("POST"))
-            .and(path("/message"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "jsonrpc": "2.0", "id": 1,
-                "result": { "content": [{ "type": "text", "text": "done" }] }
-            })))
+            .and(path("/mcp"))
+            .respond_with(move |_req: &wiremock::Request| {
+                match rc.fetch_add(1, Ordering::SeqCst) {
+                    0 => init_response(),                        // initialize
+                    1 => notif_response(),                       // notifications/initialized
+                    n => tool_ok_response(n as u64),             // tools/call
+                }
+            })
             .mount(&server)
             .await;
-        let client = PlaywrightMcpClient::new(server.uri(), None, 30_000);
+        let client = PlaywrightMcpClient::new(server.uri(), None, 30_000, make_session_id());
         let result = client.call_tool("browser_navigate", serde_json::json!({ "url": "https://x.com" })).await;
         assert!(result.is_ok(), "expected ok, got: {result:?}");
     }
 
     #[tokio::test]
-    async fn client_sends_bearer_token() {
+    async fn client_sends_bearer_token_on_every_request() {
         use wiremock::{MockServer, Mock, ResponseTemplate, matchers::{method, path, header}};
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/message"))
-            .and(header("authorization", "Bearer tok123"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "jsonrpc": "2.0", "id": 1,
-                "result": { "content": [{ "type": "text", "text": "authed" }] }
-            })))
-            .mount(&server)
-            .await;
-        let client = PlaywrightMcpClient::new(server.uri(), Some("tok123".into()), 30_000);
-        let result = client.call_tool("browser_navigate", serde_json::json!({})).await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn client_retries_and_succeeds_on_second_attempt() {
-        use wiremock::{MockServer, Mock, ResponseTemplate, matchers::{method, path}};
         use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::sync::Arc;
         let server = MockServer::start().await;
-        let count = Arc::new(AtomicUsize::new(0));
-        let count2 = count.clone();
+        let req_count = Arc::new(AtomicUsize::new(0));
+        let rc = req_count.clone();
+        // All requests must include the Authorization header
         Mock::given(method("POST"))
-            .and(path("/message"))
+            .and(path("/mcp"))
+            .and(header("authorization", "Bearer tok123"))
             .respond_with(move |_req: &wiremock::Request| {
-                if count2.fetch_add(1, Ordering::SeqCst) == 0 {
-                    ResponseTemplate::new(503)
-                } else {
-                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                        "jsonrpc": "2.0", "id": 1,
-                        "result": { "content": [{ "type": "text", "text": "ok" }] }
-                    }))
+                match rc.fetch_add(1, Ordering::SeqCst) {
+                    0 => init_response(),
+                    1 => notif_response(),
+                    n => tool_ok_response(n as u64),
                 }
             })
             .mount(&server)
             .await;
-        let client = PlaywrightMcpClient::new(server.uri(), None, 30_000);
-        let result = client.call_tool_with_retry("browser_navigate", serde_json::json!({})).await;
-        assert!(result.is_ok());
-        assert_eq!(count.load(Ordering::SeqCst), 2);
+        let client = PlaywrightMcpClient::new(server.uri(), Some("tok123".into()), 30_000, make_session_id());
+        let result = client.call_tool("browser_navigate", serde_json::json!({})).await;
+        assert!(result.is_ok(), "expected ok, got: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn client_resets_session_on_404_and_retries() {
+        use wiremock::{MockServer, Mock, ResponseTemplate, matchers::{method, path}};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let server = MockServer::start().await;
+        let req_count = Arc::new(AtomicUsize::new(0));
+        let rc = req_count.clone();
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(move |_req: &wiremock::Request| {
+                match rc.fetch_add(1, Ordering::SeqCst) {
+                    0 => init_response(),          // 1st initialize
+                    1 => notif_response(),          // 1st notifications/initialized
+                    2 => ResponseTemplate::new(404), // tools/call → 404: session expired
+                    3 => init_response(),           // 2nd initialize (retry)
+                    4 => notif_response(),           // 2nd notifications/initialized (retry)
+                    n => tool_ok_response(n as u64), // tools/call retry → success
+                }
+            })
+            .mount(&server)
+            .await;
+        let client = PlaywrightMcpClient::new(server.uri(), None, 30_000, make_session_id());
+        let result = client.call_tool("browser_navigate", serde_json::json!({ "url": "https://x.com" })).await;
+        assert!(result.is_ok(), "expected successful retry after 404, got: {result:?}");
     }
 
     #[tokio::test]
     async fn client_fails_after_all_retries_exhausted() {
         use wiremock::{MockServer, Mock, ResponseTemplate, matchers::{method, path}};
         let server = MockServer::start().await;
+        // All initialize requests fail with 500
         Mock::given(method("POST"))
-            .and(path("/message"))
-            .respond_with(ResponseTemplate::new(503))
+            .and(path("/mcp"))
+            .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
-        let client = PlaywrightMcpClient::new(server.uri(), None, 30_000);
+        let client = PlaywrightMcpClient::new(server.uri(), None, 30_000, make_session_id());
         let result = client.call_tool_with_retry("browser_navigate", serde_json::json!({})).await;
         assert!(result.is_err());
     }

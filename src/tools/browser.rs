@@ -1980,8 +1980,10 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
                 .get("selector")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for fill"))?;
+            // Accept both "value" and "text" — some LLMs (e.g. MiniMax) use "text" here
             let value = args
                 .get("value")
+                .or_else(|| args.get("text"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing 'value' for fill"))?;
             Ok(BrowserAction::Fill {
@@ -1994,8 +1996,10 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
                 .get("selector")
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for type"))?;
+            // Accept both "text" and "value" — some LLMs (e.g. MiniMax) use "value" here
             let text = args
                 .get("text")
+                .or_else(|| args.get("value"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing 'text' for type"))?;
             Ok(BrowserAction::Type {
