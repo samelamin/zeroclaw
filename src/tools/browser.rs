@@ -109,6 +109,11 @@ pub struct BrowserTool {
     native_chrome_path: Option<String>,
     computer_use: ComputerUseConfig,
     pub playwright_mcp: PlaywrightMcpConfig,
+    /// Persistent MCP session ID shared across browser tool calls within an agent turn.
+    /// Storing it here (behind a Mutex) lets successive browser actions reuse the same
+    /// Playwright browser session so that navigation, form state, and cookies are
+    /// preserved between actions.
+    playwright_mcp_session_id: Arc<tokio::sync::Mutex<Option<String>>>,
     #[cfg(feature = "browser-native")]
     native_state: tokio::sync::Mutex<native_backend::NativeBrowserState>,
 }
@@ -283,6 +288,7 @@ impl BrowserTool {
             native_chrome_path,
             computer_use,
             playwright_mcp,
+            playwright_mcp_session_id: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "browser-native")]
             native_state: tokio::sync::Mutex::new(native_backend::NativeBrowserState::default()),
         }
@@ -984,6 +990,7 @@ impl BrowserTool {
             endpoint,
             self.playwright_mcp.api_key.clone(),
             self.playwright_mcp.timeout_ms,
+            Arc::clone(&self.playwright_mcp_session_id),
         );
         match client.call_tool_with_retry(tool_name, arguments).await {
             Ok(value) => Ok(ToolResult {

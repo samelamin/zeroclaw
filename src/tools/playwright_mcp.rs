@@ -7,6 +7,7 @@ use anyhow::Context;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 use std::sync::Mutex;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -155,18 +156,52 @@ pub fn action_to_mcp_tool(action: BrowserAction) -> anyhow::Result<(&'static str
 
 // ── PlaywrightMcpClient ────────────────────────────────────────────────────
 
+/// Parse a JSON value from an MCP SSE response body.
+///
+/// MCP HTTP transport returns `text/event-stream` with:
+///   event: message\ndata: <json>\n\n
+///
+/// Extracts the first `data:` line and parses it as JSON.
+/// Falls back to direct JSON parse if no SSE framing is present.
+fn parse_sse_json(body: &str) -> anyhow::Result<Value> {
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if let Some(data) = trimmed.strip_prefix("data:") {
+            let json_str = data.trim();
+            if !json_str.is_empty() {
+                return serde_json::from_str(json_str)
+                    .context("playwright-mcp: failed to parse SSE data as JSON");
+            }
+        }
+    }
+    // Fallback: try direct JSON (plain HTTP/JSON response)
+    serde_json::from_str(body.trim())
+        .context("playwright-mcp: response body is not SSE or valid JSON")
+}
+
 /// HTTP client for the `@playwright/mcp` JSON-RPC sidecar.
 ///
-/// Posts MCP call-tool requests to `{endpoint}/message`.
+/// Uses the MCP StreamableHTTP transport (`POST {endpoint}/mcp`).
+///
+/// The session ID is shared via `Arc<tokio::sync::Mutex<Option<String>>>` so that
+/// successive browser tool calls within the same agent turn reuse the same Playwright
+/// browser session, preserving navigation history, cookies, and form state.
 pub struct PlaywrightMcpClient {
     endpoint: String,
     api_key: Option<String>,
     timeout_ms: u64,
     req_id: AtomicU64,
+    /// Shared session ID — None means no active session yet.
+    session_id: Arc<tokio::sync::Mutex<Option<String>>>,
 }
 
 impl PlaywrightMcpClient {
-    pub fn new(endpoint: impl Into<String>, api_key: Option<String>, timeout_ms: u64) -> Self {
+    pub fn new(
+        endpoint: impl Into<String>,
+        api_key: Option<String>,
+        timeout_ms: u64,
+        session_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    ) -> Self {
         let raw = endpoint.into();
         let endpoint = raw.trim_end_matches('/').to_string();
         Self {
@@ -174,15 +209,133 @@ impl PlaywrightMcpClient {
             api_key,
             timeout_ms,
             req_id: AtomicU64::new(0),
+            session_id,
         }
     }
 
-    /// Single attempt: POST to `{endpoint}/message` with MCP call-tool body.
+    fn mcp_url(&self) -> String {
+        format!("{}/mcp", self.endpoint)
+    }
+
+    fn build_request(
+        &self,
+        client: &reqwest::Client,
+        session_id: Option<&str>,
+        body: &Value,
+    ) -> reqwest::RequestBuilder {
+        let mut req = client
+            .post(self.mcp_url())
+            .timeout(Duration::from_millis(self.timeout_ms))
+            // MCP StreamableHTTP transport requires both JSON and SSE accept types
+            .header("Accept", "application/json, text/event-stream")
+            .json(body);
+        if let Some(key) = &self.api_key {
+            req = req.bearer_auth(key);
+        }
+        if let Some(sid) = session_id {
+            req = req.header("mcp-session-id", sid);
+        }
+        req
+    }
+
+    /// Ensure an active MCP session exists, initializing one if needed.
+    /// Returns the session ID (existing or newly created).
+    async fn ensure_session(&self, client: &reqwest::Client) -> anyhow::Result<String> {
+        {
+            let guard = self.session_id.lock().await;
+            if let Some(existing) = guard.as_ref() {
+                return Ok(existing.clone());
+            }
+        }
+
+        // Initialize a new session
+        let id = self.req_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let init_body = json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "zeroclaw", "version": "0.7.0" }
+            }
+        });
+
+        let resp = self.build_request(client, None, &init_body)
+            .send()
+            .await
+            .context("playwright-mcp: initialize request failed")?;
+
+        let status = resp.status();
+        let new_session_id = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow::anyhow!("playwright-mcp: initialize response missing mcp-session-id header"))?;
+
+        let body_text = resp.text().await.context("playwright-mcp: failed to read initialize response")?;
+
+        if !status.is_success() {
+            anyhow::bail!("playwright-mcp: initialize returned HTTP {status}: {body_text}");
+        }
+
+        let json_resp = parse_sse_json(&body_text)?;
+        if let Some(err) = json_resp.get("error") {
+            anyhow::bail!("playwright-mcp: initialize error: {err}");
+        }
+
+        // Send notifications/initialized and drain the response body so the
+        // HTTP connection is cleanly returned to the pool for reuse.
+        let notif_body = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        });
+        if let Ok(resp) = self.build_request(client, Some(&new_session_id), &notif_body)
+            .send()
+            .await
+        {
+            let _ = resp.bytes().await; // drain body to free the connection
+        }
+
+        // Persist the session ID for reuse
+        *self.session_id.lock().await = Some(new_session_id.clone());
+        tracing::debug!(target: "playwright_mcp", session_id = %new_session_id, "MCP session initialized");
+
+        Ok(new_session_id)
+    }
+
+    /// Single attempt: reuse (or create) an MCP session and call the given tool.
+    /// On session-not-found errors (HTTP 404), clears the stale session and retries once.
     pub async fn call_tool(
         &self,
         tool_name: &str,
         arguments: Value,
     ) -> anyhow::Result<Value> {
+        // Use a no-pool client for the MCP sidecar — playwright-mcp @0.0.70 has
+        // a race condition with connection reuse: sessions get 404 when subsequent
+        // requests arrive on a keep-alive connection before the previous response
+        // has been fully processed server-side. Using pool_max_idle_per_host(0)
+        // forces a fresh TCP connection per request, matching how the Node.js
+        // http module behaves by default (which is confirmed to work).
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(self.timeout_ms + 5_000))
+            .connect_timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(0) // no connection reuse — each request gets a fresh TCP conn
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        self.call_tool_with_client(&client, tool_name, arguments).await
+    }
+
+    async fn call_tool_with_client(
+        &self,
+        client: &reqwest::Client,
+        tool_name: &str,
+        arguments: Value,
+    ) -> anyhow::Result<Value> {
+        let session_id = self.ensure_session(client).await?;
+
         let id = self.req_id.fetch_add(1, Ordering::Relaxed) + 1;
         let body = json!({
             "jsonrpc": "2.0",
@@ -194,34 +347,58 @@ impl PlaywrightMcpClient {
             }
         });
 
-        let url = format!("{}/message", self.endpoint);
-        let client = crate::config::build_runtime_proxy_client("tool.browser.playwright_mcp");
-
-        let mut req = client
-            .post(&url)
-            .timeout(Duration::from_millis(self.timeout_ms))
-            .json(&body);
-        if let Some(key) = &self.api_key {
-            req = req.bearer_auth(key);
-        }
-
-        let resp = req.send().await.with_context(|| {
-            format!("playwright-mcp: failed to POST to {url}")
-        })?;
+        let resp = self.build_request(client, Some(&session_id), &body)
+            .send()
+            .await
+            .with_context(|| format!("playwright-mcp: tools/call request failed for '{tool_name}'"))?;
 
         let status = resp.status();
+
+        // Session expired — clear it and retry with a fresh one
+        if status == reqwest::StatusCode::NOT_FOUND {
+            tracing::warn!(
+                target: "playwright_mcp",
+                session_id = %session_id,
+                "MCP session not found (404), resetting and retrying"
+            );
+            *self.session_id.lock().await = None;
+            let new_session_id = self.ensure_session(client).await?;
+            let retry_id = self.req_id.fetch_add(1, Ordering::Relaxed) + 1;
+            let retry_body = json!({
+                "jsonrpc": "2.0",
+                "id": retry_id,
+                "method": "tools/call",
+                "params": { "name": tool_name, "arguments": arguments },
+            });
+            let retry_resp = self.build_request(client, Some(&new_session_id), &retry_body)
+                .send()
+                .await
+                .with_context(|| format!("playwright-mcp: tools/call retry failed for '{tool_name}'"))?;
+            let retry_status = retry_resp.status();
+            let retry_text = retry_resp.text().await.context("playwright-mcp: failed to read retry response")?;
+            if !retry_status.is_success() {
+                anyhow::bail!("playwright-mcp: sidecar returned HTTP {retry_status} for tool '{tool_name}' (after session reset)");
+            }
+            let json_resp = parse_sse_json(&retry_text)?;
+            if let Some(err) = json_resp.get("error") {
+                anyhow::bail!("playwright-mcp: tool '{}' error (after session reset): {}", tool_name, err);
+            }
+            return Ok(json_resp.get("result").cloned().unwrap_or(Value::Null));
+        }
+
+        let body_text = resp.text().await.context("playwright-mcp: failed to read tools/call response")?;
+
         if !status.is_success() {
             anyhow::bail!("playwright-mcp: sidecar returned HTTP {status} for tool '{tool_name}'");
         }
 
-        let json_resp: Value = resp.json().await.context("playwright-mcp: failed to parse JSON-RPC response")?;
+        let json_resp = parse_sse_json(&body_text)?;
 
         if let Some(err) = json_resp.get("error") {
             anyhow::bail!("playwright-mcp: tool '{}' error: {}", tool_name, err);
         }
 
-        let result = json_resp.get("result").cloned().unwrap_or(Value::Null);
-        Ok(result)
+        Ok(json_resp.get("result").cloned().unwrap_or(Value::Null))
     }
 
     /// Call with exponential-backoff retry: delays 100ms → 200ms → 400ms.
