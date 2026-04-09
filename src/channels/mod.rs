@@ -4769,6 +4769,10 @@ fn build_channel_by_id(config: &Config, channel_id: &str) -> Result<Arc<dyn Chan
                         wa.group_policy.clone(),
                         wa.self_chat_mode,
                     )
+                    .with_webhook_forward(
+                        wa.webhook_forward_url.clone(),
+                        wa.webhook_forward_secret.clone(),
+                    )
                     .with_platform_type(wa.platform_type.clone()),
                 ))
             }
@@ -5059,6 +5063,10 @@ fn collect_configured_channels(
                                 wa.dm_policy.clone(),
                                 wa.group_policy.clone(),
                                 wa.self_chat_mode,
+                            )
+                            .with_webhook_forward(
+                                wa.webhook_forward_url.clone(),
+                                wa.webhook_forward_secret.clone(),
                             )
                             .with_platform_type(wa.platform_type.clone())
                             .with_transcription(config.transcription.clone())

@@ -94,6 +94,13 @@ impl SendMessage {
     }
 }
 
+/// Optional metadata returned by a channel send operation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SendMessageAck {
+    /// Provider-native message identifier when the transport exposes one.
+    pub message_id: Option<String>,
+}
+
 /// Core channel trait — implement for any messaging platform
 #[async_trait]
 pub trait Channel: Send + Sync {
@@ -102,6 +109,13 @@ pub trait Channel: Send + Sync {
 
     /// Send a message through this channel
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
+
+    /// Send a message and return any transport-native metadata the channel can
+    /// expose (for example a provider message ID used for delivery receipts).
+    async fn send_with_ack(&self, message: &SendMessage) -> anyhow::Result<SendMessageAck> {
+        self.send(message).await?;
+        Ok(SendMessageAck::default())
+    }
 
     /// Start listening for incoming messages (long-running)
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
@@ -269,7 +283,7 @@ mod tests {
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
-            real_phone: None,
+                real_phone: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))

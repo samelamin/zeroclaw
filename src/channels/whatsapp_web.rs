@@ -104,6 +104,10 @@ pub struct WhatsAppWebChannel {
     dedup_store: Arc<Mutex<Option<Arc<super::whatsapp_storage::RusqliteStore>>>>,
     /// Chats currently showing typing indicator, with start time.
     typing_started: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>>,
+    /// Optional webhook target for forwarding inbound events to an external app.
+    webhook_forward_url: Option<String>,
+    /// Optional secret sent to the webhook target as `X-Internal-Secret`.
+    webhook_forward_secret: Option<String>,
 }
 
 impl WhatsAppWebChannel {
@@ -171,6 +175,8 @@ impl WhatsAppWebChannel {
             last_event_at: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             dedup_store: Arc::new(Mutex::new(None)),
             typing_started: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            webhook_forward_url: None,
+            webhook_forward_secret: None,
         }
     }
 
@@ -240,6 +246,18 @@ impl WhatsAppWebChannel {
         if config.enabled {
             self.tts_config = Some(config);
         }
+        self
+    }
+
+    /// Configure external webhook forwarding for inbound WhatsApp events.
+    #[cfg(feature = "whatsapp-web")]
+    pub fn with_webhook_forward(
+        mut self,
+        webhook_forward_url: Option<String>,
+        webhook_forward_secret: Option<String>,
+    ) -> Self {
+        self.webhook_forward_url = webhook_forward_url;
+        self.webhook_forward_secret = webhook_forward_secret;
         self
     }
 
@@ -355,6 +373,166 @@ impl WhatsAppWebChannel {
             .unwrap_or(trimmed);
         let normalized_user = user_part.trim_start_matches('+');
         format!("+{normalized_user}")
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    fn receipt_recipient(
+        source: &wa_rs_core::types::message::MessageSource,
+        message_sender: &wa_rs_binary::jid::Jid,
+    ) -> String {
+        Self::sender_phone_candidates(message_sender, source.sender_alt.as_ref(), None)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| message_sender.user.to_string())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn forward_receipt_webhook(
+        webhook_forward_url: Option<String>,
+        webhook_forward_secret: Option<String>,
+        status: &str,
+        message_ids: &[String],
+        recipient: &str,
+        timestamp: i64,
+    ) -> Result<()> {
+        let Some(url) = webhook_forward_url else {
+            return Ok(());
+        };
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+        let payload = serde_json::json!({
+            "kind": "receipt",
+            "channel": "whatsapp",
+            "status": status,
+            "message_ids": message_ids,
+            "recipient": recipient,
+            "timestamp": timestamp,
+        });
+
+        let mut request = client.post(url).json(&payload);
+        if let Some(secret) = webhook_forward_secret {
+            request = request.header("X-Internal-Secret", secret);
+        }
+
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            anyhow::bail!("webhook forward returned {}", response.status());
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "whatsapp-web")]
+    async fn send_impl(&self, message: &SendMessage) -> Result<Option<String>> {
+        let client = self.client.lock().clone();
+        let Some(client) = client else {
+            return Box::pin(self.cold_send_with_ack(message)).await;
+        };
+
+        if !Self::is_jid(&message.recipient) {
+            let normalized = self.normalize_phone(&message.recipient);
+            if !self.is_number_allowed(&normalized) {
+                tracing::warn!(
+                    "WhatsApp Web: recipient {} not in allowed list",
+                    message.recipient
+                );
+                return Ok(None);
+            }
+        }
+
+        let to = self.recipient_to_jid(&message.recipient)?;
+        let is_voice_chat = self
+            .voice_chats
+            .lock()
+            .map(|vs| vs.contains(&message.recipient))
+            .unwrap_or(false);
+
+        if is_voice_chat && self.tts_config.is_some() {
+            let content = &message.content;
+            let is_substantive = content.len() > 40
+                && !content.starts_with("http")
+                && !content.starts_with('{')
+                && !content.starts_with('[')
+                && !content.starts_with("Error")
+                && !content.contains("```")
+                && !content.contains("tool_call")
+                && !content.contains("wttr.in");
+
+            if is_substantive {
+                if let Ok(mut pv) = self.pending_voice.lock() {
+                    pv.insert(
+                        message.recipient.clone(),
+                        (content.clone(), std::time::Instant::now()),
+                    );
+                }
+
+                let pending = self.pending_voice.clone();
+                let voice_chats = self.voice_chats.clone();
+                let client_clone = client.clone();
+                let to_clone = to.clone();
+                let recipient = message.recipient.clone();
+                let tts_config = self.tts_config.clone().unwrap();
+                tokio::spawn(async move {
+                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+                    let to_voice = pending.lock().ok().and_then(|mut pv| {
+                        if let Some((_, ts)) = pv.get(&recipient) {
+                            if ts.elapsed().as_secs() >= 8 {
+                                return pv.remove(&recipient).map(|(text, _)| text);
+                            }
+                        }
+                        None
+                    });
+
+                    if let Some(text) = to_voice {
+                        if let Ok(mut vc) = voice_chats.lock() {
+                            vc.remove(&recipient);
+                        }
+                        match Box::pin(WhatsAppWebChannel::synthesize_voice_static(
+                            &client_clone,
+                            &to_clone,
+                            &text,
+                            &tts_config,
+                        ))
+                        .await
+                        {
+                            Ok(()) => {
+                                tracing::info!(
+                                    "WhatsApp Web: voice reply sent ({} chars)",
+                                    text.len()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!("WhatsApp Web: TTS voice reply failed: {e}");
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        let _ = client.chatstate().send_paused(&to).await;
+        if let Ok(mut ts) = self.typing_started.lock() {
+            ts.remove(&message.recipient);
+        }
+
+        let outgoing = wa_rs_proto::whatsapp::Message {
+            conversation: Some(message.content.clone()),
+            ..Default::default()
+        };
+
+        let message_id = client.send_message(to, outgoing).await?;
+        tracing::debug!(
+            "WhatsApp Web: sent text to {} (id: {})",
+            message.recipient,
+            message_id
+        );
+        Ok(Some(message_id.to_string()))
     }
 
     /// Whether the recipient string is a WhatsApp JID (contains a domain suffix).
@@ -821,7 +999,7 @@ impl WhatsAppWebChannel {
     /// `zeroclaw channel send` or cron job delivery.  Requires an existing paired
     /// session (session_path must already be populated via QR/pair-code linking).
     #[cfg(feature = "whatsapp-web")]
-    async fn cold_send(&self, message: &SendMessage) -> Result<()> {
+    async fn cold_send_with_ack(&self, message: &SendMessage) -> Result<Option<String>> {
         use wa_rs::bot::Bot;
         use wa_rs::store::{Device, DeviceStore};
         use wa_rs_core::types::events::Event;
@@ -897,7 +1075,7 @@ impl WhatsAppWebChannel {
                     "WhatsApp Web cold send: recipient {} not in allowed list",
                     message.recipient
                 );
-                return Ok(());
+                return Ok(None);
             }
         }
 
@@ -919,7 +1097,7 @@ impl WhatsAppWebChannel {
         bot_handle.abort();
         let _ = bot_handle.await;
 
-        Ok(())
+        Ok(Some(message_id.to_string()))
     }
 
     /// Structured health information for the /health endpoint.
@@ -1098,6 +1276,20 @@ fn wa_media_type(kind: WaAttachmentKind) -> wa_rs_core::download::MediaType {
 }
 
 #[cfg(feature = "whatsapp-web")]
+fn map_receipt_type_to_status(
+    receipt_type: &wa_rs_core::types::presence::ReceiptType,
+) -> Option<&'static str> {
+    use wa_rs_core::types::presence::ReceiptType;
+
+    match receipt_type {
+        ReceiptType::Delivered => Some("delivered"),
+        ReceiptType::Read | ReceiptType::ReadSelf => Some("read"),
+        ReceiptType::Played | ReceiptType::PlayedSelf => Some("played"),
+        _ => None,
+    }
+}
+
+#[cfg(feature = "whatsapp-web")]
 #[async_trait]
 impl Channel for WhatsAppWebChannel {
     fn name(&self) -> &str {
@@ -1105,125 +1297,14 @@ impl Channel for WhatsAppWebChannel {
     }
 
     async fn send(&self, message: &SendMessage) -> Result<()> {
-        let client = self.client.lock().clone();
-        let Some(client) = client else {
-            // Bot not started via listen() — use a one-shot connect/send/disconnect.
-            return Box::pin(self.cold_send(message)).await;
-        };
-
-        // Validate recipient allowlist only for direct phone-number targets.
-        if !Self::is_jid(&message.recipient) {
-            let normalized = self.normalize_phone(&message.recipient);
-            if !self.is_number_allowed(&normalized) {
-                tracing::warn!(
-                    "WhatsApp Web: recipient {} not in allowed list",
-                    message.recipient
-                );
-                return Ok(());
-            }
-        }
-
-        let to = self.recipient_to_jid(&message.recipient)?;
-
-        // Voice chat mode: send text normally AND queue a voice note of the
-        // final answer. Only substantive messages (not tool outputs) are queued.
-        // A debounce task waits 10s after the last substantive message, then
-        // sends ONE voice note. Text in → text out. Voice in → text + voice out.
-        let is_voice_chat = self
-            .voice_chats
-            .lock()
-            .map(|vs| vs.contains(&message.recipient))
-            .unwrap_or(false);
-
-        if is_voice_chat && self.tts_config.is_some() {
-            let content = &message.content;
-            // Only queue substantive natural-language replies for voice.
-            // Skip tool outputs: URLs, JSON, code blocks, errors, short status.
-            let is_substantive = content.len() > 40
-                && !content.starts_with("http")
-                && !content.starts_with('{')
-                && !content.starts_with('[')
-                && !content.starts_with("Error")
-                && !content.contains("```")
-                && !content.contains("tool_call")
-                && !content.contains("wttr.in");
-
-            if is_substantive {
-                if let Ok(mut pv) = self.pending_voice.lock() {
-                    pv.insert(
-                        message.recipient.clone(),
-                        (content.clone(), std::time::Instant::now()),
-                    );
-                }
-
-                let pending = self.pending_voice.clone();
-                let voice_chats = self.voice_chats.clone();
-                let client_clone = client.clone();
-                let to_clone = to.clone();
-                let recipient = message.recipient.clone();
-                let tts_config = self.tts_config.clone().unwrap();
-                tokio::spawn(async move {
-                    // Wait 10 seconds — long enough for the agent to finish its
-                    // full tool chain and send the final answer.
-                    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
-
-                    // Atomic check-and-remove: only one task gets the value
-                    let to_voice = pending.lock().ok().and_then(|mut pv| {
-                        if let Some((_, ts)) = pv.get(&recipient) {
-                            if ts.elapsed().as_secs() >= 8 {
-                                return pv.remove(&recipient).map(|(text, _)| text);
-                            }
-                        }
-                        None
-                    });
-
-                    if let Some(text) = to_voice {
-                        if let Ok(mut vc) = voice_chats.lock() {
-                            vc.remove(&recipient);
-                        }
-                        match Box::pin(WhatsAppWebChannel::synthesize_voice_static(
-                            &client_clone,
-                            &to_clone,
-                            &text,
-                            &tts_config,
-                        ))
-                        .await
-                        {
-                            Ok(()) => {
-                                tracing::info!(
-                                    "WhatsApp Web: voice reply sent ({} chars)",
-                                    text.len()
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!("WhatsApp Web: TTS voice reply failed: {e}");
-                            }
-                        }
-                    }
-                });
-            }
-            // Fall through to send text normally (voice chat gets BOTH)
-        }
-
-        // Stop typing before sending — transition from "typing…" → message.
-        let _ = client.chatstate().send_paused(&to).await;
-        if let Ok(mut ts) = self.typing_started.lock() {
-            ts.remove(&message.recipient);
-        }
-
-        // Send text message
-        let outgoing = wa_rs_proto::whatsapp::Message {
-            conversation: Some(message.content.clone()),
-            ..Default::default()
-        };
-
-        let message_id = client.send_message(to, outgoing).await?;
-        tracing::debug!(
-            "WhatsApp Web: sent text to {} (id: {})",
-            message.recipient,
-            message_id
-        );
+        let _ = self.send_impl(message).await?;
         Ok(())
+    }
+
+    async fn send_with_ack(&self, message: &SendMessage) -> Result<super::traits::SendMessageAck> {
+        Ok(super::traits::SendMessageAck {
+            message_id: self.send_impl(message).await?,
+        })
     }
 
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> Result<()> {
@@ -1304,6 +1385,8 @@ impl Channel for WhatsAppWebChannel {
             let last_event_at_clone = self.last_event_at.clone();
             let dedup_store_clone = self.dedup_store.clone();
             let typing_started_clone = self.typing_started.clone();
+            let webhook_forward_url = self.webhook_forward_url.clone();
+            let webhook_forward_secret = self.webhook_forward_secret.clone();
 
             let platform = Self::resolve_platform_type(self.platform_type.as_deref())
                 .unwrap_or(wa_rs_proto::whatsapp::device_props::PlatformType::Desktop);
@@ -1331,6 +1414,8 @@ impl Channel for WhatsAppWebChannel {
                     let last_event_at = last_event_at_clone.clone();
                     let dedup_store = dedup_store_clone.clone();
                     let typing_started_inner = typing_started_clone.clone();
+                    let webhook_forward_url = webhook_forward_url.clone();
+                    let webhook_forward_secret = webhook_forward_secret.clone();
                     async move {
                         // Record that we received an event — liveness watchdog reads this.
                         last_event_at.store(
@@ -1670,6 +1755,37 @@ impl Channel for WhatsAppWebChannel {
                                     tracing::error!("Failed to send message to channel: {}", e);
                                 }
                             }
+                            Event::Receipt(receipt) => {
+                                let Some(status) = map_receipt_type_to_status(&receipt.r#type) else {
+                                    return;
+                                };
+                                let message_ids: Vec<String> = receipt
+                                    .message_ids
+                                    .iter()
+                                    .map(ToString::to_string)
+                                    .collect();
+                                if message_ids.is_empty() {
+                                    return;
+                                }
+
+                                let recipient =
+                                    Self::receipt_recipient(&receipt.source, &receipt.message_sender);
+                                let timestamp = receipt.timestamp.timestamp();
+                                tokio::spawn(async move {
+                                    if let Err(e) = Self::forward_receipt_webhook(
+                                        webhook_forward_url,
+                                        webhook_forward_secret,
+                                        status,
+                                        &message_ids,
+                                        &recipient,
+                                        timestamp,
+                                    )
+                                    .await
+                                    {
+                                        tracing::warn!("WhatsApp Web: receipt forward failed: {e}");
+                                    }
+                                });
+                            }
                             Event::Connected(_) => {
                                 tracing::info!("WhatsApp Web connected successfully");
                                 WhatsAppWebChannel::reset_retry(&retry_count);
@@ -1806,7 +1922,9 @@ impl Channel for WhatsAppWebChannel {
                             tracing::debug!("WhatsApp Web: presence keepalive tick");
                         }
                         Err(e) => {
-                            tracing::warn!("WhatsApp Web: presence keepalive failed ({e}) — liveness watchdog will trigger reconnect");
+                            tracing::warn!(
+                                "WhatsApp Web: presence keepalive failed ({e}) — liveness watchdog will trigger reconnect"
+                            );
                         }
                     }
                 }
@@ -2104,6 +2222,14 @@ impl WhatsAppWebChannel {
     }
 
     pub fn with_tts(self, _config: crate::config::TtsConfig) -> Self {
+        self
+    }
+
+    pub fn with_webhook_forward(
+        self,
+        _webhook_forward_url: Option<String>,
+        _webhook_forward_secret: Option<String>,
+    ) -> Self {
         self
     }
 
@@ -2594,6 +2720,74 @@ mod tests {
             false,
         );
         assert_eq!(*ch.bot_phone.lock(), None);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn map_receipt_type_to_status_handles_supported_receipts() {
+        use wa_rs_core::types::presence::ReceiptType;
+
+        assert_eq!(
+            map_receipt_type_to_status(&ReceiptType::Delivered),
+            Some("delivered")
+        );
+        assert_eq!(map_receipt_type_to_status(&ReceiptType::Read), Some("read"));
+        assert_eq!(
+            map_receipt_type_to_status(&ReceiptType::ReadSelf),
+            Some("read")
+        );
+        assert_eq!(
+            map_receipt_type_to_status(&ReceiptType::Played),
+            Some("played")
+        );
+        assert_eq!(
+            map_receipt_type_to_status(&ReceiptType::PlayedSelf),
+            Some("played")
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn map_receipt_type_to_status_ignores_internal_receipts() {
+        use wa_rs_core::types::presence::ReceiptType;
+
+        assert_eq!(map_receipt_type_to_status(&ReceiptType::Sender), None);
+        assert_eq!(map_receipt_type_to_status(&ReceiptType::Retry), None);
+        assert_eq!(map_receipt_type_to_status(&ReceiptType::HistorySync), None);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "whatsapp-web")]
+    async fn forward_receipt_webhook_posts_payload_and_secret() {
+        use wiremock::matchers::{body_partial_json, header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/receipt"))
+            .and(header("X-Internal-Secret", "test-secret"))
+            .and(body_partial_json(serde_json::json!({
+                "kind": "receipt",
+                "channel": "whatsapp",
+                "status": "read",
+                "message_ids": ["wamid.1", "wamid.2"],
+                "recipient": "+15551234567",
+                "timestamp": 1_746_000_000i64
+            })))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        WhatsAppWebChannel::forward_receipt_webhook(
+            Some(format!("{}/receipt", server.uri())),
+            Some("test-secret".to_string()),
+            "read",
+            &["wamid.1".to_string(), "wamid.2".to_string()],
+            "+15551234567",
+            1_746_000_000,
+        )
+        .await
+        .expect("receipt webhook should succeed");
     }
 
     // ---- Media attachment marker parsing tests ----

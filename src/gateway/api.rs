@@ -1530,7 +1530,11 @@ pub(super) async fn handle_whatsapp_web_send(
     // We deliberately do NOT fall back to cold-send: opening a second Baileys
     // session from the same session file kicks the persistent connection off
     // WhatsApp's servers, breaking inbound message delivery.
-    let channel = match crate::channels::get_live_whatsapp_channel() {
+    let channel = match state
+        .whatsapp_web
+        .clone()
+        .or_else(crate::channels::get_live_whatsapp_channel)
+    {
         Some(ch) if ch.is_connected() => ch,
         Some(_) => {
             return (
@@ -1553,8 +1557,14 @@ pub(super) async fn handle_whatsapp_web_send(
     };
 
     let msg = crate::channels::traits::SendMessage::new(body.message, body.recipient);
-    match channel.send(&msg).await {
-        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+    match channel.send_with_ack(&msg).await {
+        Ok(ack) => {
+            let mut body = serde_json::json!({ "ok": true });
+            if let Some(message_id) = ack.message_id {
+                body["message_id"] = serde_json::Value::String(message_id);
+            }
+            Json(body).into_response()
+        }
         Err(e) => error_response(&e, "Failed to send WhatsApp Web message").into_response(),
     }
 }
@@ -1678,6 +1688,7 @@ pub(super) async fn handle_http_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::traits::{Channel, SendMessage};
     use crate::gateway::{AppState, GatewayRateLimiter, IdempotencyStore, nodes};
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
     use crate::providers::Provider;
@@ -1685,6 +1696,7 @@ mod tests {
     use async_trait::async_trait;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
+    use parking_lot::Mutex as ParkingLotMutex;
     use parking_lot::Mutex;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1758,6 +1770,44 @@ mod tests {
         }
     }
 
+    struct MockWhatsAppWebChannel {
+        sent_messages: ParkingLotMutex<Vec<SendMessage>>,
+        message_id: String,
+    }
+
+    #[async_trait]
+    impl Channel for MockWhatsAppWebChannel {
+        fn name(&self) -> &str {
+            "whatsapp"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages.lock().push(message.clone());
+            Ok(())
+        }
+
+        async fn send_with_ack(
+            &self,
+            message: &SendMessage,
+        ) -> anyhow::Result<crate::channels::traits::SendMessageAck> {
+            self.sent_messages.lock().push(message.clone());
+            Ok(crate::channels::traits::SendMessageAck {
+                message_id: Some(self.message_id.clone()),
+            })
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
+
     fn test_state(config: crate::config::Config) -> AppState {
         AppState {
             config: Arc::new(Mutex::new(config)),
@@ -1809,6 +1859,41 @@ mod tests {
             .expect("response body")
             .to_bytes();
         serde_json::from_slice(&body).expect("valid json response")
+    }
+
+    #[tokio::test]
+    async fn whatsapp_web_send_returns_message_id_when_channel_provides_one() {
+        let cfg = crate::config::Config::default();
+        let mut state = test_state(cfg);
+        let channel = Arc::new(MockWhatsAppWebChannel {
+            sent_messages: ParkingLotMutex::new(Vec::new()),
+            message_id: "wa-test-123".to_string(),
+        });
+        state.whatsapp_web = Some(channel.clone());
+
+        let response = handle_whatsapp_web_send(
+            State(state),
+            HeaderMap::new(),
+            Json(WhatsAppWebSendBody {
+                recipient: "15551234567@s.whatsapp.net".to_string(),
+                message: "hello from test".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        let body = response_json(response).await;
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "ok": true,
+                "message_id": "wa-test-123"
+            })
+        );
+        let sent = channel.sent_messages.lock();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].recipient, "15551234567@s.whatsapp.net");
+        assert_eq!(sent[0].content, "hello from test");
     }
 
     #[test]
