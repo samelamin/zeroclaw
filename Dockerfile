@@ -49,6 +49,8 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
 RUN rm -rf src benches
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
+# ARG ZEROCLAW_SRC_HASH allows callers to force-bust the COPY src/ cache layer.
+ARG ZEROCLAW_SRC_HASH=unknown
 COPY src/ src/
 COPY benches/ benches/
 COPY --from=web-builder /web/dist web/dist
