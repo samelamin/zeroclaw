@@ -28,7 +28,7 @@
 
 use super::traits::{Channel, ChannelMessage, SendMessage};
 use super::whatsapp_storage::RusqliteStore;
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::path::Path;
@@ -1922,9 +1922,23 @@ impl Channel for WhatsAppWebChannel {
                             tracing::debug!("WhatsApp Web: presence keepalive tick");
                         }
                         Err(e) => {
-                            tracing::warn!(
-                                "WhatsApp Web: presence keepalive failed ({e}) — liveness watchdog will trigger reconnect"
-                            );
+                            let err_str = e.to_string();
+                            if err_str.contains("push name") {
+                                // Push name not set — this is a known wa-rs limitation after
+                                // certain pairing flows.  Log once at warn level but do NOT
+                                // treat it as a dead-stream signal; the connection is still
+                                // alive and can receive messages.  Without this guard the
+                                // liveness watchdog interprets every failed keepalive as a
+                                // dead stream, triggering a reconnect loop that eventually
+                                // invalidates the session.
+                                tracing::debug!(
+                                    "WhatsApp Web: presence keepalive skipped (push name not set)"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    "WhatsApp Web: presence keepalive failed ({e}) — liveness watchdog will trigger reconnect"
+                                );
+                            }
                         }
                     }
                 }
