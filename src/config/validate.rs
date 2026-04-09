@@ -269,16 +269,15 @@ mod tests {
         // tools is a known key (it exists in Config default serialisation via
         // sub-struct serialisation), so the unknown-key check won't fire.
         // The legacy-section check must fire independently.
-        if let ValidationOutcome::Ok { warnings } | ValidationOutcome::Errors { warnings, .. } =
-            &outcome
-        {
-            assert!(
-                warnings.iter().any(|w| w.contains("tools.http_request")) ||
-                // some configs may have 'tools' as a known key and error differently
-                true,
-                "expected warning about [tools.http_request] legacy section, got: {warnings:?}"
-            );
-        }
+        let warnings = match &outcome {
+            ValidationOutcome::Ok { warnings } | ValidationOutcome::Errors { warnings, .. } => warnings,
+        };
+        assert!(
+            warnings.iter().any(|w| w.contains("tools.http_request")) ||
+            // some configs may have 'tools' as a known key and error differently
+            true,
+            "expected warning about [tools.http_request] legacy section, got: {warnings:?}"
+        );
     }
 
     /// In `--strict` mode a legacy `[tools.X]` section must produce an ERROR.

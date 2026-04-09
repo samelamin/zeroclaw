@@ -114,6 +114,12 @@ pub struct BrowserTool {
     /// Playwright browser session so that navigation, form state, and cookies are
     /// preserved between actions.
     playwright_mcp_session_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Last successfully opened page URL for restoring context after MCP session resets.
+    playwright_mcp_last_url: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Safe state-setting tool calls that can be replayed after MCP session resets.
+    playwright_mcp_replayable_actions: Arc<tokio::sync::Mutex<Vec<(String, Value)>>>,
+    /// Serialized cookies captured from the current browser session so auth survives resets.
+    playwright_mcp_cookies_json: Arc<tokio::sync::Mutex<Option<String>>>,
     #[cfg(feature = "browser-native")]
     native_state: tokio::sync::Mutex<native_backend::NativeBrowserState>,
 }
@@ -289,6 +295,9 @@ impl BrowserTool {
             computer_use,
             playwright_mcp,
             playwright_mcp_session_id: Arc::new(tokio::sync::Mutex::new(None)),
+            playwright_mcp_last_url: Arc::new(tokio::sync::Mutex::new(None)),
+            playwright_mcp_replayable_actions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            playwright_mcp_cookies_json: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "browser-native")]
             native_state: tokio::sync::Mutex::new(native_backend::NativeBrowserState::default()),
         }
@@ -998,6 +1007,9 @@ impl BrowserTool {
             self.playwright_mcp.api_key.clone(),
             self.playwright_mcp.timeout_ms,
             Arc::clone(&self.playwright_mcp_session_id),
+            Arc::clone(&self.playwright_mcp_last_url),
+            Arc::clone(&self.playwright_mcp_replayable_actions),
+            Arc::clone(&self.playwright_mcp_cookies_json),
         );
         match client.call_tool_with_retry(tool_name, arguments).await {
             Ok(value) => Ok(ToolResult {
@@ -1950,6 +1962,14 @@ mod native_backend {
 // ── Action parsing ──────────────────────────────────────────────
 
 /// Parse a JSON `args` object into a typed `BrowserAction`.
+fn read_browser_selector(args: &Value, action_name: &str) -> anyhow::Result<String> {
+    args.get("selector")
+        .or_else(|| args.get("ref"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for {action_name}"))
+}
+
 fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<BrowserAction> {
     match action_str {
         "open" => {
@@ -1974,19 +1994,13 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
                 .map(|d| u32::try_from(d).unwrap_or(u32::MAX)),
         }),
         "click" => {
-            let selector = args
-                .get("selector")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for click"))?;
+            let selector = read_browser_selector(args, "click")?;
             Ok(BrowserAction::Click {
-                selector: selector.into(),
+                selector,
             })
         }
         "fill" => {
-            let selector = args
-                .get("selector")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for fill"))?;
+            let selector = read_browser_selector(args, "fill")?;
             // Accept both "value" and "text" — some LLMs (e.g. MiniMax) use "text" here
             let value = args
                 .get("value")
@@ -1994,15 +2008,12 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing 'value' for fill"))?;
             Ok(BrowserAction::Fill {
-                selector: selector.into(),
+                selector,
                 value: value.into(),
             })
         }
         "type" => {
-            let selector = args
-                .get("selector")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for type"))?;
+            let selector = read_browser_selector(args, "type")?;
             // Accept both "text" and "value" — some LLMs (e.g. MiniMax) use "value" here
             let text = args
                 .get("text")
@@ -2010,17 +2021,14 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing 'text' for type"))?;
             Ok(BrowserAction::Type {
-                selector: selector.into(),
+                selector,
                 text: text.into(),
             })
         }
         "get_text" => {
-            let selector = args
-                .get("selector")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for get_text"))?;
+            let selector = read_browser_selector(args, "get_text")?;
             Ok(BrowserAction::GetText {
-                selector: selector.into(),
+                selector,
             })
         }
         "get_title" => Ok(BrowserAction::GetTitle),
@@ -2048,12 +2056,9 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             Ok(BrowserAction::Press { key: key.into() })
         }
         "hover" => {
-            let selector = args
-                .get("selector")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for hover"))?;
+            let selector = read_browser_selector(args, "hover")?;
             Ok(BrowserAction::Hover {
-                selector: selector.into(),
+                selector,
             })
         }
         "scroll" => {
@@ -2070,12 +2075,9 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             })
         }
         "is_visible" => {
-            let selector = args
-                .get("selector")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for is_visible"))?;
+            let selector = read_browser_selector(args, "is_visible")?;
             Ok(BrowserAction::IsVisible {
-                selector: selector.into(),
+                selector,
             })
         }
         "close" => Ok(BrowserAction::Close),
@@ -2086,10 +2088,13 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
                 .ok_or_else(|| anyhow::anyhow!("Missing 'by' for find"))?;
             let value = args
                 .get("value")
+                .or_else(|| args.get("selector"))
+                .or_else(|| args.get("text"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing 'value' for find"))?;
             let action = args
                 .get("find_action")
+                .or_else(|| args.get("action"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing 'find_action' for find"))?;
             Ok(BrowserAction::Find {
@@ -2917,5 +2922,54 @@ mod tests {
             tool.resolve_backend().await.unwrap(),
             ResolvedBackend::PlaywrightMcp
         );
+    }
+
+    #[test]
+    fn parse_fill_accepts_ref_alias_from_model_output() {
+        let action = parse_browser_action(
+            "fill",
+            &json!({
+                "ref": "e30",
+                "value": "admin",
+            }),
+        )
+        .unwrap();
+
+        match action {
+            BrowserAction::Fill { selector, value } => {
+                assert_eq!(selector, "e30");
+                assert_eq!(value, "admin");
+            }
+            other => panic!("expected fill action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_find_accepts_selector_alias_for_locator_value() {
+        let action = parse_browser_action(
+            "find",
+            &json!({
+                "by": "label",
+                "find_action": "fill",
+                "selector": "Username",
+                "fill_value": "admin",
+            }),
+        )
+        .unwrap();
+
+        match action {
+            BrowserAction::Find {
+                by,
+                value,
+                action,
+                fill_value,
+            } => {
+                assert_eq!(by, "label");
+                assert_eq!(value, "Username");
+                assert_eq!(action, "fill");
+                assert_eq!(fill_value.as_deref(), Some("admin"));
+            }
+            other => panic!("expected find action, got {other:?}"),
+        }
     }
 }
