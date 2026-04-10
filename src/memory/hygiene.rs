@@ -2,13 +2,13 @@ use crate::config::MemoryConfig;
 use crate::memory::policy::PolicyEnforcer;
 use anyhow::Result;
 use chrono::{DateTime, Duration, Local, NaiveDate, Utc};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration as StdDuration, SystemTime};
 
-const HYGIENE_INTERVAL_HOURS: i64 = 12;
+const HYGIENE_INTERVAL_HOURS: i64 = 1;
 const STATE_FILE: &str = "memory_hygiene_state.json";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -18,6 +18,7 @@ struct HygieneReport {
     purged_memory_archives: u64,
     purged_session_archives: u64,
     pruned_conversation_rows: u64,
+    pruned_by_count: u64,
 }
 
 impl HygieneReport {
@@ -27,6 +28,7 @@ impl HygieneReport {
             + self.purged_memory_archives
             + self.purged_session_archives
             + self.pruned_conversation_rows
+            + self.pruned_by_count
     }
 }
 
@@ -64,6 +66,7 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
         purged_memory_archives: purge_memory_archives(workspace_dir, config.purge_after_days)?,
         purged_session_archives: purge_session_archives(workspace_dir, config.purge_after_days)?,
         pruned_conversation_rows: prune_conversation_rows(workspace_dir, conversation_retention)?,
+        pruned_by_count: prune_by_count(workspace_dir)?,
     };
 
     // Prune audit entries if audit is enabled.
@@ -77,12 +80,13 @@ pub fn run_if_due(config: &MemoryConfig, workspace_dir: &Path) -> Result<()> {
 
     if report.total_actions() > 0 {
         tracing::info!(
-            "memory hygiene complete: archived_memory={} archived_sessions={} purged_memory={} purged_sessions={} pruned_conversation_rows={}",
+            "memory hygiene complete: archived_memory={} archived_sessions={} purged_memory={} purged_sessions={} pruned_rows={} pruned_by_count={}",
             report.archived_memory_files,
             report.archived_session_files,
             report.purged_memory_archives,
             report.purged_session_archives,
             report.pruned_conversation_rows,
+            report.pruned_by_count,
         );
     }
 
@@ -318,16 +322,68 @@ fn prune_conversation_rows(workspace_dir: &Path, retention_days: u32) -> Result<
     }
 
     let conn = Connection::open(db_path)?;
-    // Use WAL so hygiene pruning doesn't block agent reads
     conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
     let cutoff = (Local::now() - Duration::days(i64::from(retention_days))).to_rfc3339();
 
-    let affected = conn.execute(
+    // Prune old conversation memories
+    let affected_conversation = conn.execute(
         "DELETE FROM memories WHERE category = 'conversation' AND updated_at < ?1",
         params![cutoff],
     )?;
 
-    Ok(u64::try_from(affected).unwrap_or(0))
+    // Also prune old Core memories to prevent unbounded brain.db growth
+    // Core memories from skills/procedures/dreaming accumulate forever otherwise
+    let affected_core = conn.execute(
+        "DELETE FROM memories WHERE category = 'core' AND updated_at < ?1",
+        params![cutoff],
+    )?;
+
+    Ok(u64::try_from(affected_conversation).unwrap_or(0)
+        + u64::try_from(affected_core).unwrap_or(0))
+}
+
+/// Max memories per category before we start pruning oldest/lowest-importance entries.
+/// This prevents unbounded brain.db growth from skills/dreaming/procedural memories.
+const MAX_MEMORIES_PER_CATEGORY: usize = 5000;
+
+fn prune_by_count(workspace_dir: &Path) -> Result<u64> {
+    let db_path = workspace_dir.join("memory").join("brain.db");
+    if !db_path.exists() {
+        return Ok(0);
+    }
+
+    let conn = Connection::open(&db_path)?;
+    conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL;")?;
+
+    let mut total_pruned = 0_i64;
+
+    for category in ["core", "conversation", "daily"] {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM memories WHERE category = ?1",
+            params![category],
+            |row| row.get(0),
+        )?;
+
+        if count > MAX_MEMORIES_PER_CATEGORY as i64 {
+            let to_delete = count - MAX_MEMORIES_PER_CATEGORY as i64;
+            // Delete oldest/lowest-importance entries first
+            let deleted = conn.execute(
+                "DELETE FROM memories WHERE id IN (
+                    SELECT id FROM memories WHERE category = ?1
+                    ORDER BY importance ASC, updated_at ASC
+                    LIMIT ?2
+                )",
+                params![category, to_delete],
+            )?;
+            total_pruned += deleted as i64;
+            tracing::debug!(
+                "pruned {} {category} memories (count exceeded limit {} > {MAX_MEMORIES_PER_CATEGORY})",
+                deleted, count
+            );
+        }
+    }
+
+    Ok(total_pruned.max(0) as u64)
 }
 
 fn prune_audit_entries(workspace_dir: &Path, retention_days: u32) -> Result<()> {
