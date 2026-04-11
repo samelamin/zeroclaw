@@ -1120,7 +1120,12 @@ impl WhatsAppWebChannel {
             } else {
                 None
             },
-            "healthy": has_handle && (last_event == 0 || now.saturating_sub(last_event) < 240),
+            // Keepalive refreshes last_event_at every 60s, so any gap beyond
+            // ~180s (three missed keepalives) is unusual. Below 180s we report
+            // healthy; above, the liveness watchdog (LIVENESS_TIMEOUT_SECS=600)
+            // is the authoritative signal — it'll reconnect once the gap
+            // actually exceeds 600s.
+            "healthy": has_handle && (last_event == 0 || now.saturating_sub(last_event) < 180),
         })
     }
 }
@@ -1898,11 +1903,17 @@ impl Channel for WhatsAppWebChannel {
                 std::sync::atomic::Ordering::Relaxed,
             );
 
-            // Presence keepalive: send available every 4 minutes.
+            // Presence keepalive: send available every 60s. This MUST fire well
+            // inside LIVENESS_TIMEOUT_SECS so that during quiet chats — when no
+            // customer messages are flowing — the liveness watchdog sees a fresh
+            // last_event_at and does not mistakenly conclude the socket is dead.
+            // Previously this was 240s paired with a 120s liveness timeout, which
+            // meant the watchdog always won the race and triggered a reconnect
+            // every ~3 minutes of quiet, slowly invalidating the session.
             let keepalive_client = bot.client();
             let keepalive_last_event = self.last_event_at.clone();
             let keepalive_task = tokio::spawn(async move {
-                let mut interval = tokio::time::interval(std::time::Duration::from_secs(240));
+                let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     interval.tick().await;
@@ -1925,18 +1936,27 @@ impl Channel for WhatsAppWebChannel {
                             let err_str = e.to_string();
                             if err_str.contains("push name") {
                                 // Push name not set — this is a known wa-rs limitation after
-                                // certain pairing flows.  Log once at warn level but do NOT
-                                // treat it as a dead-stream signal; the connection is still
-                                // alive and can receive messages.  Without this guard the
-                                // liveness watchdog interprets every failed keepalive as a
-                                // dead stream, triggering a reconnect loop that eventually
+                                // certain pairing flows. The WebSocket itself is still alive
+                                // and receiving events; only the application-level presence()
+                                // call is being refused by the library. Refresh last_event_at
+                                // so the liveness watchdog doesn't interpret a missing push
+                                // name as a dead stream. Without this, every 60s keepalive
+                                // tick fails silently, last_event_at stays stale, and the
+                                // watchdog triggers a reconnect loop that eventually
                                 // invalidates the session.
+                                keepalive_last_event.store(
+                                    std::time::SystemTime::now()
+                                        .duration_since(std::time::UNIX_EPOCH)
+                                        .unwrap_or_default()
+                                        .as_secs(),
+                                    std::sync::atomic::Ordering::Relaxed,
+                                );
                                 tracing::debug!(
-                                    "WhatsApp Web: presence keepalive skipped (push name not set)"
+                                    "WhatsApp Web: presence keepalive skipped (push name not set, socket still alive)"
                                 );
                             } else {
                                 tracing::warn!(
-                                    "WhatsApp Web: presence keepalive failed ({e}) — liveness watchdog will trigger reconnect"
+                                    "WhatsApp Web: presence keepalive failed ({e}) — liveness watchdog will trigger reconnect if this persists"
                                 );
                             }
                         }
@@ -1998,11 +2018,22 @@ impl Channel for WhatsAppWebChannel {
             // bot task ends without emitting LoggedOut (e.g. crash/panic).
             drop(logout_tx);
 
-            // Liveness watchdog: if no events arrive within this window the
-            // WebSocket is considered dead and we trigger a reconnect.
-            // WhatsApp servers send keepalive pings roughly every 30-60 s,
-            // so 120 s without any event is a strong signal the stream died.
-            const LIVENESS_TIMEOUT_SECS: u64 = 120;
+            // Liveness watchdog: the keepalive task above refreshes
+            // last_event_at every 60s regardless of whether customer messages
+            // are flowing. If nothing has refreshed it for this long — i.e.
+            // roughly 10 consecutive keepalive failures — the socket is almost
+            // certainly dead and a reconnect is warranted.
+            //
+            // Must be >> the 60s keepalive interval so a single transient
+            // keepalive failure (network blip, WhatsApp server hiccup, etc.)
+            // does not kill the session. 10 minutes gives 10 keepalive attempts
+            // before we bail.
+            //
+            // Previous value was 120s paired with a 240s keepalive interval,
+            // which made the watchdog fire during every quiet chat because the
+            // keepalive could never refresh last_event_at in time. See the
+            // Apr 2026 re-pair storm: `last_event_secs_ago=149 timeout=120`.
+            const LIVENESS_TIMEOUT_SECS: u64 = 600;
             let liveness_check = self.last_event_at.clone();
 
             // Wait for a logout signal, liveness timeout, or process shutdown.
@@ -2127,7 +2158,12 @@ impl Channel for WhatsAppWebChannel {
             return false;
         }
 
-        // Verify the stream received an event recently (within 2x liveness timeout).
+        // Verify the stream received an event recently. The keepalive task
+        // refreshes last_event_at every 60s, so a 180s gap (three missed
+        // keepalives) is already suspicious. The liveness watchdog still has
+        // until 600s (LIVENESS_TIMEOUT_SECS) before it acts, but this
+        // health_check() is used by per-request probes that want an earlier
+        // signal.
         let last = self
             .last_event_at
             .load(std::sync::atomic::Ordering::Relaxed);
@@ -2139,9 +2175,7 @@ impl Channel for WhatsAppWebChannel {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        // Allow 240s (2x watchdog timeout) before reporting unhealthy.
-        // The watchdog will trigger reconnect at 120s, so this gives it time.
-        now.saturating_sub(last) < 240
+        now.saturating_sub(last) < 180
     }
 
     async fn start_typing(&self, recipient: &str) -> Result<()> {
