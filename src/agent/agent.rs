@@ -764,7 +764,9 @@ impl Agent {
     }
 
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
+        tracing::debug!("[turn] Starting turn");
         if self.history.is_empty() {
+            tracing::debug!("[turn] Building system prompt");
             let system_prompt = if let Some(ref override_prompt) = self.system_prompt_override {
                 override_prompt.clone()
             } else {
@@ -774,30 +776,53 @@ impl Agent {
                 .push(ConversationMessage::Chat(ChatMessage::system(
                     system_prompt,
                 )));
+            tracing::debug!("[turn] System prompt added to history");
         }
 
-        let context = self
-            .memory_loader
-            .load_context(
-                self.memory.as_ref(),
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
-            .await
-            .unwrap_or_default();
+        tracing::debug!("[turn] Loading memory context");
+        // Use a timeout to prevent indefinite blocking when SQLite is contended
+        let context_future = self.memory_loader.load_context(
+            self.memory.as_ref(),
+            user_message,
+            self.memory_session_id.as_deref(),
+        );
+        let context = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            context_future,
+        )
+        .await
+        {
+            Ok(Ok(ctx)) => {
+                tracing::debug!("[turn] Memory context loaded, len={}", ctx.len());
+                ctx
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("[turn] Memory context load failed: {e}");
+                String::new()
+            }
+            Err(_) => {
+                tracing::warn!("[turn] Memory context load timed out after 10s, proceeding without context");
+                String::new()
+            }
+        };
 
         if self.auto_save {
-            let _ = self
-                .memory
-                .store(
-                    "user_msg",
-                    user_message,
-                    MemoryCategory::Conversation,
-                    self.memory_session_id.as_deref(),
-                )
-                .await;
+            tracing::debug!("[turn] Auto-saving user message");
+            // Use a timeout to prevent blocking on SQLite contention
+            let store_future = self.memory.store(
+                "user_msg",
+                user_message,
+                MemoryCategory::Conversation,
+                self.memory_session_id.as_deref(),
+            );
+            match tokio::time::timeout(std::time::Duration::from_secs(5), store_future).await {
+                Ok(Ok(_)) => tracing::debug!("[turn] User message saved"),
+                Ok(Err(e)) => tracing::warn!("[turn] User message save failed: {e}"),
+                Err(_) => tracing::warn!("[turn] User message save timed out after 5s"),
+            }
         }
 
+        tracing::debug!("[turn] Building enriched message");
         let now = chrono::Local::now();
         let (year, month, day) = (now.year(), now.month(), now.day());
         let (hour, minute, second) = (now.hour(), now.minute(), now.second());
@@ -815,9 +840,12 @@ impl Agent {
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
         let effective_model = self.classify_model(user_message);
+        tracing::debug!("[turn] Effective model: {}", effective_model);
 
-        for _ in 0..self.config.max_tool_iterations {
+        for iteration in 0..self.config.max_tool_iterations {
+            tracing::debug!("[turn] Tool iteration {}", iteration);
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
+            tracing::debug!("[turn] Prepared {} messages for provider", messages.len());
 
             // Response cache: check before LLM call (only for deterministic, text-only prompts)
             let cache_key = if self.temperature == 0.0 {
@@ -859,6 +887,8 @@ impl Agent {
                 });
             }
 
+            tracing::info!("[turn] Calling provider.chat() with model={}", effective_model);
+            let chat_start = std::time::Instant::now();
             let response = match self
                 .provider
                 .chat(
@@ -876,10 +906,17 @@ impl Agent {
                 )
                 .await
             {
-                Ok(resp) => resp,
-                Err(err) => return Err(err),
+                Ok(resp) => {
+                    tracing::info!("[turn] provider.chat() returned in {:?}", chat_start.elapsed());
+                    resp
+                }
+                Err(err) => {
+                    tracing::error!("[turn] provider.chat() error after {:?}: {}", chat_start.elapsed(), err);
+                    return Err(err);
+                }
             };
 
+            tracing::debug!("[turn] Parsing response");
             let (text, calls) = self.tool_dispatcher.parse_response(&response);
             if calls.is_empty() {
                 let final_text = if text.is_empty() {
