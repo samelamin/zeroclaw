@@ -1642,12 +1642,18 @@ pub(super) async fn handle_http_chat(
         let guard = cached.lock().await;
         let mut cloned = guard.clone();
         cloned.reset_for_request();
+        // Disable memory operations for /api/chat to eliminate SQLite blocking delays
+        cloned.set_auto_save(false);
         cloned
     } else {
         tracing::warn!("No cached agent — initializing on demand (may be slow)");
         let config = state.config.lock().clone();
         match crate::agent::Agent::from_config(&config).await {
-            Ok(a) => a,
+            Ok(mut a) => {
+                // Disable memory operations for /api/chat to eliminate SQLite blocking delays
+                a.set_auto_save(false);
+                a
+            }
             Err(e) => {
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,

@@ -356,6 +356,15 @@ impl Agent {
         self.memory_session_id = session_id;
     }
 
+    /// Enable or disable auto-save mode.
+    ///
+    /// When disabled, memory operations (recall/store) are skipped entirely,
+    /// which eliminates SQLite blocking delays from concurrent tasks.
+    /// Use this for fast-path endpoints like `/api/chat`.
+    pub fn set_auto_save(&mut self, enabled: bool) {
+        self.auto_save = enabled;
+    }
+
     /// Override the system prompt for this agent instance.
     ///
     /// When set, the dynamic system prompt built from config/tools/skills is
@@ -779,30 +788,37 @@ impl Agent {
             tracing::debug!("[turn] System prompt added to history");
         }
 
-        tracing::debug!("[turn] Loading memory context");
-        // Use a timeout to prevent indefinite blocking when SQLite is contended
-        let context_future = self.memory_loader.load_context(
-            self.memory.as_ref(),
-            user_message,
-            self.memory_session_id.as_deref(),
-        );
-        let context = match tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            context_future,
-        )
-        .await
-        {
-            Ok(Ok(ctx)) => {
-                tracing::debug!("[turn] Memory context loaded, len={}", ctx.len());
-                ctx
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("[turn] Memory context load failed: {e}");
-                String::new()
-            }
-            Err(_) => {
-                tracing::warn!("[turn] Memory context load timed out after 10s, proceeding without context");
-                String::new()
+        // Skip memory operations entirely when auto_save is disabled (e.g., /api/chat endpoint)
+        // This eliminates SQLite blocking delays from concurrent cron jobs
+        let context = if !self.auto_save {
+            tracing::debug!("[turn] Skipping memory context (auto_save disabled for fast path)");
+            String::new()
+        } else {
+            tracing::debug!("[turn] Loading memory context");
+            // Use a timeout to prevent indefinite blocking when SQLite is contended
+            let context_future = self.memory_loader.load_context(
+                self.memory.as_ref(),
+                user_message,
+                self.memory_session_id.as_deref(),
+            );
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                context_future,
+            )
+            .await
+            {
+                Ok(Ok(ctx)) => {
+                    tracing::debug!("[turn] Memory context loaded, len={}", ctx.len());
+                    ctx
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("[turn] Memory context load failed: {e}");
+                    String::new()
+                }
+                Err(_) => {
+                    tracing::warn!("[turn] Memory context load timed out after 10s, proceeding without context");
+                    String::new()
+                }
             }
         };
 
