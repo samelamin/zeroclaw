@@ -20,10 +20,10 @@
 use super::AppState;
 use axum::{
     extract::{
-        Query, State, WebSocketUpgrade,
         ws::{Message, WebSocket},
+        Query, State, WebSocketUpgrade,
     },
-    http::{HeaderMap, header},
+    http::{header, HeaderMap},
     response::IntoResponse,
 };
 use futures_util::{SinkExt, StreamExt};

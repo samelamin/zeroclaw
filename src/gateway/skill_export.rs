@@ -27,11 +27,14 @@ pub struct SkillSummary {
 
 /// Build skill summaries from loaded skills.
 pub fn build_skill_summaries(skills: &[crate::skills::Skill]) -> Vec<SkillSummary> {
-    skills.iter().map(|s| SkillSummary {
-        name: s.name.clone(),
-        tags: s.tags.clone(),
-        description: s.description.clone(),
-    }).collect()
+    skills
+        .iter()
+        .map(|s| SkillSummary {
+            name: s.name.clone(),
+            tags: s.tags.clone(),
+            description: s.description.clone(),
+        })
+        .collect()
 }
 
 /// Build an export payload for a specific skill.
@@ -53,7 +56,8 @@ pub fn build_export_payload(
 
 /// Filter skills to only those that are auto-generated (tagged).
 pub fn filter_exportable(summaries: &[SkillSummary]) -> Vec<&SkillSummary> {
-    summaries.iter()
+    summaries
+        .iter()
         .filter(|s| s.tags.contains(&"auto-generated".to_string()))
         .collect()
 }

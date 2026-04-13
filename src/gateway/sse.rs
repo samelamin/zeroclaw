@@ -4,19 +4,19 @@
 
 use super::AppState;
 use axum::{
-    Json,
     extract::State,
-    http::{HeaderMap, StatusCode, header},
+    http::{header, HeaderMap, StatusCode},
     response::{
-        IntoResponse,
         sse::{Event, KeepAlive, Sse},
+        IntoResponse,
     },
+    Json,
 };
 use std::collections::VecDeque;
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
-use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
+use tokio_stream::StreamExt;
 
 /// Thread-safe ring buffer that retains recent events for history replay.
 pub struct EventBuffer {
