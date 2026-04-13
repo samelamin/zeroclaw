@@ -1638,11 +1638,13 @@ pub(super) async fn handle_http_chat(
     }
 
     let mut agent = if let Some(ref cached) = state.cached_agent {
+        tracing::info!("Using pre-warmed agent for /api/chat");
         let guard = cached.lock().await;
         let mut cloned = guard.clone();
         cloned.reset_for_request();
         cloned
     } else {
+        tracing::warn!("No cached agent — initializing on demand (may be slow)");
         let config = state.config.lock().clone();
         match crate::agent::Agent::from_config(&config).await {
             Ok(a) => a,
