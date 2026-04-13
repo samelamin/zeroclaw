@@ -5,7 +5,7 @@
 use super::AppState;
 use axum::{
     extract::{Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
 };
 use serde::Deserialize;
@@ -1637,15 +1637,22 @@ pub(super) async fn handle_http_chat(
         return e.into_response();
     }
 
-    let config = state.config.lock().clone();
-    let mut agent = match crate::agent::Agent::from_config(&config).await {
-        Ok(a) => a,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": format!("Agent init failed: {e}") })),
-            )
-                .into_response();
+    let mut agent = if let Some(ref cached) = state.cached_agent {
+        let guard = cached.lock().await;
+        let mut cloned = guard.clone();
+        cloned.reset_for_request();
+        cloned
+    } else {
+        let config = state.config.lock().clone();
+        match crate::agent::Agent::from_config(&config).await {
+            Ok(a) => a,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("Agent init failed: {e}") })),
+                )
+                    .into_response();
+            }
         }
     };
 
@@ -1689,7 +1696,7 @@ pub(super) async fn handle_http_chat(
 mod tests {
     use super::*;
     use crate::channels::traits::{Channel, SendMessage};
-    use crate::gateway::{AppState, GatewayRateLimiter, IdempotencyStore, nodes};
+    use crate::gateway::{nodes, AppState, GatewayRateLimiter, IdempotencyStore};
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
     use crate::providers::Provider;
     use crate::security::pairing::PairingGuard;
@@ -2299,18 +2306,14 @@ mod tests {
             Some("route-embed-key-1")
         );
         assert_eq!(hydrated.embedding_routes[2].api_key, None);
-        assert!(
-            hydrated
-                .model_routes
-                .iter()
-                .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET))
-        );
-        assert!(
-            hydrated
-                .embedding_routes
-                .iter()
-                .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET))
-        );
+        assert!(hydrated
+            .model_routes
+            .iter()
+            .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET)));
+        assert!(hydrated
+            .embedding_routes
+            .iter()
+            .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET)));
     }
 
     #[tokio::test]
@@ -2432,12 +2435,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = response_json(response).await;
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("delivery.to is required")
-        );
+        assert!(json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("delivery.to is required"));
 
         let config = state.config.lock().clone();
         assert!(crate::cron::list_jobs(&config).unwrap().is_empty());
@@ -2476,12 +2477,10 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = response_json(response).await;
-        assert!(
-            json["error"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("unsupported delivery channel")
-        );
+        assert!(json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unsupported delivery channel"));
 
         let config = state.config.lock().clone();
         assert!(crate::cron::list_jobs(&config).unwrap().is_empty());

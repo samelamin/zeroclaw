@@ -37,15 +37,16 @@ pub enum TurnEvent {
     ToolResult { name: String, output: String },
 }
 
+#[derive(Clone)]
 pub struct Agent {
-    provider: Box<dyn Provider>,
-    tools: Vec<Box<dyn Tool>>,
+    provider: Arc<dyn Provider>,
+    tools: Arc<Vec<Box<dyn Tool>>>,
     tool_specs: Vec<ToolSpec>,
     memory: Arc<dyn Memory>,
     observer: Arc<dyn Observer>,
-    prompt_builder: SystemPromptBuilder,
-    tool_dispatcher: Box<dyn ToolDispatcher>,
-    memory_loader: Box<dyn MemoryLoader>,
+    prompt_builder: Arc<SystemPromptBuilder>,
+    tool_dispatcher: Arc<dyn ToolDispatcher>,
+    memory_loader: Arc<dyn MemoryLoader>,
     config: crate::config::AgentConfig,
     model_name: String,
     temperature: f64,
@@ -285,10 +286,11 @@ impl AgentBuilder {
         let tool_specs = tools.iter().map(|tool| tool.spec()).collect();
 
         Ok(Agent {
-            provider: self
-                .provider
-                .ok_or_else(|| anyhow::anyhow!("provider is required"))?,
-            tools,
+            provider: Arc::from(
+                self.provider
+                    .ok_or_else(|| anyhow::anyhow!("provider is required"))?,
+            ),
+            tools: Arc::new(tools),
             tool_specs,
             memory: self
                 .memory
@@ -296,15 +298,17 @@ impl AgentBuilder {
             observer: self
                 .observer
                 .ok_or_else(|| anyhow::anyhow!("observer is required"))?,
-            prompt_builder: self
-                .prompt_builder
-                .unwrap_or_else(SystemPromptBuilder::with_defaults),
-            tool_dispatcher: self
-                .tool_dispatcher
-                .ok_or_else(|| anyhow::anyhow!("tool_dispatcher is required"))?,
-            memory_loader: self
-                .memory_loader
-                .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
+            prompt_builder: Arc::new(
+                self.prompt_builder
+                    .unwrap_or_else(SystemPromptBuilder::with_defaults),
+            ),
+            tool_dispatcher: Arc::from(
+                self.tool_dispatcher
+                    .ok_or_else(|| anyhow::anyhow!("tool_dispatcher is required"))?,
+            ),
+            memory_loader: Arc::from(self.memory_loader.unwrap_or_else(|| {
+                Box::new(DefaultMemoryLoader::default()) as Box<dyn MemoryLoader>
+            })),
             config: self.config.unwrap_or_default(),
             model_name: self
                 .model_name
@@ -608,12 +612,20 @@ impl Agent {
         self.history.extend(other_messages);
     }
 
+    /// Reset per-request state for agent reuse (clears history, keeps tools/memory/provider).
+    pub fn reset_for_request(&mut self) {
+        self.history.clear();
+        self.memory_session_id = None;
+    }
+
     fn build_system_prompt(&self) -> Result<String> {
-        let instructions = self.tool_dispatcher.prompt_instructions(&self.tools);
+        let instructions = self
+            .tool_dispatcher
+            .prompt_instructions(self.tools.as_slice());
         let ctx = PromptContext {
             workspace_dir: &self.workspace_dir,
             model_name: &self.model_name,
-            tools: &self.tools,
+            tools: self.tools.as_slice(),
             skills: &self.skills,
             skills_prompt_mode: self.skills_prompt_mode,
             identity_config: Some(&self.identity_config),
@@ -1493,12 +1505,10 @@ mod tests {
 
         let response = agent.turn("hi").await.unwrap();
         assert_eq!(response, "done");
-        assert!(
-            agent
-                .history()
-                .iter()
-                .any(|msg| matches!(msg, ConversationMessage::ToolResults(_)))
-        );
+        assert!(agent
+            .history()
+            .iter()
+            .any(|msg| matches!(msg, ConversationMessage::ToolResults(_))));
     }
 
     #[tokio::test]
@@ -1557,7 +1567,7 @@ mod tests {
 
     #[tokio::test]
     async fn from_config_passes_extra_headers_to_custom_provider() {
-        use axum::{Json, Router, http::HeaderMap, routing::post};
+        use axum::{http::HeaderMap, routing::post, Json, Router};
         use tempfile::TempDir;
         use tokio::net::TcpListener;
 

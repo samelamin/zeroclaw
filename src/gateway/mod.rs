@@ -24,28 +24,28 @@ pub mod tls;
 pub mod ws;
 
 use crate::channels::{
-    Channel, GmailPushChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel,
-    WhatsAppChannel, session_backend::SessionBackend, session_sqlite::SqliteSessionBackend,
+    session_backend::SessionBackend, session_sqlite::SqliteSessionBackend, Channel,
+    GmailPushChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel, WhatsAppChannel,
 };
 use crate::config::Config;
 use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
+use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
-use crate::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
 use crate::tools;
 use crate::tools::canvas::CanvasStore;
 use crate::tools::traits::ToolSpec;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
-    Router,
     body::Bytes,
     extract::{ConnectInfo, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Json},
     routing::{delete, get, post, put},
+    Router,
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -375,6 +375,8 @@ pub struct AppState {
     pub pending_pairings: Option<Arc<api_pairing::PairingStore>>,
     /// Shared canvas store for Live Canvas (A2UI) system
     pub canvas_store: CanvasStore,
+    /// Pre-warmed agent for /api/chat — avoids 30s init on each request.
+    pub cached_agent: Option<Arc<tokio::sync::Mutex<crate::agent::Agent>>>,
     /// WebAuthn state for hardware key authentication (optional, requires `webauthn` feature)
     #[cfg(feature = "webauthn")]
     pub webauthn: Option<Arc<api_webauthn::WebAuthnState>>,
@@ -843,6 +845,19 @@ pub async fn run_gateway(
         None
     };
 
+    // ── Pre-warm agent for /api/chat ─────────────────────────────────
+    // This avoids 30s init on each request by reusing a pre-initialized agent.
+    let cached_agent = match crate::agent::Agent::from_config(&config).await {
+        Ok(agent) => {
+            tracing::info!("Pre-warmed agent for /api/chat endpoint");
+            Some(Arc::new(tokio::sync::Mutex::new(agent)))
+        }
+        Err(e) => {
+            tracing::warn!("Failed to pre-warm agent: {e} — /api/chat will init on demand");
+            None
+        }
+    };
+
     let state = AppState {
         config: config_state,
         provider,
@@ -878,6 +893,7 @@ pub async fn run_gateway(
         pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
         canvas_store,
+        cached_agent,
         #[cfg(feature = "webauthn")]
         webauthn: if config.security.webauthn.enabled {
             let secret_store = Arc::new(crate::security::SecretStore::new(
@@ -2378,6 +2394,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cached_agent: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2450,6 +2467,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cached_agent: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2847,6 +2865,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cached_agent: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -2927,6 +2946,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cached_agent: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3019,6 +3039,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cached_agent: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3083,6 +3104,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cached_agent: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3152,6 +3174,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cached_agent: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3226,6 +3249,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cached_agent: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
@@ -3297,6 +3321,7 @@ mod tests {
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
+            cached_agent: None,
             #[cfg(feature = "webauthn")]
             webauthn: None,
         };
