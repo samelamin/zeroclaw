@@ -2033,7 +2033,7 @@ impl Channel for WhatsAppWebChannel {
             // which made the watchdog fire during every quiet chat because the
             // keepalive could never refresh last_event_at in time. See the
             // Apr 2026 re-pair storm: `last_event_secs_ago=149 timeout=120`.
-            const LIVENESS_TIMEOUT_SECS: u64 = 600;
+            const LIVENESS_TIMEOUT_SECS: u64 = 180; // 3 minutes (reduced from 600 for faster reconnect)
             let liveness_check = self.last_event_at.clone();
 
             // Wait for a logout signal, liveness timeout, or process shutdown.
