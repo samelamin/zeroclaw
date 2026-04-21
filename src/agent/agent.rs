@@ -1,7 +1,6 @@
 use crate::agent::dispatcher::{
     NativeToolDispatcher, ParsedToolCall, ToolDispatcher, ToolExecutionResult, XmlToolDispatcher,
 };
-use crate::agent::memory_loader::{DefaultMemoryLoader, MemoryLoader};
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::Config;
 use crate::i18n::ToolDescriptions;
@@ -13,7 +12,6 @@ use crate::security::SecurityPolicy;
 use crate::tools::{self, Tool, ToolSpec};
 use anyhow::Result;
 use chrono::{Datelike, Timelike};
-use std::collections::HashMap;
 use std::io::Write as IoWrite;
 use std::sync::Arc;
 use std::time::Instant;
@@ -45,7 +43,6 @@ pub struct Agent {
     observer: Arc<dyn Observer>,
     prompt_builder: SystemPromptBuilder,
     tool_dispatcher: Box<dyn ToolDispatcher>,
-    memory_loader: Box<dyn MemoryLoader>,
     config: crate::config::AgentConfig,
     model_name: String,
     temperature: f64,
@@ -56,11 +53,7 @@ pub struct Agent {
     auto_save: bool,
     memory_session_id: Option<String>,
     history: Vec<ConversationMessage>,
-    classification_config: crate::config::QueryClassificationConfig,
-    available_hints: Vec<String>,
-    route_model_by_hint: HashMap<String, String>,
     allowed_tools: Option<Vec<String>>,
-    response_cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
     tool_descriptions: Option<ToolDescriptions>,
     /// Pre-rendered security policy summary injected into the system prompt
     /// so the LLM knows the concrete constraints before making tool calls.
@@ -83,7 +76,6 @@ pub struct AgentBuilder {
     observer: Option<Arc<dyn Observer>>,
     prompt_builder: Option<SystemPromptBuilder>,
     tool_dispatcher: Option<Box<dyn ToolDispatcher>>,
-    memory_loader: Option<Box<dyn MemoryLoader>>,
     config: Option<crate::config::AgentConfig>,
     model_name: Option<String>,
     temperature: Option<f64>,
@@ -93,11 +85,7 @@ pub struct AgentBuilder {
     skills_prompt_mode: Option<crate::config::SkillsPromptInjectionMode>,
     auto_save: Option<bool>,
     memory_session_id: Option<String>,
-    classification_config: Option<crate::config::QueryClassificationConfig>,
-    available_hints: Option<Vec<String>>,
-    route_model_by_hint: Option<HashMap<String, String>>,
     allowed_tools: Option<Vec<String>>,
-    response_cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
     tool_descriptions: Option<ToolDescriptions>,
     security_summary: Option<String>,
     autonomy_level: Option<crate::security::AutonomyLevel>,
@@ -114,7 +102,6 @@ impl AgentBuilder {
             observer: None,
             prompt_builder: None,
             tool_dispatcher: None,
-            memory_loader: None,
             config: None,
             model_name: None,
             temperature: None,
@@ -124,11 +111,7 @@ impl AgentBuilder {
             skills_prompt_mode: None,
             auto_save: None,
             memory_session_id: None,
-            classification_config: None,
-            available_hints: None,
-            route_model_by_hint: None,
             allowed_tools: None,
-            response_cache: None,
             tool_descriptions: None,
             security_summary: None,
             autonomy_level: None,
@@ -164,11 +147,6 @@ impl AgentBuilder {
 
     pub fn tool_dispatcher(mut self, tool_dispatcher: Box<dyn ToolDispatcher>) -> Self {
         self.tool_dispatcher = Some(tool_dispatcher);
-        self
-    }
-
-    pub fn memory_loader(mut self, memory_loader: Box<dyn MemoryLoader>) -> Self {
-        self.memory_loader = Some(memory_loader);
         self
     }
 
@@ -220,34 +198,8 @@ impl AgentBuilder {
         self
     }
 
-    pub fn classification_config(
-        mut self,
-        classification_config: crate::config::QueryClassificationConfig,
-    ) -> Self {
-        self.classification_config = Some(classification_config);
-        self
-    }
-
-    pub fn available_hints(mut self, available_hints: Vec<String>) -> Self {
-        self.available_hints = Some(available_hints);
-        self
-    }
-
-    pub fn route_model_by_hint(mut self, route_model_by_hint: HashMap<String, String>) -> Self {
-        self.route_model_by_hint = Some(route_model_by_hint);
-        self
-    }
-
     pub fn allowed_tools(mut self, allowed_tools: Option<Vec<String>>) -> Self {
         self.allowed_tools = allowed_tools;
-        self
-    }
-
-    pub fn response_cache(
-        mut self,
-        cache: Option<Arc<crate::memory::response_cache::ResponseCache>>,
-    ) -> Self {
-        self.response_cache = cache;
         self
     }
 
@@ -302,9 +254,6 @@ impl AgentBuilder {
             tool_dispatcher: self
                 .tool_dispatcher
                 .ok_or_else(|| anyhow::anyhow!("tool_dispatcher is required"))?,
-            memory_loader: self
-                .memory_loader
-                .unwrap_or_else(|| Box::new(DefaultMemoryLoader::default())),
             config: self.config.unwrap_or_default(),
             model_name: self
                 .model_name
@@ -319,11 +268,7 @@ impl AgentBuilder {
             auto_save: self.auto_save.unwrap_or(false),
             memory_session_id: self.memory_session_id,
             history: Vec::new(),
-            classification_config: self.classification_config.unwrap_or_default(),
-            available_hints: self.available_hints.unwrap_or_default(),
-            route_model_by_hint: self.route_model_by_hint.unwrap_or_default(),
             allowed_tools: allowed,
-            response_cache: self.response_cache,
             tool_descriptions: self.tool_descriptions,
             security_summary: self.security_summary,
             autonomy_level: self
@@ -529,45 +474,17 @@ impl Agent {
             _ => Box::new(XmlToolDispatcher),
         };
 
-        let route_model_by_hint: HashMap<String, String> = config
-            .model_routes
-            .iter()
-            .map(|route| (route.hint.clone(), route.model.clone()))
-            .collect();
-        let available_hints: Vec<String> = route_model_by_hint.keys().cloned().collect();
-
-        let response_cache = if config.memory.response_cache_enabled {
-            crate::memory::response_cache::ResponseCache::with_hot_cache(
-                &config.workspace_dir,
-                config.memory.response_cache_ttl_minutes,
-                config.memory.response_cache_max_entries,
-                config.memory.response_cache_hot_entries,
-            )
-            .ok()
-            .map(Arc::new)
-        } else {
-            None
-        };
-
         Agent::builder()
             .provider(provider)
             .tools(tools)
             .memory(memory)
             .observer(observer)
-            .response_cache(response_cache)
             .tool_dispatcher(tool_dispatcher)
-            .memory_loader(Box::new(DefaultMemoryLoader::new(
-                5,
-                config.memory.min_relevance_score,
-            )))
             .prompt_builder(SystemPromptBuilder::with_defaults())
             .config(config.agent.clone())
             .model_name(model_name)
             .temperature(config.default_temperature)
             .workspace_dir(config.workspace_dir.clone())
-            .classification_config(config.query_classification.clone())
-            .available_hints(available_hints)
-            .route_model_by_hint(route_model_by_hint)
             .identity_config(config.identity.clone())
             .skills(crate::skills::load_skills_with_config(
                 &config.workspace_dir,
@@ -637,23 +554,15 @@ impl Agent {
                         duration: start.elapsed(),
                         success: r.success,
                     });
-                    if self.config.core == "minimal" {
-                        let raw = if r.success {
-                            r.output
-                        } else {
-                            match r.error {
-                                Some(e) if !e.is_empty() => e,
-                                _ => r.output,
-                            }
-                        };
-                        crate::agent::tool_result_truncate::format_tool_output(&raw, r.success)
+                    let raw = if r.success {
+                        r.output
                     } else {
-                        if r.success {
-                            r.output
-                        } else {
-                            format!("Error: {}", r.error.unwrap_or(r.output))
+                        match r.error {
+                            Some(e) if !e.is_empty() => e,
+                            _ => r.output,
                         }
-                    }
+                    };
+                    crate::agent::tool_result_truncate::format_tool_output(&raw, r.success)
                 }
                 Err(e) => {
                     self.observer.record_event(&ObserverEvent::ToolCall {
@@ -661,12 +570,8 @@ impl Agent {
                         duration: start.elapsed(),
                         success: false,
                     });
-                    if self.config.core == "minimal" {
-                        let raw = format!("{e:#}");
-                        crate::agent::tool_result_truncate::format_tool_output(&raw, false)
-                    } else {
-                        format!("Error executing {}: {e}", call.name)
-                    }
+                    let raw = format!("{e:#}");
+                    crate::agent::tool_result_truncate::format_tool_output(&raw, false)
                 }
             }
         } else if let Some(activated_arc) = self.activated_tools.as_ref() {
@@ -680,23 +585,15 @@ impl Agent {
                             duration: start.elapsed(),
                             success: r.success,
                         });
-                        if self.config.core == "minimal" {
-                            let raw = if r.success {
-                                r.output
-                            } else {
-                                match r.error {
-                                    Some(e) if !e.is_empty() => e,
-                                    _ => r.output,
-                                }
-                            };
-                            crate::agent::tool_result_truncate::format_tool_output(&raw, r.success)
+                        let raw = if r.success {
+                            r.output
                         } else {
-                            if r.success {
-                                r.output
-                            } else {
-                                format!("Error: {}", r.error.unwrap_or(r.output))
+                            match r.error {
+                                Some(e) if !e.is_empty() => e,
+                                _ => r.output,
                             }
-                        }
+                        };
+                        crate::agent::tool_result_truncate::format_tool_output(&raw, r.success)
                     }
                     Err(e) => {
                         self.observer.record_event(&ObserverEvent::ToolCall {
@@ -704,12 +601,8 @@ impl Agent {
                             duration: start.elapsed(),
                             success: false,
                         });
-                        if self.config.core == "minimal" {
-                            let raw = format!("{e:#}");
-                            crate::agent::tool_result_truncate::format_tool_output(&raw, false)
-                        } else {
-                            format!("Error executing {}: {e}", call.name)
-                        }
+                        let raw = format!("{e:#}");
+                        crate::agent::tool_result_truncate::format_tool_output(&raw, false)
                     }
                 }
             } else {
@@ -743,48 +636,6 @@ impl Agent {
         futures_util::future::join_all(futs).await
     }
 
-    fn classify_model(&self, user_message: &str) -> String {
-        if let Some(decision) =
-            super::classifier::classify_with_decision(&self.classification_config, user_message)
-        {
-            if self.available_hints.contains(&decision.hint) {
-                let resolved_model = self
-                    .route_model_by_hint
-                    .get(&decision.hint)
-                    .map(String::as_str)
-                    .unwrap_or("unknown");
-                tracing::info!(
-                    target: "query_classification",
-                    hint = decision.hint.as_str(),
-                    model = resolved_model,
-                    rule_priority = decision.priority,
-                    message_length = user_message.len(),
-                    "Classified message route"
-                );
-                return format!("hint:{}", decision.hint);
-            }
-        }
-
-        // Fallback: auto-classify by complexity when no rule matched.
-        if let Some(ref ac) = self.config.auto_classify {
-            let tier = super::eval::estimate_complexity(user_message);
-            if let Some(hint) = ac.hint_for(tier) {
-                if self.available_hints.contains(&hint.to_string()) {
-                    tracing::info!(
-                        target: "query_classification",
-                        hint = hint,
-                        complexity = ?tier,
-                        message_length = user_message.len(),
-                        "Auto-classified by complexity"
-                    );
-                    return format!("hint:{hint}");
-                }
-            }
-        }
-
-        self.model_name.clone()
-    }
-
     pub async fn turn(&mut self, user_message: &str) -> Result<String> {
         if self.history.is_empty() {
             let system_prompt = if let Some(ref override_prompt) = self.system_prompt_override {
@@ -797,19 +648,6 @@ impl Agent {
                     system_prompt,
                 )));
         }
-
-        let context = if self.config.core == "minimal" {
-            String::new()
-        } else {
-            self.memory_loader
-                .load_context(
-                    self.memory.as_ref(),
-                    user_message,
-                    self.memory_session_id.as_deref(),
-                )
-                .await
-                .unwrap_or_default()
-        };
 
         if self.auto_save {
             let _ = self
@@ -830,63 +668,15 @@ impl Agent {
         let date_str =
             format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02} {tz}");
 
-        let enriched = if context.is_empty() {
-            format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}")
-        } else {
-            format!("[CURRENT DATE & TIME: {date_str}]\n\n{context}\n\n{user_message}")
-        };
+        let enriched = format!("[CURRENT DATE & TIME: {date_str}]\n\n{user_message}");
 
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = if self.config.core == "minimal" {
-            self.model_name.clone()
-        } else {
-            self.classify_model(user_message)
-        };
+        let effective_model = self.model_name.clone();
 
         for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
-
-            // Response cache: check before LLM call (only for deterministic, text-only prompts)
-            let cache_key = if self.temperature == 0.0 {
-                self.response_cache.as_ref().map(|_| {
-                    let last_user = messages
-                        .iter()
-                        .rfind(|m| m.role == "user")
-                        .map(|m| m.content.as_str())
-                        .unwrap_or("");
-                    let system = messages
-                        .iter()
-                        .find(|m| m.role == "system")
-                        .map(|m| m.content.as_str());
-                    crate::memory::response_cache::ResponseCache::cache_key(
-                        &effective_model,
-                        system,
-                        last_user,
-                    )
-                })
-            } else {
-                None
-            };
-
-            if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
-                if let Ok(Some(cached)) = cache.get(key) {
-                    self.observer.record_event(&ObserverEvent::CacheHit {
-                        cache_type: "response".into(),
-                        tokens_saved: 0,
-                    });
-                    self.history
-                        .push(ConversationMessage::Chat(ChatMessage::assistant(
-                            cached.clone(),
-                        )));
-                    self.trim_history();
-                    return Ok(cached);
-                }
-                self.observer.record_event(&ObserverEvent::CacheMiss {
-                    cache_type: "response".into(),
-                });
-            }
 
             let response = match self
                 .provider
@@ -916,17 +706,6 @@ impl Agent {
                 } else {
                     text
                 };
-
-                // Store in response cache (text-only, no tool calls)
-                if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
-                    let token_count = response
-                        .usage
-                        .as_ref()
-                        .and_then(|u| u.output_tokens)
-                        .unwrap_or(0);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let _ = cache.put(key, &effective_model, &final_text, token_count as u32);
-                }
 
                 self.history
                     .push(ConversationMessage::Chat(ChatMessage::assistant(
@@ -990,19 +769,6 @@ impl Agent {
                 )));
         }
 
-        let context = if self.config.core == "minimal" {
-            String::new()
-        } else {
-            self.memory_loader
-                .load_context(
-                    self.memory.as_ref(),
-                    user_message,
-                    self.memory_session_id.as_deref(),
-                )
-                .await
-                .unwrap_or_default()
-        };
-
         if self.auto_save {
             let _ = self
                 .memory
@@ -1016,64 +782,16 @@ impl Agent {
         }
 
         let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S %Z");
-        let enriched = if context.is_empty() {
-            format!("[{now}] {user_message}")
-        } else {
-            format!("{context}[{now}] {user_message}")
-        };
+        let enriched = format!("[{now}] {user_message}");
 
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = if self.config.core == "minimal" {
-            self.model_name.clone()
-        } else {
-            self.classify_model(user_message)
-        };
+        let effective_model = self.model_name.clone();
 
         // ── Turn loop ──────────────────────────────────────────────────
         for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
-
-            // Response cache check (same as turn)
-            let cache_key = if self.temperature == 0.0 {
-                self.response_cache.as_ref().map(|_| {
-                    let last_user = messages
-                        .iter()
-                        .rfind(|m| m.role == "user")
-                        .map(|m| m.content.as_str())
-                        .unwrap_or("");
-                    let system = messages
-                        .iter()
-                        .find(|m| m.role == "system")
-                        .map(|m| m.content.as_str());
-                    crate::memory::response_cache::ResponseCache::cache_key(
-                        &effective_model,
-                        system,
-                        last_user,
-                    )
-                })
-            } else {
-                None
-            };
-
-            if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
-                if let Ok(Some(cached)) = cache.get(key) {
-                    self.observer.record_event(&ObserverEvent::CacheHit {
-                        cache_type: "response".into(),
-                        tokens_saved: 0,
-                    });
-                    self.history
-                        .push(ConversationMessage::Chat(ChatMessage::assistant(
-                            cached.clone(),
-                        )));
-                    self.trim_history();
-                    return Ok(cached);
-                }
-                self.observer.record_event(&ObserverEvent::CacheMiss {
-                    cache_type: "response".into(),
-                });
-            }
 
             // ── Streaming LLM call ────────────────────────────────────
             // Try streaming first; if the provider returns content we
@@ -1195,17 +913,6 @@ impl Agent {
                 } else {
                     text
                 };
-
-                // Store in response cache
-                if let (Some(cache), Some(key)) = (&self.response_cache, &cache_key) {
-                    let token_count = response
-                        .usage
-                        .as_ref()
-                        .and_then(|u| u.output_tokens)
-                        .unwrap_or(0);
-                    #[allow(clippy::cast_possible_truncation)]
-                    let _ = cache.put(key, &effective_model, &final_text, token_count as u32);
-                }
 
                 // If we didn't stream, send the full response as a single chunk
                 if !got_stream && !final_text.is_empty() {
@@ -1399,43 +1106,6 @@ mod tests {
         }
     }
 
-    struct ModelCaptureProvider {
-        responses: Mutex<Vec<crate::providers::ChatResponse>>,
-        seen_models: Arc<Mutex<Vec<String>>>,
-    }
-
-    #[async_trait]
-    impl Provider for ModelCaptureProvider {
-        async fn chat_with_system(
-            &self,
-            _system_prompt: Option<&str>,
-            _message: &str,
-            _model: &str,
-            _temperature: f64,
-        ) -> Result<String> {
-            Ok("ok".into())
-        }
-
-        async fn chat(
-            &self,
-            _request: ChatRequest<'_>,
-            model: &str,
-            _temperature: f64,
-        ) -> Result<crate::providers::ChatResponse> {
-            self.seen_models.lock().push(model.to_string());
-            let mut guard = self.responses.lock();
-            if guard.is_empty() {
-                return Ok(crate::providers::ChatResponse {
-                    text: Some("done".into()),
-                    tool_calls: vec![],
-                    usage: None,
-                    reasoning_content: None,
-                });
-            }
-            Ok(guard.remove(0))
-        }
-    }
-
     struct MockTool;
 
     #[async_trait]
@@ -1547,64 +1217,6 @@ mod tests {
                 .iter()
                 .any(|msg| matches!(msg, ConversationMessage::ToolResults(_)))
         );
-    }
-
-    #[tokio::test]
-    async fn turn_routes_with_hint_when_query_classification_matches() {
-        let seen_models = Arc::new(Mutex::new(Vec::new()));
-        let provider = Box::new(ModelCaptureProvider {
-            responses: Mutex::new(vec![crate::providers::ChatResponse {
-                text: Some("classified".into()),
-                tool_calls: vec![],
-                usage: None,
-                reasoning_content: None,
-            }]),
-            seen_models: seen_models.clone(),
-        });
-
-        let memory_cfg = crate::config::MemoryConfig {
-            backend: "none".into(),
-            ..crate::config::MemoryConfig::default()
-        };
-        let mem: Arc<dyn Memory> = Arc::from(
-            crate::memory::create_memory(&memory_cfg, std::path::Path::new("/tmp"), None)
-                .expect("memory creation should succeed with valid config"),
-        );
-
-        let observer: Arc<dyn Observer> = Arc::from(crate::observability::NoopObserver {});
-        let mut route_model_by_hint = HashMap::new();
-        route_model_by_hint.insert("fast".to_string(), "anthropic/claude-haiku-4-5".to_string());
-        let mut agent = Agent::builder()
-            .provider(provider)
-            .tools(vec![Box::new(MockTool)])
-            .memory(mem)
-            .observer(observer)
-            .tool_dispatcher(Box::new(NativeToolDispatcher))
-            .workspace_dir(std::path::PathBuf::from("/tmp"))
-            .config(crate::config::AgentConfig {
-                core: "legacy".to_string(),
-                ..crate::config::AgentConfig::default()
-            })
-            .classification_config(crate::config::QueryClassificationConfig {
-                enabled: true,
-                rules: vec![crate::config::ClassificationRule {
-                    hint: "fast".to_string(),
-                    keywords: vec!["quick".to_string()],
-                    patterns: vec![],
-                    min_length: None,
-                    max_length: None,
-                    priority: 10,
-                }],
-            })
-            .available_hints(vec!["fast".to_string()])
-            .route_model_by_hint(route_model_by_hint)
-            .build()
-            .expect("agent builder should succeed with valid config");
-
-        let response = agent.turn("quick summary please").await.unwrap();
-        assert_eq!(response, "classified");
-        let seen = seen_models.lock();
-        assert_eq!(seen.as_slice(), &["hint:fast".to_string()]);
     }
 
     #[tokio::test]
