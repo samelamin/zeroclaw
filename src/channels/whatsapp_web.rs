@@ -1492,7 +1492,57 @@ impl Channel for WhatsAppWebChannel {
                                 let chat = info.source.chat.to_string();
 
                                 let mapped_phone = if sender_jid.is_lid() {
-                                    client.get_phone_number_from_lid(&sender_jid.user).await
+                                    match client.get_phone_number_from_lid(&sender_jid.user).await {
+                                        Some(pn) => Some(pn),
+                                        None => {
+                                            // Cache miss: no PushName / peer-PN learning yet.
+                                            // Issue a usync contact query so the WA server
+                                            // returns the PN that pairs with this LID. Until
+                                            // we resolve it, the downstream webhook only knows
+                                            // the LID which callers can't reply to or match
+                                            // against their CRM.
+                                            match client
+                                                .contacts()
+                                                .get_user_info(std::slice::from_ref(&sender_jid))
+                                                .await
+                                            {
+                                                Ok(map) => {
+                                                    let resolved = map.into_iter().find_map(
+                                                        |(jid, info)| match info.lid.as_ref() {
+                                                            Some(lid_jid)
+                                                                if lid_jid.user
+                                                                    == sender_jid.user
+                                                                    && jid.is_pn() =>
+                                                            {
+                                                                Some(jid.user)
+                                                            }
+                                                            _ => None,
+                                                        },
+                                                    );
+                                                    if let Some(pn) = resolved.as_ref() {
+                                                        tracing::debug!(
+                                                            "WhatsApp Web: resolved LID {}@lid -> {} via usync",
+                                                            sender_jid.user,
+                                                            pn
+                                                        );
+                                                    } else {
+                                                        tracing::debug!(
+                                                            "WhatsApp Web: usync query returned no PN for LID {}@lid",
+                                                            sender_jid.user
+                                                        );
+                                                    }
+                                                    resolved
+                                                }
+                                                Err(e) => {
+                                                    tracing::debug!(
+                                                        "WhatsApp Web: usync LID resolution failed for {}@lid: {e}",
+                                                        sender_jid.user
+                                                    );
+                                                    None
+                                                }
+                                            }
+                                        }
+                                    }
                                 } else {
                                     None
                                 };
