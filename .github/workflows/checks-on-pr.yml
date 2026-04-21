@@ -31,6 +31,9 @@ jobs:
       - name: Ensure web/dist placeholder exists
         run: mkdir -p web/dist && touch web/dist/.gitkeep
 
+      - name: Agent-core guardrail lint
+        run: ./scripts/ci/lint_agent_core.sh
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
