@@ -7,6 +7,7 @@ pub mod context_compressor;
 pub mod cost;
 pub mod dispatcher;
 pub mod eval;
+pub mod eval_suite;
 pub mod history;
 pub mod history_pruner;
 pub mod loop_;
