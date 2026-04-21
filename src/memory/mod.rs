@@ -2,24 +2,16 @@ pub mod audit;
 pub mod backend;
 pub mod chunker;
 pub mod cli;
-pub mod customer_model;
-pub mod conflict;
-pub mod consolidation;
 pub mod decay;
-pub mod dreaming;
 pub mod embeddings;
-pub mod hygiene;
-pub mod importance;
 pub mod knowledge_graph;
 pub mod lucid;
 pub mod markdown;
 pub mod namespaced;
 pub mod none;
-pub mod outcomes;
 pub mod policy;
 pub mod procedural;
 pub mod qdrant;
-pub mod response_cache;
 pub mod retrieval;
 pub mod snapshot;
 pub mod sqlite;
@@ -43,7 +35,6 @@ pub use none::NoneMemory;
 #[allow(unused_imports)]
 pub use policy::PolicyEnforcer;
 pub use qdrant::QdrantMemory;
-pub use response_cache::ResponseCache;
 #[allow(unused_imports)]
 pub use retrieval::{RetrievalConfig, RetrievalPipeline};
 pub use sqlite::SqliteMemory;
@@ -252,10 +243,7 @@ pub fn create_memory_with_storage_and_routes(
     let backend_kind = classify_memory_backend(&backend_name);
     let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key);
 
-    // Best-effort memory hygiene/retention pass (throttled by state file).
-    if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
-        tracing::warn!("memory hygiene skipped: {e}");
-    }
+    // Memory hygiene removed — retention is now managed through explicit tools.
 
     // If snapshot_on_hygiene is enabled, export core memories during hygiene.
     if config.snapshot_enabled
@@ -386,31 +374,6 @@ pub fn create_memory_for_migration(
 }
 
 /// Factory: create an optional response cache from config.
-pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Option<ResponseCache> {
-    if !config.response_cache_enabled {
-        return None;
-    }
-
-    match ResponseCache::new(
-        workspace_dir,
-        config.response_cache_ttl_minutes,
-        config.response_cache_max_entries,
-    ) {
-        Ok(cache) => {
-            tracing::info!(
-                "💾 Response cache enabled (TTL: {}min, max: {} entries)",
-                config.response_cache_ttl_minutes,
-                config.response_cache_max_entries
-            );
-            Some(cache)
-        }
-        Err(e) => {
-            tracing::warn!("Response cache disabled due to error: {e}");
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

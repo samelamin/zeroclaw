@@ -3590,27 +3590,8 @@ async fn process_channel_message(
                 }
             }
 
-            // Fire-and-forget LLM-driven memory consolidation.
-            if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
-                let provider = Arc::clone(&ctx.provider);
-                let model = ctx.model.to_string();
-                let memory = Arc::clone(&ctx.memory);
-                let user_msg = msg.content.clone();
-                let assistant_resp = delivered_response.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = crate::memory::consolidation::consolidate_turn(
-                        provider.as_ref(),
-                        &model,
-                        memory.as_ref(),
-                        &user_msg,
-                        &assistant_resp,
-                    )
-                    .await
-                    {
-                        tracing::debug!("Memory consolidation skipped: {e}");
-                    }
-                });
-            }
+            // Memory consolidation removed — memory is now an explicit model action
+            // through remember/recall tools backed by MarkdownMemory.
 
             println!(
                 "  🤖 Reply ({}ms): {}",

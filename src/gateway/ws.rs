@@ -464,28 +464,8 @@ async fn process_chat_message(
                 let _ = backend.append(session_key, &assistant_msg);
             }
 
-            // Fire-and-forget memory consolidation so facts from WS sessions
-            // are extracted to long-term memory (Daily + Core categories).
-            if state.auto_save {
-                let mem = state.mem.clone();
-                let provider = state.provider.clone();
-                let model = state.model.clone();
-                let user_msg = content.to_string();
-                let assistant_resp = response.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = crate::memory::consolidation::consolidate_turn(
-                        provider.as_ref(),
-                        &model,
-                        mem.as_ref(),
-                        &user_msg,
-                        &assistant_resp,
-                    )
-                    .await
-                    {
-                        tracing::debug!("WS memory consolidation skipped: {e}");
-                    }
-                });
-            }
+            // Memory consolidation removed — memory is now an explicit model action
+            // through remember/recall tools backed by MarkdownMemory.
 
             // Send chunk_reset so the client clears any accumulated draft
             // before the authoritative done message.
