@@ -1581,6 +1581,10 @@ mod tests {
             .observer(observer)
             .tool_dispatcher(Box::new(NativeToolDispatcher))
             .workspace_dir(std::path::PathBuf::from("/tmp"))
+            .config(crate::config::AgentConfig {
+                core: "legacy".to_string(),
+                ..crate::config::AgentConfig::default()
+            })
             .classification_config(crate::config::QueryClassificationConfig {
                 enabled: true,
                 rules: vec![crate::config::ClassificationRule {

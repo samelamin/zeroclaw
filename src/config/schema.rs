@@ -1451,7 +1451,7 @@ fn default_agent_max_tool_iterations() -> usize {
 }
 
 fn default_agent_core() -> String {
-    "legacy".to_string()
+    "minimal".to_string()
 }
 
 fn default_agent_max_history_messages() -> usize {
@@ -16439,9 +16439,9 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
     }
 
     #[test]
-    async fn agent_core_defaults_to_legacy() {
+    async fn agent_core_defaults_to_minimal() {
         let cfg = AgentConfig::default();
-        assert_eq!(cfg.core, "legacy");
+        assert_eq!(cfg.core, "minimal");
     }
 
     #[test]
