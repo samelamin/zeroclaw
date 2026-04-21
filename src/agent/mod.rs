@@ -18,6 +18,7 @@ pub mod prompt;
 pub mod session_state;
 pub mod thinking;
 pub mod tool_execution;
+pub mod tool_result_truncate;
 pub mod tool_executor;
 
 #[cfg(test)]
