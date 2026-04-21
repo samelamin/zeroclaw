@@ -1314,6 +1314,17 @@ pub struct AgentConfig {
     /// Setting to `0` falls back to the safe default of `10`.
     #[serde(default = "default_agent_max_tool_iterations")]
     pub max_tool_iterations: usize,
+    /// Which agent loop path to use.
+    ///
+    /// - `"legacy"` (default): current path, full scaffolding (classifier,
+    ///   memory_loader, context_compressor, microcompactor, loop_detector,
+    ///   history_pruner, personality, thinking).
+    /// - `"minimal"`: scaffolding bypassed; clean tool-use loop with tail-
+    ///   preserving tool-error truncation. Used to earn the promotion.
+    ///
+    /// CLI flag `--core=minimal` overrides this for ad-hoc testing.
+    #[serde(default = "default_agent_core")]
+    pub core: String,
     /// Maximum conversation history messages retained per session. Default: `50`.
     #[serde(default = "default_agent_max_history_messages")]
     pub max_history_messages: usize,
@@ -1439,6 +1450,10 @@ fn default_agent_max_tool_iterations() -> usize {
     10
 }
 
+fn default_agent_core() -> String {
+    "legacy".to_string()
+}
+
 fn default_agent_max_history_messages() -> usize {
     50
 }
@@ -1460,6 +1475,7 @@ impl Default for AgentConfig {
         Self {
             compact_context: true,
             max_tool_iterations: default_agent_max_tool_iterations(),
+            core: default_agent_core(),
             max_history_messages: default_agent_max_history_messages(),
             max_context_tokens: default_agent_max_context_tokens(),
             parallel_tools: false,
@@ -16420,5 +16436,31 @@ auto_approve = ["file_read", "file_write", "file_edit", "memory_recall", "memory
             cfg.resolved_brave_api_key().is_none(),
             "resolved_brave_api_key() must be None when neither field is set"
         );
+    }
+
+    #[test]
+    async fn agent_core_defaults_to_legacy() {
+        let cfg = AgentConfig::default();
+        assert_eq!(cfg.core, "legacy");
+    }
+
+    #[test]
+    async fn agent_core_parses_minimal() {
+        let toml = r#"
+core = "minimal"
+"#;
+        let parsed: AgentConfig = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.core, "minimal");
+    }
+
+    #[test]
+    async fn agent_core_roundtrips_unknown_as_legacy_equivalent() {
+        // Unknown values are passed through verbatim; Agent::turn treats any
+        // non-"minimal" value as legacy. The config layer does not validate.
+        let toml = r#"
+core = "experimental"
+"#;
+        let parsed: AgentConfig = toml::from_str(toml).unwrap();
+        assert_eq!(parsed.core, "experimental");
     }
 }
