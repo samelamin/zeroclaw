@@ -20,11 +20,28 @@ pub struct ToolDescriptions {
     locale: String,
 }
 
-/// TOML structure: `[tools]` table mapping tool name -> description string.
+/// Five-section schema for a single tool description.
+///
+/// Each top-level TOML section (e.g. `[shell]`) holds these fields.
+/// `get_description()` formats them into a single string for the system prompt.
 #[derive(Debug, serde::Deserialize)]
-struct DescriptionFile {
-    #[serde(default)]
-    tools: HashMap<String, String>,
+struct ToolEntry {
+    purpose: String,
+    when: String,
+    example: String,
+    success: String,
+    failure: String,
+}
+
+impl ToolEntry {
+    /// Render all five sections into the one-line description string
+    /// that the system prompt inserts next to the tool name.
+    fn get_description(&self) -> String {
+        format!(
+            "{} {}\nExample:{}\nSuccess: {}\nFailure: {}",
+            self.purpose, self.when, self.example, self.success, self.failure,
+        )
+    }
 }
 
 impl ToolDescriptions {
@@ -141,21 +158,35 @@ pub fn default_search_dirs(workspace_dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Try to load and parse a locale TOML file from the first matching search dir.
+///
+/// Supports the five-section per-tool format: each top-level TOML section
+/// (e.g. `[shell]`) contains `purpose`, `when`, `example`, `success`, and
+/// `failure` fields, which are rendered into a single description string.
 fn load_locale_file(locale: &str, search_dirs: &[PathBuf]) -> HashMap<String, String> {
     let filename = format!("tool_descriptions/{locale}.toml");
 
     for dir in search_dirs {
         let path = dir.join(&filename);
         match std::fs::read_to_string(&path) {
-            Ok(contents) => match toml::from_str::<DescriptionFile>(&contents) {
-                Ok(parsed) => {
-                    debug!(path = %path.display(), keys = parsed.tools.len(), "loaded locale file");
-                    return parsed.tools;
+            Ok(contents) => {
+                match toml::from_str::<HashMap<String, ToolEntry>>(&contents) {
+                    Ok(parsed) => {
+                        let descriptions: HashMap<String, String> = parsed
+                            .into_iter()
+                            .map(|(k, v)| (k, v.get_description()))
+                            .collect();
+                        debug!(
+                            path = %path.display(),
+                            keys = descriptions.len(),
+                            "loaded locale file (five-section format)"
+                        );
+                        return descriptions;
+                    }
+                    Err(e) => {
+                        debug!(path = %path.display(), error = %e, "failed to parse locale file");
+                    }
                 }
-                Err(e) => {
-                    debug!(path = %path.display(), error = %e, "failed to parse locale file");
-                }
-            },
+            }
             Err(_) => {
                 // File not found in this directory, try next.
             }
@@ -181,20 +212,64 @@ mod tests {
         fs::write(td.join(format!("{locale}.toml")), content).unwrap();
     }
 
+    /// Minimal five-section TOML entry for use in tests.
+    fn shell_entry() -> &'static str {
+        r#"[shell]
+purpose = "Execute a shell command in the workspace directory."
+when = "Use for commands no dedicated tool covers. Prefer file_read for files, git_operations for git."
+example = '''
+Input:  {"command": "echo hello"}
+Output: hello
+'''
+success = "Output contains the command stdout with success=true."
+failure = "Returns success=false with 'command blocked by security policy' or the command stderr."
+"#
+    }
+
+    fn file_read_entry() -> &'static str {
+        r#"[file_read]
+purpose = "Read file contents with line numbers."
+when = "Use to inspect a known file. Do not use for searching — use content_search."
+example = '''
+Input:  {"path": "README.md"}
+Output: 1: # MyProject\n[1 lines total]
+'''
+success = "Output contains numbered lines with a line-count summary and success=true."
+failure = "Returns success=false with 'Failed to resolve file path' or 'path not allowed'."
+"#
+    }
+
+    fn shell_entry_zh() -> &'static str {
+        r#"[shell]
+purpose = "在工作区目录中执行 shell 命令。"
+when = "在没有专用工具时使用。读取文件请用 file_read；Git 操作请用 git_operations。"
+example = '''
+Input:  {"command": "echo hello"}
+Output: hello
+'''
+success = "输出包含命令的标准输出，success=true。"
+failure = "当命令被安全策略阻止时，返回 success=false 并附带错误说明。"
+"#
+    }
+
     #[test]
     fn load_english_descriptions() {
         let tmp = tempfile::tempdir().unwrap();
         write_locale_file(
             tmp.path(),
             "en",
-            r#"[tools]
-shell = "Execute a shell command"
-file_read = "Read file contents"
-"#,
+            &format!("{}{}", shell_entry(), file_read_entry()),
         );
         let descs = ToolDescriptions::load("en", &[tmp.path().to_path_buf()]);
-        assert_eq!(descs.get("shell"), Some("Execute a shell command"));
-        assert_eq!(descs.get("file_read"), Some("Read file contents"));
+        // Both tools should be present; the value starts with the purpose sentence.
+        assert!(
+            descs.get("shell").unwrap_or("").contains("Execute a shell command"),
+            "shell description should contain purpose"
+        );
+        assert!(
+            descs.get("file_read").unwrap_or("").contains("Read file contents"),
+            "file_read description should contain purpose"
+        );
         assert_eq!(descs.get("nonexistent"), None);
         assert_eq!(descs.locale(), "en");
     }
@@ -205,40 +280,34 @@ file_read = "Read file contents"
         write_locale_file(
             tmp.path(),
             "en",
-            r#"[tools]
-shell = "Execute a shell command"
-file_read = "Read file contents"
-"#,
+            &format!("{}{}", shell_entry(), file_read_entry()),
         );
-        write_locale_file(
-            tmp.path(),
-            "zh-CN",
-            r#"[tools]
-shell = "在工作区目录中执行 shell 命令"
-"#,
-        );
+        write_locale_file(tmp.path(), "zh-CN", shell_entry_zh());
         let descs = ToolDescriptions::load("zh-CN", &[tmp.path().to_path_buf()]);
-        // Translated key returns Chinese.
-        assert_eq!(descs.get("shell"), Some("在工作区目录中执行 shell 命令"));
-        // Missing key falls back to English.
-        assert_eq!(descs.get("file_read"), Some("Read file contents"));
+        // Translated key contains the Chinese purpose.
+        assert!(
+            descs.get("shell").unwrap_or("").contains("在工作区目录中执行"),
+            "shell should use Chinese translation"
+        );
+        // Missing key falls back to English purpose.
+        assert!(
+            descs.get("file_read").unwrap_or("").contains("Read file contents"),
+            "file_read should fall back to English"
+        );
         assert_eq!(descs.locale(), "zh-CN");
     }
 
     #[test]
     fn fallback_when_locale_file_missing() {
         let tmp = tempfile::tempdir().unwrap();
-        write_locale_file(
-            tmp.path(),
-            "en",
-            r#"[tools]
-shell = "Execute a shell command"
-"#,
-        );
+        write_locale_file(tmp.path(), "en", shell_entry());
         // Request a locale that has no file.
         let descs = ToolDescriptions::load("fr", &[tmp.path().to_path_buf()]);
         // Falls back to English.
-        assert_eq!(descs.get("shell"), Some("Execute a shell command"));
+        assert!(
+            descs.get("shell").unwrap_or("").contains("Execute a shell command"),
+            "shell should fall back to English"
+        );
         assert_eq!(descs.locale(), "fr");
     }
 
@@ -305,14 +374,21 @@ shell = "Execute a shell command"
         write_locale_file(
             tmp.path(),
             "de",
-            r#"[tools]
-shell = "Einen Shell-Befehl im Arbeitsverzeichnis ausführen"
+            r#"[shell]
+purpose = "Einen Shell-Befehl im Arbeitsverzeichnis ausführen."
+when = "Wenn kein dediziertes Tool passt. Für Dateien: file_read; für Git: git_operations."
+example = '''
+Input:  {"command": "echo hallo"}
+Output: hallo
+'''
+success = "Ausgabe enthält die Standardausgabe des Befehls mit success=true."
+failure = "Gibt success=false zurück, wenn der Befehl von der Sicherheitsrichtlinie blockiert wird."
 "#,
         );
         let descs = ToolDescriptions::load("de", &[tmp.path().to_path_buf()]);
-        assert_eq!(
-            descs.get("shell"),
-            Some("Einen Shell-Befehl im Arbeitsverzeichnis ausführen")
+        assert!(
+            descs.get("shell").unwrap_or("").contains("Einen Shell-Befehl im Arbeitsverzeichnis ausführen"),
+            "shell should contain the German purpose sentence"
         );
     }
 }
