@@ -1,5 +1,5 @@
 use super::traits::{Channel, ChannelMessage, SendMessage};
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use async_trait::async_trait;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -465,6 +465,7 @@ impl MattermostChannel {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            real_phone: None,
         })
     }
 }

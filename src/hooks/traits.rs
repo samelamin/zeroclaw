@@ -11,11 +11,34 @@ use crate::tools::traits::ToolResult;
 pub enum HookResult<T> {
     Continue(T),
     Cancel(String),
+    /// Hard deny — cannot be overridden by any privilege escalation or bypass mode.
+    /// Used for security-critical blocks (e.g., prompt injection detected in tool output,
+    /// team budget exceeded). Analogous to Claude Code's exit code 2 enforcement.
+    HardDeny(String),
 }
 
 impl<T> HookResult<T> {
+    /// Returns `true` for both `Cancel` and `HardDeny` (any kind of cancellation).
     pub fn is_cancel(&self) -> bool {
+        matches!(self, HookResult::Cancel(_) | HookResult::HardDeny(_))
+    }
+
+    /// Returns `true` only for the non-overridable `HardDeny` variant.
+    pub fn is_hard_deny(&self) -> bool {
+        matches!(self, HookResult::HardDeny(_))
+    }
+
+    /// Returns `true` only for a soft `Cancel` (not `HardDeny`).
+    pub fn is_soft_cancel(&self) -> bool {
         matches!(self, HookResult::Cancel(_))
+    }
+
+    /// Returns the reason string for `Cancel` or `HardDeny`, or `None` for `Continue`.
+    pub fn reason(&self) -> Option<&str> {
+        match self {
+            HookResult::Cancel(r) | HookResult::HardDeny(r) => Some(r),
+            HookResult::Continue(_) => None,
+        }
     }
 }
 
@@ -135,6 +158,36 @@ mod tests {
         {
             HookResult::Continue((name, _args)) => assert_eq!(name, "shell"),
             HookResult::Cancel(_) => panic!("should not cancel"),
+            HookResult::HardDeny(_) => panic!("should not hard deny"),
         }
+    }
+
+    #[test]
+    fn hook_result_is_hard_deny() {
+        let cont: HookResult<String> = HookResult::Continue("hi".into());
+        assert!(!cont.is_hard_deny());
+        assert!(!cont.is_soft_cancel());
+
+        let cancel: HookResult<String> = HookResult::Cancel("soft".into());
+        assert!(!cancel.is_hard_deny());
+        assert!(cancel.is_soft_cancel());
+        assert!(cancel.is_cancel());
+
+        let hard: HookResult<String> = HookResult::HardDeny("security violation".into());
+        assert!(hard.is_hard_deny());
+        assert!(hard.is_cancel()); // HardDeny is also a cancellation
+        assert!(!hard.is_soft_cancel());
+    }
+
+    #[test]
+    fn hook_result_reason() {
+        let cont: HookResult<String> = HookResult::Continue("hi".into());
+        assert_eq!(cont.reason(), None);
+
+        let cancel: HookResult<String> = HookResult::Cancel("soft block".into());
+        assert_eq!(cancel.reason(), Some("soft block"));
+
+        let hard: HookResult<String> = HookResult::HardDeny("budget exceeded".into());
+        assert_eq!(hard.reason(), Some("budget exceeded"));
     }
 }

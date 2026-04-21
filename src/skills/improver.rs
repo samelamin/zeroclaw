@@ -5,7 +5,7 @@
 // in `src/skills/mod.rs`.
 
 use crate::config::SkillImprovementConfig;
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -115,6 +115,50 @@ impl SkillImprover {
         self.cooldowns.insert(slug.to_string(), Instant::now());
 
         Ok(Some(slug.to_string()))
+    }
+
+    /// Refine a skill after successful use by consulting the LLM.
+    ///
+    /// Returns `Ok(Some(slug))` if the skill was refined, `Ok(None)` if skipped
+    /// (not eligible, LLM proposed no change, or parsing failed).
+    pub async fn refine_after_use(
+        &mut self,
+        slug: &str,
+        execution_trace: &str,
+        provider: &dyn crate::providers::traits::Provider,
+        model: &str,
+    ) -> Result<Option<String>> {
+        if !self.should_improve_skill(slug) {
+            return Ok(None);
+        }
+
+        let toml_path = self.skills_dir().join(slug).join("SKILL.toml");
+        let current_content = tokio::fs::read_to_string(&toml_path)
+            .await
+            .with_context(|| format!("Failed to read {}", toml_path.display()))?;
+
+        let prompt = crate::skills::refinement::build_refinement_prompt(
+            slug,
+            &current_content,
+            execution_trace,
+        );
+
+        let system_message = "You are a skill-improvement assistant. \
+            Analyze skill definitions and suggest targeted improvements based on execution evidence. \
+            Respond only with a JSON object as instructed.";
+
+        let raw = provider
+            .chat_with_system(Some(system_message), &prompt, model, 0.2)
+            .await
+            .with_context(|| "LLM call failed during skill refinement")?;
+
+        let Some((improved_content, reason)) =
+            crate::skills::refinement::parse_refinement_response(&raw)
+        else {
+            return Ok(None);
+        };
+
+        self.improve_skill(slug, &improved_content, &reason).await
     }
 
     fn skills_dir(&self) -> PathBuf {

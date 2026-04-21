@@ -1,9 +1,9 @@
+use super::Provider;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
-use super::Provider;
 use async_trait::async_trait;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -912,6 +912,7 @@ impl Provider for ReliableProvider {
                     let req = ChatRequest {
                         messages: &effective_messages,
                         tools: request.tools,
+                        thinking_level: request.thinking_level,
                     };
                     match provider.chat(req, current_model, temperature).await {
                         Ok(resp) => {
@@ -1098,6 +1099,7 @@ impl Provider for ReliableProvider {
             let req = ChatRequest {
                 messages: request.messages,
                 tools: request.tools,
+                thinking_level: request.thinking_level,
             };
             let stream = provider.stream_chat(req, &current_model, temperature, options);
             let (tx, rx) = tokio::sync::mpsc::channel::<StreamResult<StreamEvent>>(100);
@@ -1152,7 +1154,7 @@ impl Provider for ReliableProvider {
 
             // Try the first model in the chain for streaming
             let current_model = match self.model_chain(model).first() {
-                Some(m) => m.to_string(),
+                Some(m) => (*m).to_string(),
                 None => model.to_string(),
             };
 
@@ -1219,7 +1221,7 @@ impl Provider for ReliableProvider {
             let provider_clone = provider_name.clone();
 
             let current_model = match self.model_chain(model).first() {
-                Some(m) => m.to_string(),
+                Some(m) => (*m).to_string(),
                 None => model.to_string(),
             };
 
@@ -2111,6 +2113,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
         };
         let result = provider.chat(request, "test-model", 0.0).await.unwrap();
 
@@ -2147,6 +2150,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
         };
         let result = provider.chat(request, "test-model", 0.0).await.unwrap();
 
@@ -2218,6 +2222,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
         };
         let err = provider
             .chat(request, "test", 0.0)
@@ -2334,6 +2339,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
         };
         let result = provider.chat(request, "claude-opus", 0.0).await.unwrap();
         assert_eq!(result.text.as_deref(), Some("ok from sonnet"));
@@ -2382,6 +2388,7 @@ mod tests {
         let request = ChatRequest {
             messages: &messages,
             tools: None,
+            thinking_level: None,
         };
         let result = provider.chat(request, "test", 0.0).await.unwrap();
         assert_eq!(result.text.as_deref(), Some("from fallback"));
@@ -2433,7 +2440,7 @@ mod tests {
         assert_eq!(messages[0].role, "system");
         // Remaining messages should be the newer ones
         assert_eq!(messages.len(), 4); // system + 3 remaining non-system
-                                       // The last message should still be the most recent user message
+        // The last message should still be the most recent user message
         assert_eq!(messages.last().unwrap().content, "msg3");
     }
 
@@ -2733,6 +2740,7 @@ mod tests {
             ChatRequest {
                 messages: &messages,
                 tools: Some(&tools),
+                thinking_level: None,
             },
             "model",
             0.0,
@@ -2774,6 +2782,7 @@ mod tests {
             ChatRequest {
                 messages: &messages,
                 tools: Some(&tools),
+                thinking_level: None,
             },
             "model",
             0.0,

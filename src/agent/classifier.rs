@@ -65,6 +65,74 @@ pub fn classify_with_decision(
     None
 }
 
+/// Estimate message complexity on a scale of 0-100.
+/// Used for dynamic model routing — simple tasks go to cheap models.
+pub fn estimate_complexity(message: &str) -> u32 {
+    let mut score: u32 = 0;
+    let len = message.len();
+
+    // Length-based: longer messages tend to be more complex
+    if len > 2000 {
+        score += 30;
+    } else if len > 500 {
+        score += 15;
+    } else if len > 100 {
+        score += 5;
+    }
+
+    let lower = message.to_lowercase();
+
+    // Code-related keywords suggest higher complexity
+    let complex_keywords = [
+        "refactor",
+        "architect",
+        "design",
+        "debug",
+        "optimize",
+        "implement",
+        "migrate",
+        "security",
+        "performance",
+        "concurrent",
+    ];
+    for kw in &complex_keywords {
+        if lower.contains(kw) {
+            score += 10;
+        }
+    }
+
+    // Simple task keywords
+    let simple_keywords = [
+        "list",
+        "show",
+        "what is",
+        "how to",
+        "explain",
+        "summarize",
+        "read",
+        "find",
+        "search",
+        "check",
+    ];
+    for kw in &simple_keywords {
+        if lower.contains(kw) {
+            score = score.saturating_sub(5);
+        }
+    }
+
+    // Multiple questions or requirements increase complexity
+    let question_marks =
+        u32::try_from(message.chars().filter(|c| *c == '?').count()).unwrap_or(u32::MAX);
+    score += question_marks.min(3) * 5;
+
+    // Code blocks suggest complexity
+    if message.contains("```") {
+        score += 15;
+    }
+
+    score.min(100)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -212,5 +280,32 @@ mod tests {
             .expect("classification decision expected");
         assert_eq!(decision.hint, "code");
         assert_eq!(decision.priority, 10);
+    }
+
+    #[test]
+    fn complexity_simple_question() {
+        assert!(estimate_complexity("what is rust?") < 20);
+    }
+
+    #[test]
+    fn complexity_complex_task() {
+        // "refactor" (+10) + "concurrent" (+10) = 20
+        // Adding more complex keywords to push over 40
+        assert!(
+            estimate_complexity(
+                "refactor and optimize the authentication system to use async concurrent handlers, debug performance issues, and migrate to the new design"
+            ) > 40
+        );
+    }
+
+    #[test]
+    fn complexity_caps_at_100() {
+        // Length > 2000 (+30) plus 5 complex keywords (+50) plus code block (+15) = 95
+        // Add question marks to push to 100
+        let long_complex = format!(
+            "refactor architect design debug optimize {}```code```???",
+            "x ".repeat(1000)
+        );
+        assert_eq!(estimate_complexity(&long_complex), 100);
     }
 }

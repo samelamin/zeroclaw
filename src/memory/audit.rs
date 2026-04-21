@@ -8,7 +8,7 @@ use super::traits::{Memory, MemoryCategory, MemoryEntry, ProceduralMessage};
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -55,6 +55,8 @@ impl<M: Memory> AuditedMemory<M> {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous = NORMAL;
+             PRAGMA cache_size = -4000;
+             PRAGMA mmap_size = 16777216;
              CREATE TABLE IF NOT EXISTS memory_audit (
                  id INTEGER PRIMARY KEY AUTOINCREMENT,
                  operation TEXT NOT NULL,

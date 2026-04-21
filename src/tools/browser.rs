@@ -10,7 +10,7 @@ use crate::security::SecurityPolicy;
 use anyhow::Context;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 use std::net::ToSocketAddrs;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -57,6 +57,47 @@ impl Default for ComputerUseConfig {
     }
 }
 
+/// Playwright-MCP sidecar settings (local copy of schema struct; api_key is redacted in Debug).
+#[derive(Clone)]
+pub struct PlaywrightMcpConfig {
+    pub endpoint: String,
+    pub api_key: Option<String>,
+    pub timeout_ms: u64,
+    pub allow_remote_endpoint: bool,
+    pub browser: String,
+    pub user_agent: Option<String>,
+    pub locale: Option<String>,
+    pub timezone_id: Option<String>,
+    pub viewport: Option<String>,
+}
+
+impl std::fmt::Debug for PlaywrightMcpConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PlaywrightMcpConfig")
+            .field("endpoint", &self.endpoint)
+            .field("timeout_ms", &self.timeout_ms)
+            .field("allow_remote_endpoint", &self.allow_remote_endpoint)
+            .field("browser", &self.browser)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for PlaywrightMcpConfig {
+    fn default() -> Self {
+        Self {
+            endpoint: "http://127.0.0.1:3000".into(),
+            api_key: None,
+            timeout_ms: 30_000,
+            allow_remote_endpoint: false,
+            browser: "chromium".into(),
+            user_agent: None,
+            locale: None,
+            timezone_id: None,
+            viewport: None,
+        }
+    }
+}
+
 /// Browser automation tool using pluggable backends.
 pub struct BrowserTool {
     security: Arc<SecurityPolicy>,
@@ -67,6 +108,18 @@ pub struct BrowserTool {
     native_webdriver_url: String,
     native_chrome_path: Option<String>,
     computer_use: ComputerUseConfig,
+    pub playwright_mcp: PlaywrightMcpConfig,
+    /// Persistent MCP session ID shared across browser tool calls within an agent turn.
+    /// Storing it here (behind a Mutex) lets successive browser actions reuse the same
+    /// Playwright browser session so that navigation, form state, and cookies are
+    /// preserved between actions.
+    playwright_mcp_session_id: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Last successfully opened page URL for restoring context after MCP session resets.
+    playwright_mcp_last_url: Arc<tokio::sync::Mutex<Option<String>>>,
+    /// Safe state-setting tool calls that can be replayed after MCP session resets.
+    playwright_mcp_replayable_actions: Arc<tokio::sync::Mutex<Vec<(String, Value)>>>,
+    /// Serialized cookies captured from the current browser session so auth survives resets.
+    playwright_mcp_cookies_json: Arc<tokio::sync::Mutex<Option<String>>>,
     #[cfg(feature = "browser-native")]
     native_state: tokio::sync::Mutex<native_backend::NativeBrowserState>,
 }
@@ -76,6 +129,7 @@ enum BrowserBackendKind {
     AgentBrowser,
     RustNative,
     ComputerUse,
+    PlaywrightMcp,
     Auto,
 }
 
@@ -84,6 +138,7 @@ enum ResolvedBackend {
     AgentBrowser,
     RustNative,
     ComputerUse,
+    PlaywrightMcp,
 }
 
 impl BrowserBackendKind {
@@ -93,9 +148,10 @@ impl BrowserBackendKind {
             "agent_browser" | "agentbrowser" => Ok(Self::AgentBrowser),
             "rust_native" | "native" => Ok(Self::RustNative),
             "computer_use" | "computeruse" => Ok(Self::ComputerUse),
+            "playwright_mcp" | "playwrightmcp" => Ok(Self::PlaywrightMcp),
             "auto" => Ok(Self::Auto),
             _ => anyhow::bail!(
-                "Unsupported browser backend '{raw}'. Use 'agent_browser', 'rust_native', 'computer_use', or 'auto'"
+                "Unsupported browser backend '{raw}'. Use 'agent_browser', 'rust_native', 'computer_use', 'playwright_mcp', or 'auto'"
             ),
         }
     }
@@ -105,6 +161,7 @@ impl BrowserBackendKind {
             Self::AgentBrowser => "agent_browser",
             Self::RustNative => "rust_native",
             Self::ComputerUse => "computer_use",
+            Self::PlaywrightMcp => "playwright_mcp",
             Self::Auto => "auto",
         }
     }
@@ -211,6 +268,7 @@ impl BrowserTool {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            PlaywrightMcpConfig::default(),
         )
     }
 
@@ -224,6 +282,7 @@ impl BrowserTool {
         native_webdriver_url: String,
         native_chrome_path: Option<String>,
         computer_use: ComputerUseConfig,
+        playwright_mcp: PlaywrightMcpConfig,
     ) -> Self {
         Self {
             security,
@@ -234,6 +293,11 @@ impl BrowserTool {
             native_webdriver_url,
             native_chrome_path,
             computer_use,
+            playwright_mcp,
+            playwright_mcp_session_id: Arc::new(tokio::sync::Mutex::new(None)),
+            playwright_mcp_last_url: Arc::new(tokio::sync::Mutex::new(None)),
+            playwright_mcp_replayable_actions: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            playwright_mcp_cookies_json: Arc::new(tokio::sync::Mutex::new(None)),
             #[cfg(feature = "browser-native")]
             native_state: tokio::sync::Mutex::new(native_backend::NativeBrowserState::default()),
         }
@@ -330,6 +394,47 @@ impl BrowserTool {
         Ok(endpoint_reachable(&endpoint, Duration::from_millis(500)))
     }
 
+    pub fn playwright_mcp_endpoint_url(&self) -> anyhow::Result<reqwest::Url> {
+        if self.playwright_mcp.timeout_ms == 0 {
+            anyhow::bail!("browser.playwright_mcp.timeout_ms must be > 0");
+        }
+        let endpoint = self.playwright_mcp.endpoint.trim();
+        if endpoint.is_empty() {
+            anyhow::bail!("browser.playwright_mcp.endpoint cannot be empty");
+        }
+        let parsed = reqwest::Url::parse(endpoint).map_err(|_| {
+            anyhow::anyhow!(
+                "Invalid browser.playwright_mcp.endpoint: '{endpoint}'. Expected http(s) URL"
+            )
+        })?;
+        let scheme = parsed.scheme();
+        if scheme != "http" && scheme != "https" {
+            anyhow::bail!("browser.playwright_mcp.endpoint must use http:// or https://");
+        }
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("browser.playwright_mcp.endpoint must include host"))?;
+        let host_is_private = is_private_host(host);
+        if !self.playwright_mcp.allow_remote_endpoint && !host_is_private {
+            anyhow::bail!(
+                "browser.playwright_mcp.endpoint host '{host}' is public. \
+                 Set browser.playwright_mcp.allow_remote_endpoint=true to allow it"
+            );
+        }
+        if self.playwright_mcp.allow_remote_endpoint && !host_is_private && scheme != "https" {
+            anyhow::bail!(
+                "browser.playwright_mcp.endpoint must use https:// when \
+                 allow_remote_endpoint=true and host is public"
+            );
+        }
+        Ok(parsed)
+    }
+
+    fn playwright_mcp_available(&self) -> anyhow::Result<bool> {
+        let endpoint = self.playwright_mcp_endpoint_url()?;
+        Ok(endpoint_reachable(&endpoint, Duration::from_millis(500)))
+    }
+
     async fn resolve_backend(&self) -> anyhow::Result<ResolvedBackend> {
         let configured = self.configured_backend()?;
 
@@ -370,6 +475,15 @@ impl BrowserTool {
                 }
                 Ok(ResolvedBackend::ComputerUse)
             }
+            BrowserBackendKind::PlaywrightMcp => {
+                // Explicit Playwright-MCP configuration should not be blocked by
+                // a best-effort startup probe. Container DNS and modern MCP
+                // sidecars can fail a shallow liveness check even though real
+                // tool calls succeed. Validate the endpoint shape/security here
+                // and let the first action surface any true runtime error.
+                self.playwright_mcp_endpoint_url()?;
+                Ok(ResolvedBackend::PlaywrightMcp)
+            }
             BrowserBackendKind::Auto => {
                 if Self::rust_native_compiled() && self.rust_native_available() {
                     return Ok(ResolvedBackend::RustNative);
@@ -383,6 +497,12 @@ impl BrowserTool {
                     Ok(false) => None,
                     Err(err) => Some(err.to_string()),
                 };
+
+                // Try playwright_mcp as fallback
+                match self.playwright_mcp_available() {
+                    Ok(true) => return Ok(ResolvedBackend::PlaywrightMcp),
+                    Ok(false) | Err(_) => {}
+                }
 
                 if Self::rust_native_compiled() {
                     if let Some(err) = computer_use_err {
@@ -872,6 +992,51 @@ impl BrowserTool {
         })
     }
 
+    async fn execute_playwright_mcp_action(
+        &self,
+        action: BrowserAction,
+    ) -> anyhow::Result<ToolResult> {
+        let endpoint = self
+            .playwright_mcp_endpoint_url()?
+            .as_str()
+            .trim_end_matches('/')
+            .to_string();
+        let (tool_name, arguments) = crate::tools::playwright_mcp::action_to_mcp_tool(action)?;
+        let client = crate::tools::playwright_mcp::PlaywrightMcpClient::new(
+            endpoint,
+            self.playwright_mcp.api_key.clone(),
+            self.playwright_mcp.timeout_ms,
+            Arc::clone(&self.playwright_mcp_session_id),
+            Arc::clone(&self.playwright_mcp_last_url),
+            Arc::clone(&self.playwright_mcp_replayable_actions),
+            Arc::clone(&self.playwright_mcp_cookies_json),
+        );
+        match client.call_tool_with_retry(tool_name, arguments).await {
+            Ok(value) => Ok(ToolResult {
+                success: true,
+                output: if value.is_null() {
+                    String::new()
+                } else {
+                    // Extract text from MCP content array if present
+                    if let Some(arr) = value.get("content").and_then(|c| c.as_array()) {
+                        arr.iter()
+                            .filter_map(|item| item.get("text").and_then(|t| t.as_str()))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    } else {
+                        serde_json::to_string_pretty(&value).unwrap_or_default()
+                    }
+                },
+                error: None,
+            }),
+            Err(e) => Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(e.to_string()),
+            }),
+        }
+    }
+
     async fn execute_action(
         &self,
         action: BrowserAction,
@@ -880,6 +1045,7 @@ impl BrowserTool {
         match backend {
             ResolvedBackend::AgentBrowser => self.execute_agent_browser_action(action).await,
             ResolvedBackend::RustNative => self.execute_rust_native_action(action).await,
+            ResolvedBackend::PlaywrightMcp => self.execute_playwright_mcp_action(action).await,
             ResolvedBackend::ComputerUse => anyhow::bail!(
                 "Internal error: computer_use backend must be handled before BrowserAction parsing"
             ),
@@ -1115,7 +1281,7 @@ mod native_backend {
     use fantoccini::actions::{InputSource, MouseActions, PointerAction};
     use fantoccini::key::Key;
     use fantoccini::{Client, ClientBuilder, Locator};
-    use serde_json::{json, Map, Value};
+    use serde_json::{Map, Value, json};
     use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Duration;
 
@@ -1796,6 +1962,14 @@ mod native_backend {
 // ── Action parsing ──────────────────────────────────────────────
 
 /// Parse a JSON `args` object into a typed `BrowserAction`.
+fn read_browser_selector(args: &Value, action_name: &str) -> anyhow::Result<String> {
+    args.get("selector")
+        .or_else(|| args.get("ref"))
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for {action_name}"))
+}
+
 fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<BrowserAction> {
     match action_str {
         "open" => {
@@ -1820,49 +1994,41 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
                 .map(|d| u32::try_from(d).unwrap_or(u32::MAX)),
         }),
         "click" => {
-            let selector = args
-                .get("selector")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for click"))?;
+            let selector = read_browser_selector(args, "click")?;
             Ok(BrowserAction::Click {
-                selector: selector.into(),
+                selector,
             })
         }
         "fill" => {
-            let selector = args
-                .get("selector")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for fill"))?;
+            let selector = read_browser_selector(args, "fill")?;
+            // Accept both "value" and "text" — some LLMs (e.g. MiniMax) use "text" here
             let value = args
                 .get("value")
+                .or_else(|| args.get("text"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing 'value' for fill"))?;
             Ok(BrowserAction::Fill {
-                selector: selector.into(),
+                selector,
                 value: value.into(),
             })
         }
         "type" => {
-            let selector = args
-                .get("selector")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for type"))?;
+            let selector = read_browser_selector(args, "type")?;
+            // Accept both "text" and "value" — some LLMs (e.g. MiniMax) use "value" here
             let text = args
                 .get("text")
+                .or_else(|| args.get("value"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing 'text' for type"))?;
             Ok(BrowserAction::Type {
-                selector: selector.into(),
+                selector,
                 text: text.into(),
             })
         }
         "get_text" => {
-            let selector = args
-                .get("selector")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for get_text"))?;
+            let selector = read_browser_selector(args, "get_text")?;
             Ok(BrowserAction::GetText {
-                selector: selector.into(),
+                selector,
             })
         }
         "get_title" => Ok(BrowserAction::GetTitle),
@@ -1890,12 +2056,9 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             Ok(BrowserAction::Press { key: key.into() })
         }
         "hover" => {
-            let selector = args
-                .get("selector")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for hover"))?;
+            let selector = read_browser_selector(args, "hover")?;
             Ok(BrowserAction::Hover {
-                selector: selector.into(),
+                selector,
             })
         }
         "scroll" => {
@@ -1912,12 +2075,9 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
             })
         }
         "is_visible" => {
-            let selector = args
-                .get("selector")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow::anyhow!("Missing 'selector' for is_visible"))?;
+            let selector = read_browser_selector(args, "is_visible")?;
             Ok(BrowserAction::IsVisible {
-                selector: selector.into(),
+                selector,
             })
         }
         "close" => Ok(BrowserAction::Close),
@@ -1928,10 +2088,13 @@ fn parse_browser_action(action_str: &str, args: &Value) -> anyhow::Result<Browse
                 .ok_or_else(|| anyhow::anyhow!("Missing 'by' for find"))?;
             let value = args
                 .get("value")
+                .or_else(|| args.get("selector"))
+                .or_else(|| args.get("text"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing 'value' for find"))?;
             let action = args
                 .get("find_action")
+                .or_else(|| args.get("action"))
                 .and_then(|v| v.as_str())
                 .ok_or_else(|| anyhow::anyhow!("Missing 'find_action' for find"))?;
             Ok(BrowserAction::Find {
@@ -1990,6 +2153,7 @@ fn backend_name(backend: ResolvedBackend) -> &'static str {
         ResolvedBackend::AgentBrowser => "agent_browser",
         ResolvedBackend::RustNative => "rust_native",
         ResolvedBackend::ComputerUse => "computer_use",
+        ResolvedBackend::PlaywrightMcp => "playwright_mcp",
     }
 }
 
@@ -2082,6 +2246,12 @@ fn is_private_host(host: &str) -> bool {
         .unwrap_or(host);
 
     if bare == "localhost" || bare.ends_with(".localhost") {
+        return true;
+    }
+
+    // Single-label hostnames such as Docker Compose service names resolve only
+    // within local/container network scopes rather than public DNS.
+    if !bare.is_empty() && !bare.contains('.') {
         return true;
     }
 
@@ -2239,6 +2409,7 @@ mod tests {
         assert!(is_private_host("localhost"));
         assert!(is_private_host("app.localhost"));
         assert!(is_private_host("printer.local"));
+        assert!(is_private_host("playwright-mcp"));
         assert!(is_private_host("127.0.0.1"));
         assert!(is_private_host("192.168.1.1"));
         assert!(is_private_host("10.0.0.1"));
@@ -2290,9 +2461,10 @@ mod tests {
         let tool = BrowserTool::new(security, vec!["*".into()], None);
         assert!(tool.validate_url("https://[::1]/").is_err());
         assert!(tool.validate_url("https://[::ffff:127.0.0.1]/").is_err());
-        assert!(tool
-            .validate_url("https://[::ffff:10.0.0.1]:8080/")
-            .is_err());
+        assert!(
+            tool.validate_url("https://[::ffff:10.0.0.1]:8080/")
+                .is_err()
+        );
     }
 
     #[test]
@@ -2365,6 +2537,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            PlaywrightMcpConfig::default(),
         );
         assert_eq!(tool.configured_backend().unwrap(), BrowserBackendKind::Auto);
     }
@@ -2381,6 +2554,7 @@ mod tests {
             "http://127.0.0.1:9515".into(),
             None,
             ComputerUseConfig::default(),
+            PlaywrightMcpConfig::default(),
         );
         assert_eq!(
             tool.configured_backend().unwrap(),
@@ -2403,6 +2577,7 @@ mod tests {
                 endpoint: "http://computer-use.example.com/v1/actions".into(),
                 ..ComputerUseConfig::default()
             },
+            PlaywrightMcpConfig::default(),
         );
 
         assert!(tool.computer_use_endpoint_url().is_err());
@@ -2424,6 +2599,7 @@ mod tests {
                 allow_remote_endpoint: true,
                 ..ComputerUseConfig::default()
             },
+            PlaywrightMcpConfig::default(),
         );
 
         assert!(tool.computer_use_endpoint_url().is_ok());
@@ -2445,17 +2621,21 @@ mod tests {
                 max_coordinate_y: Some(100),
                 ..ComputerUseConfig::default()
             },
+            PlaywrightMcpConfig::default(),
         );
 
-        assert!(tool
-            .validate_coordinate("x", 50, tool.computer_use.max_coordinate_x)
-            .is_ok());
-        assert!(tool
-            .validate_coordinate("x", 101, tool.computer_use.max_coordinate_x)
-            .is_err());
-        assert!(tool
-            .validate_coordinate("y", -1, tool.computer_use.max_coordinate_y)
-            .is_err());
+        assert!(
+            tool.validate_coordinate("x", 50, tool.computer_use.max_coordinate_x)
+                .is_ok()
+        );
+        assert!(
+            tool.validate_coordinate("x", 101, tool.computer_use.max_coordinate_x)
+                .is_err()
+        );
+        assert!(
+            tool.validate_coordinate("y", -1, tool.computer_use.max_coordinate_y)
+                .is_err()
+        );
     }
 
     #[test]
@@ -2648,6 +2828,148 @@ mod tests {
             assert_eq!(cmd, "agent-browser.cmd");
         } else {
             assert_eq!(cmd, "agent-browser");
+        }
+    }
+
+    #[test]
+    fn playwright_mcp_backend_kind_parses_all_aliases() {
+        assert_eq!(
+            BrowserBackendKind::parse("playwright_mcp").unwrap(),
+            BrowserBackendKind::PlaywrightMcp
+        );
+        assert_eq!(
+            BrowserBackendKind::parse("playwright-mcp").unwrap(),
+            BrowserBackendKind::PlaywrightMcp
+        );
+    }
+
+    #[test]
+    fn playwright_mcp_endpoint_rejects_public_host_by_default() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "playwright_mcp".into(),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            PlaywrightMcpConfig {
+                endpoint: "http://playwright.external.example.com".into(),
+                ..PlaywrightMcpConfig::default()
+            },
+        );
+        assert!(tool.playwright_mcp_endpoint_url().is_err());
+    }
+
+    #[test]
+    fn playwright_mcp_endpoint_accepts_localhost() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "playwright_mcp".into(),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            PlaywrightMcpConfig::default(), // 127.0.0.1:3000
+        );
+        assert!(tool.playwright_mcp_endpoint_url().is_ok());
+    }
+
+    #[test]
+    fn playwright_mcp_endpoint_accepts_docker_service_hostname() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "playwright_mcp".into(),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            PlaywrightMcpConfig {
+                endpoint: "http://playwright-mcp:3000".into(),
+                ..PlaywrightMcpConfig::default()
+            },
+        );
+        assert!(tool.playwright_mcp_endpoint_url().is_ok());
+    }
+
+    #[tokio::test]
+    async fn explicit_playwright_mcp_backend_skips_preflight_reachability_probe() {
+        let security = Arc::new(SecurityPolicy::default());
+        let tool = BrowserTool::new_with_backend(
+            security,
+            vec!["*".into()],
+            None,
+            "playwright_mcp".into(),
+            true,
+            "http://127.0.0.1:9515".into(),
+            None,
+            ComputerUseConfig::default(),
+            PlaywrightMcpConfig {
+                endpoint: "http://playwright-mcp:3000".into(),
+                ..PlaywrightMcpConfig::default()
+            },
+        );
+
+        assert_eq!(
+            tool.resolve_backend().await.unwrap(),
+            ResolvedBackend::PlaywrightMcp
+        );
+    }
+
+    #[test]
+    fn parse_fill_accepts_ref_alias_from_model_output() {
+        let action = parse_browser_action(
+            "fill",
+            &json!({
+                "ref": "e30",
+                "value": "admin",
+            }),
+        )
+        .unwrap();
+
+        match action {
+            BrowserAction::Fill { selector, value } => {
+                assert_eq!(selector, "e30");
+                assert_eq!(value, "admin");
+            }
+            other => panic!("expected fill action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_find_accepts_selector_alias_for_locator_value() {
+        let action = parse_browser_action(
+            "find",
+            &json!({
+                "by": "label",
+                "find_action": "fill",
+                "selector": "Username",
+                "fill_value": "admin",
+            }),
+        )
+        .unwrap();
+
+        match action {
+            BrowserAction::Find {
+                by,
+                value,
+                action,
+                fill_value,
+            } => {
+                assert_eq!(by, "label");
+                assert_eq!(value, "Username");
+                assert_eq!(action, "fill");
+                assert_eq!(fill_value.as_deref(), Some("admin"));
+            }
+            other => panic!("expected find action, got {other:?}"),
         }
     }
 }

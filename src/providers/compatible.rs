@@ -9,10 +9,10 @@ use crate::providers::traits::{
     ToolCall as ProviderToolCall,
 };
 use async_trait::async_trait;
-use futures_util::{stream, StreamExt};
+use futures_util::{StreamExt, stream};
 use reqwest::{
-    header::{HeaderMap, HeaderValue, USER_AGENT},
     Client,
+    header::{HeaderMap, HeaderValue, USER_AGENT},
 };
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +59,59 @@ pub enum AuthStyle {
     XApiKey,
     /// Custom header name
     Custom(String),
+    /// Zhipu/GLM JWT auth: the credential is `id.secret`, and a short-lived
+    /// JWT (HMAC-SHA256, 3.5 min expiry) is generated per request.
+    /// Used by Z.AI and GLM providers.
+    ZhipuJwt,
+}
+
+/// Generate a Zhipu JWT from an `id.secret` API key.
+/// Returns `Authorization: Bearer <jwt>` value. Token is valid for 3.5 minutes.
+fn zhipu_jwt_bearer(credential: &str) -> Result<String, String> {
+    let (id, secret) = credential
+        .split_once('.')
+        .ok_or_else(|| "Zhipu API key must be in 'id.secret' format".to_string())?;
+
+    #[allow(clippy::cast_possible_truncation)] // millis won't exceed u64 until year 584 million
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis() as u64;
+    let exp_ms = now_ms + 210_000; // 3.5 minutes
+
+    // Header: {"alg":"HS256","typ":"JWT","sign_type":"SIGN"}
+    let header_b64 = base64url_no_pad(br#"{"alg":"HS256","typ":"JWT","sign_type":"SIGN"}"#);
+    let payload = format!(r#"{{"api_key":"{id}","exp":{exp_ms},"timestamp":{now_ms}}}"#);
+    let payload_b64 = base64url_no_pad(payload.as_bytes());
+
+    let signing_input = format!("{header_b64}.{payload_b64}");
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    let sig = ring::hmac::sign(&key, signing_input.as_bytes());
+    let sig_b64 = base64url_no_pad(sig.as_ref());
+
+    Ok(format!("Bearer {signing_input}.{sig_b64}"))
+}
+
+fn base64url_no_pad(data: &[u8]) -> String {
+    use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
+    URL_SAFE_NO_PAD.encode(data)
+}
+
+/// Apply auth to a request builder (usable from spawned tasks without `&self`).
+fn apply_auth_to_request(
+    req: reqwest::RequestBuilder,
+    style: &AuthStyle,
+    credential: &str,
+) -> reqwest::RequestBuilder {
+    match style {
+        AuthStyle::Bearer => req.header("Authorization", format!("Bearer {credential}")),
+        AuthStyle::XApiKey => req.header("x-api-key", credential),
+        AuthStyle::Custom(header) => req.header(header, credential),
+        AuthStyle::ZhipuJwt => match zhipu_jwt_bearer(credential) {
+            Ok(val) => req.header("Authorization", val),
+            Err(_) => req.header("Authorization", format!("Bearer {credential}")),
+        },
+    }
 }
 
 impl OpenAiCompatibleProvider {
@@ -393,12 +446,13 @@ impl OpenAiCompatibleProvider {
         tools
             .iter()
             .map(|tool| {
+                let params = crate::tools::SchemaCleanr::clean_for_openai(tool.parameters.clone());
                 serde_json::json!({
                     "type": "function",
                     "function": {
                         "name": tool.name,
                         "description": tool.description,
-                        "parameters": tool.parameters
+                        "parameters": params
                     }
                 })
             })
@@ -478,28 +532,46 @@ struct Choice {
     message: ResponseMessage,
 }
 
-/// Remove `<think>...</think>` blocks from model output.
-/// Some reasoning models (e.g. MiniMax) embed their chain-of-thought inline
-/// in the `content` field rather than a separate `reasoning_content` field.
-/// The resulting `<think>` tags must be stripped before returning to the user.
-fn strip_think_tags(s: &str) -> String {
-    let mut result = String::with_capacity(s.len());
-    let mut rest = s;
+/// Extract visible text and reasoning content from a model response.
+/// Models like MiniMax embed chain-of-thought in `<think>...</think>` blocks
+/// inline in the `content` field rather than a separate `reasoning_content` field.
+/// Returns `(visible_text, Option<reasoning_content>)`.
+fn extract_content_and_reasoning(raw: &str) -> (String, Option<String>) {
+    let mut visible = String::with_capacity(raw.len());
+    let mut reasoning = String::new();
+    let mut rest = raw;
     loop {
         if let Some(start) = rest.find("<think>") {
-            result.push_str(&rest[..start]);
-            if let Some(end) = rest[start..].find("</think>") {
-                rest = &rest[start + end + "</think>".len()..];
+            visible.push_str(&rest[..start]);
+            let after_open = &rest[start + "<think>".len()..];
+            if let Some(end) = after_open.find("</think>") {
+                reasoning.push_str(&after_open[..end]);
+                reasoning.push('\n');
+                rest = &after_open[end + "</think>".len()..];
             } else {
-                // Unclosed tag: drop the rest to avoid leaking partial reasoning.
+                // Unclosed tag: capture remaining as reasoning, drop from visible.
+                reasoning.push_str(after_open);
                 break;
             }
         } else {
-            result.push_str(rest);
+            visible.push_str(rest);
             break;
         }
     }
-    result.trim().to_string()
+    let visible = visible.trim().to_string();
+    let reasoning = reasoning.trim().to_string();
+    let reasoning = if reasoning.is_empty() {
+        None
+    } else {
+        Some(reasoning)
+    };
+    (visible, reasoning)
+}
+
+/// Convenience wrapper: strip `<think>` blocks and return only the visible text.
+/// Used in code paths that cannot propagate reasoning content (e.g. `chat_with_history`).
+fn strip_think_tags(s: &str) -> String {
+    extract_content_and_reasoning(s).0
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -547,6 +619,48 @@ impl ResponseMessage {
             .as_ref()
             .map(|c| strip_think_tags(c))
             .filter(|c| !c.is_empty())
+    }
+
+    /// Extract visible text and merged reasoning content.
+    /// Returns `(Option<visible_text>, Option<reasoning_content>)`.
+    ///
+    /// Reasoning is composed of:
+    /// 1. Any `<think>...</think>` blocks extracted from `content`
+    /// 2. The existing `reasoning_content` field from the API response
+    ///
+    /// When both sources provide reasoning, they are concatenated with a newline.
+    fn extract_text_and_reasoning(&self) -> (Option<String>, Option<String>) {
+        let (visible, inline_reasoning) =
+            if let Some(content) = self.content.as_ref().filter(|c| !c.is_empty()) {
+                let (vis, reasoning) = extract_content_and_reasoning(content);
+                let vis = if vis.is_empty() { None } else { Some(vis) };
+                (vis, reasoning)
+            } else {
+                (None, None)
+            };
+
+        // If visible text is empty, fall back to reasoning_content (stripped of think tags)
+        let visible = visible.or_else(|| {
+            self.reasoning_content
+                .as_ref()
+                .map(|c| strip_think_tags(c))
+                .filter(|c| !c.is_empty())
+        });
+
+        // Merge inline reasoning with the API-level reasoning_content field
+        let merged_reasoning = match (&inline_reasoning, &self.reasoning_content) {
+            (Some(inline), Some(api)) => {
+                let mut merged = inline.clone();
+                merged.push('\n');
+                merged.push_str(api);
+                Some(merged)
+            }
+            (Some(inline), None) => Some(inline.clone()),
+            (None, Some(api)) => Some(api.clone()),
+            (None, None) => None,
+        };
+
+        (visible, merged_reasoning)
     }
 }
 
@@ -960,22 +1074,35 @@ fn sse_bytes_to_chunks(
         }
 
         let mut bytes_stream = response.bytes_stream();
+        // Accumulate partial UTF-8 sequences that may be split across
+        // HTTP/1.1 chunked transfer boundaries (e.g. 3-byte CJK chars).
+        let mut utf8_buf: Vec<u8> = Vec::new();
 
         while let Some(item) = bytes_stream.next().await {
             match item {
                 Ok(bytes) => {
-                    let text = match String::from_utf8(bytes.to_vec()) {
-                        Ok(t) => t,
+                    utf8_buf.extend_from_slice(&bytes);
+                    let text = match std::str::from_utf8(&utf8_buf) {
+                        Ok(s) => {
+                            let owned = s.to_string();
+                            utf8_buf.clear();
+                            owned
+                        }
                         Err(e) => {
-                            let _ = tx
-                                .send(Err(StreamError::InvalidSse(format!(
-                                    "Invalid UTF-8: {}",
-                                    e
-                                ))))
-                                .await;
-                            break;
+                            let valid_up_to = e.valid_up_to();
+                            if valid_up_to == 0 && utf8_buf.len() < 4 {
+                                // Could still be an incomplete multi-byte char; wait for more data
+                                continue;
+                            }
+                            let valid =
+                                String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
+                            utf8_buf.drain(..valid_up_to);
+                            valid
                         }
                     };
+                    if text.is_empty() {
+                        continue;
+                    }
 
                     buffer.push_str(&text);
 
@@ -1039,21 +1166,32 @@ fn sse_bytes_to_events(
         }
 
         let mut bytes_stream = response.bytes_stream();
+        // Accumulate partial UTF-8 sequences split across chunk boundaries.
+        let mut utf8_buf: Vec<u8> = Vec::new();
         while let Some(item) = bytes_stream.next().await {
             match item {
                 Ok(bytes) => {
-                    let text = match String::from_utf8(bytes.to_vec()) {
-                        Ok(t) => t,
+                    utf8_buf.extend_from_slice(&bytes);
+                    let text = match std::str::from_utf8(&utf8_buf) {
+                        Ok(s) => {
+                            let owned = s.to_string();
+                            utf8_buf.clear();
+                            owned
+                        }
                         Err(e) => {
-                            let _ = tx
-                                .send(Err(StreamError::InvalidSse(format!(
-                                    "Invalid UTF-8: {}",
-                                    e
-                                ))))
-                                .await;
-                            return;
+                            let valid_up_to = e.valid_up_to();
+                            if valid_up_to == 0 && utf8_buf.len() < 4 {
+                                continue;
+                            }
+                            let valid =
+                                String::from_utf8_lossy(&utf8_buf[..valid_up_to]).into_owned();
+                            utf8_buf.drain(..valid_up_to);
+                            valid
                         }
                     };
+                    if text.is_empty() {
+                        continue;
+                    }
 
                     buffer.push_str(&text);
 
@@ -1259,6 +1397,10 @@ impl OpenAiCompatibleProvider {
             AuthStyle::Bearer => req.header("Authorization", format!("Bearer {credential}")),
             AuthStyle::XApiKey => req.header("x-api-key", credential),
             AuthStyle::Custom(header) => req.header(header, credential),
+            AuthStyle::ZhipuJwt => match zhipu_jwt_bearer(credential) {
+                Ok(val) => req.header("Authorization", val),
+                Err(_) => req.header("Authorization", format!("Bearer {credential}")),
+            },
         }
     }
 
@@ -1309,12 +1451,14 @@ impl OpenAiCompatibleProvider {
             items
                 .iter()
                 .map(|tool| {
+                    let params =
+                        crate::tools::SchemaCleanr::clean_for_openai(tool.parameters.clone());
                     serde_json::json!({
                         "type": "function",
                         "function": {
                             "name": tool.name,
                             "description": tool.description,
-                            "parameters": tool.parameters,
+                            "parameters": params,
                         }
                     })
                 })
@@ -1471,8 +1615,7 @@ impl OpenAiCompatibleProvider {
     }
 
     fn parse_native_response(message: ResponseMessage) -> ProviderChatResponse {
-        let text = message.effective_content_optional();
-        let reasoning_content = message.reasoning_content.clone();
+        let (text, reasoning_content) = message.extract_text_and_reasoning();
         let tool_calls = message
             .tool_calls
             .unwrap_or_default()
@@ -1876,8 +2019,7 @@ impl Provider for OpenAiCompatibleProvider {
             .next()
             .ok_or_else(|| anyhow::anyhow!("No response from {}", self.name))?;
 
-        let text = choice.message.effective_content_optional();
-        let reasoning_content = choice.message.reasoning_content;
+        let (text, reasoning_content) = choice.message.extract_text_and_reasoning();
         let tool_calls = choice
             .message
             .tool_calls
@@ -2133,13 +2275,7 @@ impl Provider for OpenAiCompatibleProvider {
         tokio::spawn(async move {
             let mut req_builder = client.post(&url).json(&payload);
 
-            req_builder = match &auth_header {
-                AuthStyle::Bearer => {
-                    req_builder.header("Authorization", format!("Bearer {}", credential))
-                }
-                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
-                AuthStyle::Custom(header) => req_builder.header(header, &credential),
-            };
+            req_builder = apply_auth_to_request(req_builder, &auth_header, &credential);
             req_builder = req_builder.header("Accept", "text/event-stream");
 
             let response = match req_builder.send().await {
@@ -2234,13 +2370,7 @@ impl Provider for OpenAiCompatibleProvider {
             let mut req_builder = client.post(&url).json(&request);
 
             // Apply auth header
-            req_builder = match &auth_header {
-                AuthStyle::Bearer => {
-                    req_builder.header("Authorization", format!("Bearer {}", credential))
-                }
-                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
-                AuthStyle::Custom(header) => req_builder.header(header, &credential),
-            };
+            req_builder = apply_auth_to_request(req_builder, &auth_header, &credential);
 
             // Set accept header for streaming
             req_builder = req_builder.header("Accept", "text/event-stream");
@@ -2341,15 +2471,7 @@ impl Provider for OpenAiCompatibleProvider {
 
         tokio::spawn(async move {
             let mut req_builder = client.post(&url).json(&request);
-
-            req_builder = match &auth_header {
-                AuthStyle::Bearer => {
-                    req_builder.header("Authorization", format!("Bearer {}", credential))
-                }
-                AuthStyle::XApiKey => req_builder.header("x-api-key", &credential),
-                AuthStyle::Custom(header) => req_builder.header(header, &credential),
-            };
-
+            req_builder = apply_auth_to_request(req_builder, &auth_header, &credential);
             req_builder = req_builder.header("Accept", "text/event-stream");
 
             let response = match req_builder.send().await {
@@ -2440,10 +2562,12 @@ mod tests {
             .chat_with_system(None, "hello", "llama-3.3-70b", 0.7)
             .await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Venice API key not set"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Venice API key not set")
+        );
     }
 
     #[test]
@@ -2538,6 +2662,79 @@ mod tests {
             AuthStyle::Custom("X-Custom-Key".into()),
         );
         assert!(matches!(p.auth_header, AuthStyle::Custom(_)));
+    }
+
+    #[test]
+    fn zhipu_jwt_produces_valid_three_part_token() {
+        let result = zhipu_jwt_bearer("testid.testsecret").unwrap();
+        assert!(result.starts_with("Bearer "));
+        let jwt = result.strip_prefix("Bearer ").unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3, "JWT must have 3 dot-separated parts: {jwt}");
+    }
+
+    #[test]
+    fn zhipu_jwt_header_is_correct() {
+        use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
+        let result = zhipu_jwt_bearer("myid.mysecret").unwrap();
+        let jwt = result.strip_prefix("Bearer ").unwrap();
+        let header_b64 = jwt.split('.').next().unwrap();
+        let header_bytes = URL_SAFE_NO_PAD.decode(header_b64).unwrap();
+        let header: serde_json::Value = serde_json::from_slice(&header_bytes).unwrap();
+        assert_eq!(header["alg"], "HS256");
+        assert_eq!(header["typ"], "JWT");
+        assert_eq!(header["sign_type"], "SIGN");
+    }
+
+    #[test]
+    fn zhipu_jwt_payload_contains_api_key_and_timestamps() {
+        use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
+        let result = zhipu_jwt_bearer("myapiid.mysecretkey").unwrap();
+        let jwt = result.strip_prefix("Bearer ").unwrap();
+        let payload_b64 = jwt.split('.').nth(1).unwrap();
+        let payload_bytes = URL_SAFE_NO_PAD.decode(payload_b64).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+        assert_eq!(payload["api_key"], "myapiid");
+        assert!(payload["exp"].is_number());
+        assert!(payload["timestamp"].is_number());
+        // exp should be ~210s after timestamp
+        let ts = payload["timestamp"].as_u64().unwrap();
+        let exp = payload["exp"].as_u64().unwrap();
+        assert_eq!(exp - ts, 210_000);
+    }
+
+    #[test]
+    fn zhipu_jwt_signature_is_verifiable() {
+        let secret = "testsecret123";
+        let credential = format!("testid.{secret}");
+        let result = zhipu_jwt_bearer(&credential).unwrap();
+        let jwt = result.strip_prefix("Bearer ").unwrap();
+        let parts: Vec<&str> = jwt.split('.').collect();
+        let signing_input = format!("{}.{}", parts[0], parts[1]);
+
+        // Verify HMAC-SHA256 signature
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+        use base64::engine::{Engine, general_purpose::URL_SAFE_NO_PAD};
+        let sig_bytes = URL_SAFE_NO_PAD.decode(parts[2]).unwrap();
+        ring::hmac::verify(&key, signing_input.as_bytes(), &sig_bytes)
+            .expect("signature must verify");
+    }
+
+    #[test]
+    fn zhipu_jwt_rejects_invalid_key_format() {
+        assert!(zhipu_jwt_bearer("no-dot-here").is_err());
+        assert!(zhipu_jwt_bearer("").is_err());
+    }
+
+    #[test]
+    fn zhipu_jwt_auth_style_applies_correctly() {
+        let p = OpenAiCompatibleProvider::new(
+            "Z.AI",
+            "https://api.z.ai/api/coding/paas/v4",
+            Some("testid.testsecret"),
+            AuthStyle::ZhipuJwt,
+        );
+        assert!(matches!(p.auth_header, AuthStyle::ZhipuJwt));
     }
 
     #[tokio::test]
@@ -2660,9 +2857,10 @@ mod tests {
             .await
             .expect_err("system-only fallback payload should fail");
 
-        assert!(err
-            .to_string()
-            .contains("requires at least one non-system message"));
+        assert!(
+            err.to_string()
+                .contains("requires at least one non-system message")
+        );
     }
 
     #[test]
@@ -3006,6 +3204,46 @@ mod tests {
     fn strip_think_tags_drops_unclosed_block_suffix() {
         let input = "visible<think>hidden";
         assert_eq!(strip_think_tags(input), "visible");
+    }
+
+    // ----------------------------------------------------------
+    // extract_content_and_reasoning tests
+    // ----------------------------------------------------------
+
+    #[test]
+    fn extract_content_and_reasoning_single_block() {
+        let (text, reasoning) =
+            extract_content_and_reasoning("<think>reasoning</think>visible text");
+        assert_eq!(text, "visible text");
+        assert_eq!(reasoning.as_deref(), Some("reasoning"));
+    }
+
+    #[test]
+    fn extract_content_and_reasoning_multiple_blocks() {
+        let (text, reasoning) = extract_content_and_reasoning("<think>a</think>X<think>b</think>Y");
+        assert_eq!(text, "XY");
+        assert_eq!(reasoning.as_deref(), Some("a\nb"));
+    }
+
+    #[test]
+    fn extract_content_and_reasoning_no_tags() {
+        let (text, reasoning) = extract_content_and_reasoning("plain text");
+        assert_eq!(text, "plain text");
+        assert!(reasoning.is_none());
+    }
+
+    #[test]
+    fn extract_content_and_reasoning_unclosed_tag() {
+        let (text, reasoning) = extract_content_and_reasoning("visible<think>hidden");
+        assert_eq!(text, "visible");
+        assert_eq!(reasoning.as_deref(), Some("hidden"));
+    }
+
+    #[test]
+    fn extract_content_and_reasoning_only_think_tags() {
+        let (text, reasoning) = extract_content_and_reasoning("<think>all reasoning</think>");
+        assert_eq!(text, "");
+        assert_eq!(reasoning.as_deref(), Some("all reasoning"));
     }
 
     #[test]
@@ -3427,10 +3665,12 @@ mod tests {
 
         let result = p.chat_with_tools(&messages, &tools, "model", 0.7).await;
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("TestProvider API key not set"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("TestProvider API key not set")
+        );
     }
 
     #[test]
@@ -3490,6 +3730,52 @@ mod tests {
         let input = "Visible<think>hidden tail";
         let output = strip_think_tags(input);
         assert_eq!(output, "Visible");
+    }
+
+    #[test]
+    fn extract_text_and_reasoning_merges_inline_and_api_reasoning() {
+        let json = r#"{"choices":[{"message":{"content":"<think>inline thought</think>Hello","reasoning_content":"api reasoning"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        let (text, reasoning) = msg.extract_text_and_reasoning();
+        assert_eq!(text.as_deref(), Some("Hello"));
+        let reasoning = reasoning.unwrap();
+        assert!(reasoning.contains("inline thought"));
+        assert!(reasoning.contains("api reasoning"));
+    }
+
+    #[test]
+    fn extract_text_and_reasoning_inline_only() {
+        let json = r#"{"choices":[{"message":{"content":"<think>thought</think>visible"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        let (text, reasoning) = msg.extract_text_and_reasoning();
+        assert_eq!(text.as_deref(), Some("visible"));
+        assert_eq!(reasoning.as_deref(), Some("thought"));
+    }
+
+    #[test]
+    fn extract_text_and_reasoning_api_reasoning_only() {
+        let json =
+            r#"{"choices":[{"message":{"content":"Hello","reasoning_content":"api only"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        let (text, reasoning) = msg.extract_text_and_reasoning();
+        assert_eq!(text.as_deref(), Some("Hello"));
+        assert_eq!(reasoning.as_deref(), Some("api only"));
+    }
+
+    #[test]
+    fn extract_text_and_reasoning_content_only_think_falls_back() {
+        // Content is only think tags -> visible is empty -> falls back to reasoning_content
+        let json = r#"{"choices":[{"message":{"content":"<think>secret</think>","reasoning_content":"Fallback text"}}]}"#;
+        let resp: ApiChatResponse = serde_json::from_str(json).unwrap();
+        let msg = &resp.choices[0].message;
+        let (text, reasoning) = msg.extract_text_and_reasoning();
+        assert_eq!(text.as_deref(), Some("Fallback text"));
+        let reasoning = reasoning.unwrap();
+        assert!(reasoning.contains("secret"));
+        assert!(reasoning.contains("Fallback text"));
     }
 
     // ----------------------------------------------------------

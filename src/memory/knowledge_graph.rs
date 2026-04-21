@@ -8,7 +8,7 @@
 use anyhow::Context;
 use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -143,7 +143,9 @@ impl KnowledgeGraph {
         conn.execute_batch(
             "PRAGMA journal_mode = WAL;
              PRAGMA synchronous  = NORMAL;
-             PRAGMA foreign_keys = ON;",
+             PRAGMA foreign_keys = ON;
+             PRAGMA cache_size   = -4000;
+             PRAGMA mmap_size    = 16777216;",
         )?;
 
         conn.execute_batch(
@@ -645,15 +647,19 @@ mod tests {
 
         // Outbound: from id1 → id2
         let related = graph.find_related(&id1).unwrap();
-        assert!(related
-            .iter()
-            .any(|(n, r)| n.id == id2 && *r == Relation::Uses));
+        assert!(
+            related
+                .iter()
+                .any(|(n, r)| n.id == id2 && *r == Relation::Uses)
+        );
 
         // Inbound: id2 sees id1 via the same edge
         let related = graph.find_related(&id2).unwrap();
-        assert!(related
-            .iter()
-            .any(|(n, r)| n.id == id1 && *r == Relation::Uses));
+        assert!(
+            related
+                .iter()
+                .any(|(n, r)| n.id == id1 && *r == Relation::Uses)
+        );
     }
 
     #[test]

@@ -2,19 +2,16 @@ pub mod audit;
 pub mod backend;
 pub mod chunker;
 pub mod cli;
-pub mod conflict;
-pub mod consolidation;
 pub mod decay;
 pub mod embeddings;
-pub mod hygiene;
-pub mod importance;
 pub mod knowledge_graph;
 pub mod lucid;
 pub mod markdown;
+pub mod namespaced;
 pub mod none;
 pub mod policy;
+pub mod procedural;
 pub mod qdrant;
-pub mod response_cache;
 pub mod retrieval;
 pub mod snapshot;
 pub mod sqlite;
@@ -28,16 +25,16 @@ mod battle_tests;
 pub use audit::AuditedMemory;
 #[allow(unused_imports)]
 pub use backend::{
-    classify_memory_backend, default_memory_backend_key, memory_backend_profile,
-    selectable_memory_backends, MemoryBackendKind, MemoryBackendProfile,
+    MemoryBackendKind, MemoryBackendProfile, classify_memory_backend, default_memory_backend_key,
+    memory_backend_profile, selectable_memory_backends,
 };
 pub use lucid::LucidMemory;
 pub use markdown::MarkdownMemory;
+pub use namespaced::NamespacedMemory;
 pub use none::NoneMemory;
 #[allow(unused_imports)]
 pub use policy::PolicyEnforcer;
 pub use qdrant::QdrantMemory;
-pub use response_cache::ResponseCache;
 #[allow(unused_imports)]
 pub use retrieval::{RetrievalConfig, RetrievalPipeline};
 pub use sqlite::SqliteMemory;
@@ -246,10 +243,7 @@ pub fn create_memory_with_storage_and_routes(
     let backend_kind = classify_memory_backend(&backend_name);
     let resolved_embedding = resolve_embedding_config(config, embedding_routes, api_key);
 
-    // Best-effort memory hygiene/retention pass (throttled by state file).
-    if let Err(e) = hygiene::run_if_due(config, workspace_dir) {
-        tracing::warn!("memory hygiene skipped: {e}");
-    }
+    // Memory hygiene removed — retention is now managed through explicit tools.
 
     // If snapshot_on_hygiene is enabled, export core memories during hygiene.
     if config.snapshot_enabled
@@ -380,31 +374,6 @@ pub fn create_memory_for_migration(
 }
 
 /// Factory: create an optional response cache from config.
-pub fn create_response_cache(config: &MemoryConfig, workspace_dir: &Path) -> Option<ResponseCache> {
-    if !config.response_cache_enabled {
-        return None;
-    }
-
-    match ResponseCache::new(
-        workspace_dir,
-        config.response_cache_ttl_minutes,
-        config.response_cache_max_entries,
-    ) {
-        Ok(cache) => {
-            tracing::info!(
-                "💾 Response cache enabled (TTL: {}min, max: {} entries)",
-                config.response_cache_ttl_minutes,
-                config.response_cache_max_entries
-            );
-            Some(cache)
-        }
-        Err(e) => {
-            tracing::warn!("Response cache disabled due to error: {e}");
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,7 +599,8 @@ mod tests {
     fn resolve_embedding_config_uses_embedding_provider_env_key_not_default_provider_key() {
         // COHERE_API_KEY is almost certainly unset in normal dev environments.
         let prev = std::env::var("COHERE_API_KEY").ok();
-        std::env::set_var("COHERE_API_KEY", "cohere-from-env");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("COHERE_API_KEY", "cohere-from-env") };
 
         let cfg = MemoryConfig {
             embedding_provider: "cohere".into(),
@@ -644,8 +614,10 @@ mod tests {
 
         // Restore env.
         match prev {
-            Some(v) => std::env::set_var("COHERE_API_KEY", v),
-            None => std::env::remove_var("COHERE_API_KEY"),
+            // SAFETY: test-only, single-threaded test runner.
+            Some(v) => unsafe { std::env::set_var("COHERE_API_KEY", v) },
+            // SAFETY: test-only, single-threaded test runner.
+            None => unsafe { std::env::remove_var("COHERE_API_KEY") },
         }
 
         assert_eq!(

@@ -62,7 +62,7 @@ async fn provider_vision_support() -> Result<()> {
         eprintln!("Creating minimal 1x1 PNG...");
 
         // Create minimal PNG if missing
-        use base64::{engine::general_purpose, Engine as _};
+        use base64::{Engine as _, engine::general_purpose};
         let png_data = general_purpose::STANDARD.decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
         )?;
@@ -86,6 +86,7 @@ async fn provider_vision_support() -> Result<()> {
     let request = ChatRequest {
         messages: &messages,
         tools: None,
+        thinking_level: None,
     };
 
     // Send request to provider
@@ -189,7 +190,7 @@ async fn openai_codex_second_vision_support() -> Result<()> {
         eprintln!("Creating minimal 1x1 PNG...");
 
         // Create minimal PNG if missing
-        use base64::{engine::general_purpose, Engine as _};
+        use base64::{Engine as _, engine::general_purpose};
         let png_data = general_purpose::STANDARD.decode(
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="
         )?;
@@ -213,6 +214,7 @@ async fn openai_codex_second_vision_support() -> Result<()> {
     let request = ChatRequest {
         messages: &messages,
         tools: None,
+        thinking_level: None,
     };
 
     // Send request to provider

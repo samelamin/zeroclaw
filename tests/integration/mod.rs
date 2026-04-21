@@ -1,10 +1,13 @@
 mod agent;
 mod agent_robustness;
+mod minimax_tool_loop;
 mod backup_cron_scheduling;
 mod channel_matrix;
 mod channel_routing;
+mod email_attachments;
 mod hooks;
 mod memory_comparison;
+mod memory_loop_continuity;
 mod memory_restart;
 mod report_template_tool_test;
 mod telegram_attachment_fallback;

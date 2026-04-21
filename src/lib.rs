@@ -58,6 +58,7 @@ pub mod hooks;
 pub mod i18n;
 pub(crate) mod identity;
 pub(crate) mod integrations;
+pub mod mcp_server;
 pub mod memory;
 pub(crate) mod migration;
 pub(crate) mod multimodal;
@@ -75,6 +76,7 @@ pub(crate) mod skills;
 pub mod sop;
 pub mod tools;
 pub(crate) mod trust;
+pub mod tui;
 pub(crate) mod tunnel;
 pub(crate) mod util;
 pub mod verifiable_intent;
@@ -581,6 +583,15 @@ Examples:
     },
     /// Flash ZeroClaw firmware to Nucleo-F401RE (builds + probe-rs run)
     FlashNucleo,
+}
+
+/// Browser sidecar subcommands (`zeroclaw browser …`).
+#[derive(Subcommand, Debug, Clone)]
+pub enum BrowserCommands {
+    /// Check whether the Playwright-MCP sidecar is reachable and print config.
+    Status,
+    /// Print bootstrap instructions for the Playwright-MCP sidecar.
+    Bootstrap,
 }
 
 /// SOP management subcommands

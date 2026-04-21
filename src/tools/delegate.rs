@@ -2,10 +2,11 @@ use super::traits::{Tool, ToolResult};
 use crate::agent::loop_::run_tool_call_loop;
 use crate::agent::prompt::{PromptContext, SystemPromptBuilder};
 use crate::config::{DelegateAgentConfig, DelegateToolConfig};
+use crate::memory::{Memory, NamespacedMemory};
 use crate::observability::traits::{Observer, ObserverEvent, ObserverMetric};
 use crate::providers::{self, ChatMessage, Provider};
-use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
+use crate::security::policy::ToolOperation;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use serde_json::json;
@@ -70,6 +71,8 @@ pub struct DelegateTool {
     workspace_dir: PathBuf,
     /// Cancellation token for cascade control of background tasks.
     cancellation_token: CancellationToken,
+    /// Optional memory instance for namespace isolation on delegate agents.
+    memory: Option<Arc<dyn Memory>>,
 }
 
 impl DelegateTool {
@@ -103,6 +106,7 @@ impl DelegateTool {
             delegate_config: DelegateToolConfig::default(),
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
+            memory: None,
         }
     }
 
@@ -142,6 +146,7 @@ impl DelegateTool {
             delegate_config: DelegateToolConfig::default(),
             workspace_dir: PathBuf::new(),
             cancellation_token: CancellationToken::new(),
+            memory: None,
         }
     }
 
@@ -187,6 +192,25 @@ impl DelegateTool {
         &self.cancellation_token
     }
 
+    /// Attach memory for namespace isolation on delegate agents.
+    pub fn with_memory(mut self, memory: Arc<dyn Memory>) -> Self {
+        self.memory = Some(memory);
+        self
+    }
+
+    /// Wrap memory with namespace isolation if configured for the given agent.
+    /// Returns the namespaced memory if memory_namespace is set, otherwise returns
+    /// the original memory.
+    fn get_agent_memory(&self, agent_config: &DelegateAgentConfig) -> Option<Arc<dyn Memory>> {
+        self.memory.as_ref().map(|mem| {
+            if let Some(namespace) = &agent_config.memory_namespace {
+                Arc::new(NamespacedMemory::new(mem.clone(), namespace.clone())) as Arc<dyn Memory>
+            } else {
+                mem.clone()
+            }
+        })
+    }
+
     /// Directory where background delegate results are stored.
     fn results_dir(&self) -> PathBuf {
         self.workspace_dir.join("delegate_results")
@@ -225,10 +249,11 @@ impl Tool for DelegateTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["delegate", "check_result", "list_results", "cancel_task"],
+                    "enum": ["delegate", "check_result", "list_results", "cancel_task", "plan"],
                     "description": "Action to perform. Default: 'delegate'. Use 'check_result' to \
                                     retrieve a background task result, 'list_results' to list all \
-                                    background tasks, 'cancel_task' to cancel a running background task.",
+                                    background tasks, 'cancel_task' to cancel a running background task, \
+                                    'plan' to generate and execute a multi-step task plan.",
                     "default": "delegate"
                 },
                 "agent": {
@@ -270,6 +295,17 @@ impl Tool for DelegateTool {
                     "type": "string",
                     "description": "Task ID for check_result/cancel_task actions (returned by \
                                     background delegation)."
+                },
+                "goal": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "High-level goal for the 'plan' action. The planner agent will \
+                                    decompose this into sub-tasks assigned to available agents."
+                },
+                "planner": {
+                    "type": "string",
+                    "description": "Agent name to use as the planner for the 'plan' action. Defaults \
+                                    to the first available agent."
                 }
             },
             "required": []
@@ -287,12 +323,27 @@ impl Tool for DelegateTool {
             "list_results" => return self.handle_list_results().await,
             "cancel_task" => return self.handle_cancel_task(&args).await,
             "delegate" => {} // fall through to delegation logic
+            "plan" => {
+                let goal = args
+                    .get("goal")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .ok_or_else(|| anyhow::anyhow!("'goal' required for plan action"))?;
+                if goal.is_empty() {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some("'goal' parameter must not be empty".into()),
+                    });
+                }
+                return self.execute_plan(goal, &args).await;
+            }
             other => {
                 return Ok(ToolResult {
                     success: false,
                     output: String::new(),
                     error: Some(format!(
-                        "Unknown action '{other}'. Use delegate/check_result/list_results/cancel_task."
+                        "Unknown action '{other}'. Use delegate/check_result/list_results/cancel_task/plan."
                     )),
                 });
             }
@@ -626,6 +677,7 @@ impl DelegateTool {
                 delegate_config,
                 workspace_dir: workspace_dir.clone(),
                 cancellation_token: child_token.clone(),
+                memory: None,
             };
 
             let args_inner = json!({
@@ -783,6 +835,7 @@ impl DelegateTool {
                     delegate_config,
                     workspace_dir,
                     cancellation_token,
+                    memory: None,
                 };
                 let result = Box::pin(inner.execute_sync(&agent_name, &prompt, &args_clone)).await;
                 (agent_name, result)
@@ -984,6 +1037,144 @@ impl DelegateTool {
         self.cancellation_token.cancel();
     }
 
+    // ── Plan Execution ──────────────────────────────────────────────
+
+    /// Generate a multi-step task plan from a high-level goal and execute it
+    /// batch-by-batch using the existing delegation infrastructure.
+    async fn execute_plan(
+        &self,
+        goal: &str,
+        args: &serde_json::Value,
+    ) -> anyhow::Result<ToolResult> {
+        let available_agents: Vec<&str> = self.agents.keys().map(|s| s.as_str()).collect();
+
+        if available_agents.is_empty() {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some("No agents configured for planning".into()),
+            });
+        }
+
+        // Determine planner agent
+        let planner = args
+            .get("planner")
+            .and_then(|v| v.as_str())
+            .unwrap_or_else(|| available_agents[0]);
+
+        if !self.agents.contains_key(planner) {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Unknown planner agent '{planner}'. Available: {}",
+                    available_agents.join(", ")
+                )),
+            });
+        }
+
+        // Generate plan via planner agent
+        let plan_prompt = format!(
+            "You are a task planner. Break down this goal into sub-tasks for the available agents.\n\n\
+             Goal: {goal}\n\n\
+             Available agents: {agents}\n\n\
+             Respond with ONLY a JSON object (no markdown, no explanation):\n\
+             {{\n  \"goal\": \"{goal}\",\n  \"tasks\": [\n    {{\n      \"id\": \"task-1\",\n\
+             \"description\": \"...\",\n      \"agent\": \"<one of: {agents}>\",\n\
+             \"prompt\": \"detailed instructions for the agent\",\n      \"depends_on\": [],\n\
+             \"priority\": 0\n    }}\n  ]\n}}",
+            agents = available_agents.join(", ")
+        );
+
+        let plan_result = self.execute_sync(planner, &plan_prompt, args).await?;
+        if !plan_result.success {
+            return Ok(ToolResult {
+                success: false,
+                output: String::new(),
+                error: Some(format!(
+                    "Planner failed: {}",
+                    plan_result.error.unwrap_or_default()
+                )),
+            });
+        }
+
+        // Parse and validate plan — extract JSON from agent output which may
+        // contain a prefix line like "[Agent 'planner' (provider/model)]".
+        let raw_output = &plan_result.output;
+        let json_str = if let Some(idx) = raw_output.find('{') {
+            &raw_output[idx..]
+        } else {
+            raw_output.as_str()
+        };
+
+        let plan: crate::tools::task_planner::TaskPlan =
+            serde_json::from_str(json_str).map_err(|e| {
+                anyhow::anyhow!("Failed to parse plan JSON: {e}\nRaw output: {raw_output}")
+            })?;
+
+        plan.validate()
+            .map_err(|e| anyhow::anyhow!("Invalid plan: {e}"))?;
+
+        // Execute batch by batch
+        let mut execution = crate::tools::task_planner::PlanExecution::new(plan);
+
+        while !execution.is_finished() {
+            let ready = execution.ready_tasks();
+            if ready.is_empty() {
+                break; // stuck due to failures
+            }
+
+            let task_ids: Vec<String> = ready.iter().map(|t| t.id.clone()).collect();
+            let task_agents: Vec<String> = ready.iter().map(|t| t.agent.clone()).collect();
+            let task_prompts: Vec<String> =
+                ready.iter().map(|t| execution.enriched_prompt(t)).collect();
+
+            // Execute ready tasks sequentially
+            for (i, task_id) in task_ids.iter().enumerate() {
+                let agent = &task_agents[i];
+                let prompt = &task_prompts[i];
+
+                match self.execute_sync(agent, prompt, args).await {
+                    Ok(result) if result.success => {
+                        execution.complete(task_id, result.output);
+                    }
+                    Ok(result) => {
+                        execution.fail(
+                            task_id,
+                            result.error.unwrap_or_else(|| "Unknown error".into()),
+                        );
+                    }
+                    Err(e) => {
+                        execution.fail(task_id, format!("{e}"));
+                    }
+                }
+            }
+        }
+
+        let summary = format!(
+            "Plan execution {}.\nGoal: {}\nCompleted: {}/{}\nFailed: {}",
+            if execution.is_success() {
+                "succeeded"
+            } else {
+                "completed with failures"
+            },
+            execution.plan.goal,
+            execution.completed.len(),
+            execution.plan.tasks.len(),
+            execution.failed.len(),
+        );
+
+        Ok(ToolResult {
+            success: execution.is_success(),
+            output: serde_json::to_string_pretty(&execution).unwrap_or(summary.clone()),
+            error: if execution.is_success() {
+                None
+            } else {
+                Some(summary)
+            },
+        })
+    }
+
     /// Build an enriched system prompt for a sub-agent by composing structured
     /// operational sections (tools, skills, workspace, datetime, shell policy)
     /// with the operator-configured `system_prompt` string.
@@ -1143,6 +1334,9 @@ impl DelegateTool {
                 None,
                 None,
                 &crate::config::PacingConfig::default(),
+                0,    // max_tool_result_chars: inherit from parent config in future
+                0,    // context_token_budget: 0 = disabled for subagents
+                None, // shared_budget: TODO thread from parent in future
             ),
         )
         .await;
@@ -1257,6 +1451,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         agents.insert(
@@ -1274,6 +1469,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         agents
@@ -1430,6 +1626,7 @@ mod tests {
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
+            memory_namespace: None,
         }
     }
 
@@ -1545,6 +1742,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1610,11 +1808,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("read-only mode"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("read-only mode")
+        );
     }
 
     #[tokio::test]
@@ -1629,11 +1829,13 @@ mod tests {
             .await
             .unwrap();
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Rate limit exceeded"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Rate limit exceeded")
+        );
     }
 
     #[tokio::test]
@@ -1654,6 +1856,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1667,11 +1870,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Failed to create provider"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Failed to create provider")
+        );
     }
 
     #[tokio::test]
@@ -1692,6 +1897,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         let tool = DelegateTool::new(agents, None, test_security());
@@ -1705,11 +1911,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("Failed to create provider"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("Failed to create provider")
+        );
     }
 
     #[test]
@@ -1741,11 +1949,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("allowed_tools is empty"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("allowed_tools is empty")
+        );
     }
 
     #[tokio::test]
@@ -1764,11 +1974,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("no executable tools"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("no executable tools")
+        );
     }
 
     #[tokio::test]
@@ -1810,11 +2022,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("no executable tools"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("no executable tools")
+        );
     }
 
     #[tokio::test]
@@ -1830,11 +2044,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("maximum tool iterations (2)"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("maximum tool iterations (2)")
+        );
     }
 
     #[tokio::test]
@@ -1850,11 +2066,13 @@ mod tests {
             .unwrap();
 
         assert!(!result.success);
-        assert!(result
-            .error
-            .as_deref()
-            .unwrap_or("")
-            .contains("provider boom"));
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("provider boom")
+        );
     }
 
     /// MCP tools pushed into the shared parent_tools handle after DelegateTool
@@ -1968,6 +2186,7 @@ mod tests {
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
+            memory_namespace: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2021,6 +2240,7 @@ mod tests {
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
+            memory_namespace: None,
         };
 
         struct MockShellTool;
@@ -2091,6 +2311,7 @@ mod tests {
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
+            memory_namespace: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2119,6 +2340,7 @@ mod tests {
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
+            memory_namespace: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2152,6 +2374,7 @@ mod tests {
             timeout_secs: Some(60),
             agentic_timeout_secs: Some(600),
             skills_directory: None,
+            memory_namespace: None,
         };
         assert_eq!(
             config.timeout_secs.unwrap_or(DEFAULT_DELEGATE_TIMEOUT_SECS),
@@ -2207,6 +2430,7 @@ mod tests {
                 timeout_secs: Some(0),
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2234,6 +2458,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: Some(0),
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2261,6 +2486,7 @@ mod tests {
                 timeout_secs: Some(7200),
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2288,6 +2514,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: Some(5000),
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         let err = config.validate().unwrap_err();
@@ -2315,6 +2542,7 @@ mod tests {
                 timeout_secs: Some(3600),
                 agentic_timeout_secs: Some(3600),
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2338,6 +2566,7 @@ mod tests {
                 timeout_secs: None,
                 agentic_timeout_secs: None,
                 skills_directory: None,
+                memory_namespace: None,
             },
         );
         assert!(config.validate().is_ok());
@@ -2370,6 +2599,7 @@ mod tests {
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: Some("skills/code-review".to_string()),
+            memory_namespace: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2416,6 +2646,7 @@ mod tests {
             timeout_secs: None,
             agentic_timeout_secs: None,
             skills_directory: None,
+            memory_namespace: None,
         };
 
         let tools: Vec<Box<dyn Tool>> = vec![Box::new(EchoTool)];
@@ -2871,5 +3102,127 @@ mod tests {
         assert!(result.error.unwrap().contains("Invalid task_id"));
 
         let _ = std::fs::remove_dir_all(workspace);
+    }
+
+    // ── Plan action tests ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn plan_action_missing_goal_rejected() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let result = tool.execute(json!({"action": "plan"})).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn plan_action_empty_goal_rejected() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let result = tool
+            .execute(json!({"action": "plan", "goal": "  "}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("must not be empty"));
+    }
+
+    #[tokio::test]
+    async fn plan_action_no_agents_configured() {
+        let tool = DelegateTool::new(HashMap::new(), None, test_security());
+        let result = tool
+            .execute(json!({"action": "plan", "goal": "build something"}))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("No agents configured"));
+    }
+
+    #[tokio::test]
+    async fn plan_action_unknown_planner_rejected() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let result = tool
+            .execute(json!({
+                "action": "plan",
+                "goal": "build something",
+                "planner": "nonexistent"
+            }))
+            .await
+            .unwrap();
+        assert!(!result.success);
+        assert!(result.error.unwrap().contains("Unknown planner agent"));
+    }
+
+    #[test]
+    fn plan_action_in_schema() {
+        let tool = DelegateTool::new(sample_agents(), None, test_security());
+        let schema = tool.parameters_schema();
+        let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+        let action_strs: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            action_strs.contains(&"plan"),
+            "schema should include 'plan' action"
+        );
+        assert!(
+            schema["properties"]["goal"].is_object(),
+            "schema should include 'goal' param"
+        );
+        assert!(
+            schema["properties"]["planner"].is_object(),
+            "schema should include 'planner' param"
+        );
+    }
+
+    #[test]
+    fn plan_execution_data_flow_validates() {
+        // Verify that the plan/execution types integrate correctly with expected
+        // serialization and state transitions (unit-level, no provider needed).
+        use crate::tools::task_planner::{PlanExecution, SubTask, TaskPlan};
+
+        let plan = TaskPlan {
+            goal: "integration test".into(),
+            tasks: vec![
+                SubTask {
+                    id: "step-1".into(),
+                    description: "first step".into(),
+                    agent: "researcher".into(),
+                    prompt: "do research".into(),
+                    depends_on: vec![],
+                    priority: 0,
+                },
+                SubTask {
+                    id: "step-2".into(),
+                    description: "second step".into(),
+                    agent: "coder".into(),
+                    prompt: "write code".into(),
+                    depends_on: vec!["step-1".into()],
+                    priority: 0,
+                },
+            ],
+        };
+
+        assert!(plan.validate().is_ok());
+
+        let mut exec = PlanExecution::new(plan);
+        assert!(!exec.is_finished());
+
+        // step-1 is ready, step-2 is not
+        let ready = exec.ready_tasks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, "step-1");
+
+        exec.complete("step-1", "research output".into());
+
+        // step-2 now ready with enriched prompt
+        let ready = exec.ready_tasks();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].id, "step-2");
+        let enriched = exec.enriched_prompt(&ready[0]);
+        assert!(enriched.contains("research output"));
+
+        exec.complete("step-2", "code output".into());
+        assert!(exec.is_finished());
+        assert!(exec.is_success());
+
+        // Verify serialization round-trips
+        let json = serde_json::to_string_pretty(&exec).unwrap();
+        let _: PlanExecution = serde_json::from_str(&json).unwrap();
     }
 }

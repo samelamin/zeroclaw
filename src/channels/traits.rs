@@ -22,6 +22,10 @@ pub struct ChannelMessage {
     /// Channels populate this when they receive media alongside a text message.
     /// Defaults to empty — existing channels are unaffected.
     pub attachments: Vec<super::media_pipeline::MediaAttachment>,
+    /// The sender's real E.164 phone number when the platform uses opaque IDs.
+    /// Set by WhatsApp Web when Baileys can resolve the LID to a real number.
+    /// Included in webhook forward payloads as `real_phone`.
+    pub real_phone: Option<String>,
 }
 
 /// Message to send through a channel
@@ -34,6 +38,9 @@ pub struct SendMessage {
     pub thread_ts: Option<String>,
     /// Optional cancellation token for interruptible delivery (e.g. multi-message mode).
     pub cancellation_token: Option<CancellationToken>,
+    /// File attachments to send with the message.
+    /// Channels that don't support attachments ignore this field.
+    pub attachments: Vec<super::media_pipeline::MediaAttachment>,
 }
 
 impl SendMessage {
@@ -45,6 +52,7 @@ impl SendMessage {
             subject: None,
             thread_ts: None,
             cancellation_token: None,
+            attachments: vec![],
         }
     }
 
@@ -60,6 +68,7 @@ impl SendMessage {
             subject: Some(subject.into()),
             thread_ts: None,
             cancellation_token: None,
+            attachments: vec![],
         }
     }
 
@@ -74,6 +83,22 @@ impl SendMessage {
         self.cancellation_token = Some(token);
         self
     }
+
+    /// Attach files to this message.
+    pub fn with_attachments(
+        mut self,
+        attachments: Vec<super::media_pipeline::MediaAttachment>,
+    ) -> Self {
+        self.attachments = attachments;
+        self
+    }
+}
+
+/// Optional metadata returned by a channel send operation.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SendMessageAck {
+    /// Provider-native message identifier when the transport exposes one.
+    pub message_id: Option<String>,
 }
 
 /// Core channel trait — implement for any messaging platform
@@ -84,6 +109,13 @@ pub trait Channel: Send + Sync {
 
     /// Send a message through this channel
     async fn send(&self, message: &SendMessage) -> anyhow::Result<()>;
+
+    /// Send a message and return any transport-native metadata the channel can
+    /// expose (for example a provider message ID used for delivery receipts).
+    async fn send_with_ack(&self, message: &SendMessage) -> anyhow::Result<SendMessageAck> {
+        self.send(message).await?;
+        Ok(SendMessageAck::default())
+    }
 
     /// Start listening for incoming messages (long-running)
     async fn listen(&self, tx: tokio::sync::mpsc::Sender<ChannelMessage>) -> anyhow::Result<()>;
@@ -102,6 +134,14 @@ pub trait Channel: Send + Sync {
     /// Stop any active typing indicator.
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    /// Whether this channel currently has an active live connection.
+    /// Stateless HTTP-based channels always return true.
+    /// WebSocket-backed channels (e.g. WhatsApp Web) return false when
+    /// their persistent client is not yet connected or has disconnected.
+    fn is_connected(&self) -> bool {
+        true
     }
 
     /// Whether this channel supports progressive message updates via draft edits.
@@ -243,6 +283,7 @@ mod tests {
                 thread_ts: None,
                 interruption_scope_id: None,
                 attachments: vec![],
+                real_phone: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -261,6 +302,7 @@ mod tests {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            real_phone: None,
         };
 
         let cloned = message.clone();
@@ -279,24 +321,30 @@ mod tests {
         assert!(channel.health_check().await);
         assert!(channel.start_typing("bob").await.is_ok());
         assert!(channel.stop_typing("bob").await.is_ok());
-        assert!(channel
-            .send(&SendMessage::new("hello", "bob"))
-            .await
-            .is_ok());
+        assert!(
+            channel
+                .send(&SendMessage::new("hello", "bob"))
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
     async fn default_reaction_methods_return_success() {
         let channel = DummyChannel;
 
-        assert!(channel
-            .add_reaction("chan_1", "msg_1", "\u{1F440}")
-            .await
-            .is_ok());
-        assert!(channel
-            .remove_reaction("chan_1", "msg_1", "\u{1F440}")
-            .await
-            .is_ok());
+        assert!(
+            channel
+                .add_reaction("chan_1", "msg_1", "\u{1F440}")
+                .await
+                .is_ok()
+        );
+        assert!(
+            channel
+                .remove_reaction("chan_1", "msg_1", "\u{1F440}")
+                .await
+                .is_ok()
+        );
     }
 
     #[tokio::test]
@@ -304,16 +352,20 @@ mod tests {
         let channel = DummyChannel;
 
         assert!(!channel.supports_draft_updates());
-        assert!(channel
-            .send_draft(&SendMessage::new("draft", "bob"))
-            .await
-            .unwrap()
-            .is_none());
+        assert!(
+            channel
+                .send_draft(&SendMessage::new("draft", "bob"))
+                .await
+                .unwrap()
+                .is_none()
+        );
         assert!(channel.update_draft("bob", "msg_1", "text").await.is_ok());
-        assert!(channel
-            .finalize_draft("bob", "msg_1", "final text")
-            .await
-            .is_ok());
+        assert!(
+            channel
+                .finalize_draft("bob", "msg_1", "final text")
+                .await
+                .is_ok()
+        );
         assert!(channel.cancel_draft("bob", "msg_1").await.is_ok());
     }
 
@@ -334,13 +386,17 @@ mod tests {
     async fn default_redact_message_returns_success() {
         let channel = DummyChannel;
 
-        assert!(channel
-            .redact_message("chan_1", "msg_1", Some("spam".to_string()))
-            .await
-            .is_ok());
-        assert!(channel
-            .redact_message("chan_1", "msg_2", None)
-            .await
-            .is_ok());
+        assert!(
+            channel
+                .redact_message("chan_1", "msg_1", Some("spam".to_string()))
+                .await
+                .is_ok()
+        );
+        assert!(
+            channel
+                .redact_message("chan_1", "msg_2", None)
+                .await
+                .is_ok()
+        );
     }
 }

@@ -13,36 +13,39 @@ pub mod api_pairing;
 pub mod api_plugins;
 #[cfg(feature = "webauthn")]
 pub mod api_webauthn;
+pub mod auth_rate_limit;
 pub mod canvas;
 pub mod nodes;
+pub mod session_queue;
+pub mod skill_export;
 pub mod sse;
 pub mod static_files;
 pub mod tls;
 pub mod ws;
 
 use crate::channels::{
-    session_backend::SessionBackend, session_sqlite::SqliteSessionBackend, Channel,
-    GmailPushChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel, WhatsAppChannel,
+    Channel, GmailPushChannel, LinqChannel, NextcloudTalkChannel, SendMessage, WatiChannel,
+    WhatsAppChannel, session_backend::SessionBackend, session_sqlite::SqliteSessionBackend,
 };
 use crate::config::Config;
 use crate::cost::CostTracker;
 use crate::memory::{self, Memory, MemoryCategory};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
-use crate::security::pairing::{constant_time_eq, is_public_bind, PairingGuard};
 use crate::security::SecurityPolicy;
+use crate::security::pairing::{PairingGuard, constant_time_eq, is_public_bind};
 use crate::tools;
 use crate::tools::canvas::CanvasStore;
 use crate::tools::traits::ToolSpec;
 use crate::util::truncate_with_ellipsis;
 use anyhow::{Context, Result};
 use axum::{
+    Router,
     body::Bytes,
     extract::{ConnectInfo, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
     routing::{delete, get, post, put},
-    Router,
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -330,10 +333,13 @@ pub struct AppState {
     pub pairing: Arc<PairingGuard>,
     pub trust_forwarded_headers: bool,
     pub rate_limiter: Arc<GatewayRateLimiter>,
+    pub auth_limiter: Arc<auth_rate_limit::AuthRateLimiter>,
     pub idempotency_store: Arc<IdempotencyStore>,
     pub whatsapp: Option<Arc<WhatsAppChannel>>,
     /// `WhatsApp` app secret for webhook signature verification (`X-Hub-Signature-256`)
     pub whatsapp_app_secret: Option<Arc<str>>,
+    /// Live WhatsApp Web channel instance (Baileys-backed daemon connection)
+    pub whatsapp_web: Option<Arc<dyn crate::channels::traits::Channel>>,
     pub linq: Option<Arc<LinqChannel>>,
     /// Linq webhook signing secret for signature verification
     pub linq_signing_secret: Option<Arc<str>>,
@@ -351,6 +357,8 @@ pub struct AppState {
     pub cost_tracker: Option<Arc<CostTracker>>,
     /// SSE broadcast channel for real-time events
     pub event_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
+    /// Ring buffer of recent events for history replay
+    pub event_buffer: Arc<sse::EventBuffer>,
     /// Shutdown signal sender for graceful shutdown
     pub shutdown_tx: tokio::sync::watch::Sender<bool>,
     /// Registry of dynamically connected nodes
@@ -359,6 +367,8 @@ pub struct AppState {
     pub path_prefix: String,
     /// Session backend for persisting gateway WS chat sessions
     pub session_backend: Option<Arc<dyn SessionBackend>>,
+    /// Per-session actor queue for serializing concurrent turns
+    pub session_queue: Arc<session_queue::SessionActorQueue>,
     /// Device registry for paired device management
     pub device_registry: Option<Arc<api_pairing::DeviceRegistry>>,
     /// Pending pairing request store
@@ -372,7 +382,12 @@ pub struct AppState {
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
 #[allow(clippy::too_many_lines)]
-pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
+pub async fn run_gateway(
+    host: &str,
+    port: u16,
+    config: Config,
+    external_event_tx: Option<tokio::sync::broadcast::Sender<serde_json::Value>>,
+) -> Result<()> {
     // ── Security: warn on public bind without tunnel or explicit opt-in ──
     if is_public_bind(host) && config.tunnel.provider == "none" && !config.gateway.allow_public_bind
     {
@@ -531,8 +546,14 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     // Cost tracker — process-global singleton so channels share the same instance
     let cost_tracker = CostTracker::get_or_init_global(config.cost.clone(), &config.workspace_dir);
 
-    // SSE broadcast channel for real-time events
-    let (event_tx, _event_rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+    // SSE broadcast channel for real-time events.
+    // Use an externally provided sender (e.g. from the daemon) so that other
+    // components (cron, heartbeat) can publish events to the same bus.
+    let event_tx = external_event_tx.unwrap_or_else(|| {
+        let (tx, _rx) = tokio::sync::broadcast::channel::<serde_json::Value>(256);
+        tx
+    });
+    let event_buffer = Arc::new(sse::EventBuffer::new(500));
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -576,6 +597,13 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             })
         })
         .map(Arc::from);
+
+    // WhatsApp Web sends go through the live persistent channel registered by
+    // the channels supervisor (see crate::channels::get_live_whatsapp_channel).
+    // We do NOT create a cold channel here — cold Baileys sessions share the
+    // same session file as the persistent connection and kick it off WhatsApp's
+    // servers the moment they connect.
+    let whatsapp_web_channel: Option<Arc<dyn crate::channels::traits::Channel>> = None;
 
     // Linq channel (if configured)
     let linq_channel: Option<Arc<LinqChannel>> = config.channels_config.linq.as_ref().map(|lq| {
@@ -625,6 +653,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
             Arc::new(NextcloudTalkChannel::new(
                 nc.base_url.clone(),
                 nc.app_token.clone(),
+                nc.bot_name.clone().unwrap_or_default(),
                 nc.allowed_users.clone(),
             ))
         });
@@ -790,6 +819,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         Arc::new(sse::BroadcastObserver::new(
             crate::observability::create_observer(&config.observability),
             event_tx.clone(),
+            event_buffer.clone(),
         ));
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
@@ -824,9 +854,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         pairing,
         trust_forwarded_headers: config.gateway.trust_forwarded_headers,
         rate_limiter,
+        auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
         idempotency_store,
         whatsapp: whatsapp_channel,
         whatsapp_app_secret,
+        whatsapp_web: whatsapp_web_channel,
         linq: linq_channel,
         linq_signing_secret,
         nextcloud_talk: nextcloud_talk_channel,
@@ -837,9 +869,11 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         tools_registry,
         cost_tracker,
         event_tx,
+        event_buffer,
         shutdown_tx,
         node_registry,
         session_backend,
+        session_queue: Arc::new(session_queue::SessionActorQueue::new(8, 30, 600)),
         device_registry,
         pending_pairings,
         path_prefix: path_prefix.unwrap_or("").to_string(),
@@ -885,6 +919,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/health", get(handle_health))
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
+        .route("/pair/code", get(handle_pair_code))
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
@@ -926,7 +961,19 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         .route("/api/cli-tools", get(api::handle_api_cli_tools))
         .route("/api/health", get(api::handle_api_health))
         .route("/api/sessions", get(api::handle_api_sessions_list))
+        .route("/api/sessions/running", get(api::handle_api_sessions_running))
+        .route(
+            "/api/sessions/{id}/messages",
+            get(api::handle_api_session_messages),
+        )
         .route("/api/sessions/{id}", delete(api::handle_api_session_delete).put(api::handle_api_session_rename))
+        .route("/api/sessions/{id}/state", get(api::handle_api_session_state))
+        .route(
+            "/api/channels/whatsapp/send",
+            post(api::handle_whatsapp_web_send),
+        )
+        .route("/api/channels/whatsapp/typing", post(api::handle_whatsapp_typing))
+        .route("/api/chat", post(api::handle_http_chat))
         // ── Pairing + Device management API ──
         .route("/api/pairing/initiate", post(api_pairing::initiate_pairing))
         .route("/api/pair", post(api_pairing::submit_pairing_enhanced))
@@ -987,6 +1034,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
     let inner = inner
         // ── SSE event stream ──
         .route("/api/events", get(sse::handle_sse_events))
+        .route("/api/events/history", get(sse::handle_events_history))
         // ── WebSocket agent chat ──
         .route("/ws/chat", get(ws::handle_ws_chat))
         // ── WebSocket canvas updates ──
@@ -1117,7 +1165,9 @@ async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
 const PROMETHEUS_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
 fn prometheus_disabled_hint() -> String {
-    String::from("# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n")
+    String::from(
+        "# Prometheus backend not enabled. Set [observability] backend = \"prometheus\" in config.\n",
+    )
 }
 
 #[cfg(feature = "observability-prometheus")]
@@ -1183,6 +1233,16 @@ async fn handle_pair(
         return (StatusCode::TOO_MANY_REQUESTS, Json(err));
     }
 
+    // ── Auth rate limiting (brute-force protection) ──
+    if let Err(e) = state.auth_limiter.check_rate_limit(&rate_key) {
+        tracing::warn!("🔐 Pairing auth rate limit exceeded for {rate_key}");
+        let err = serde_json::json!({
+            "error": format!("Too many auth attempts. Try again in {}s.", e.retry_after_secs),
+            "retry_after": e.retry_after_secs,
+        });
+        return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+    }
+
     let code = headers
         .get("X-Pairing-Code")
         .and_then(|v| v.to_str().ok())
@@ -1213,6 +1273,7 @@ async fn handle_pair(
             (StatusCode::OK, Json(body))
         }
         Ok(None) => {
+            state.auth_limiter.record_attempt(&rate_key);
             tracing::warn!("🔐 Pairing attempt with invalid code");
             let err = serde_json::json!({"error": "Invalid pairing code"});
             (StatusCode::FORBIDDEN, Json(err))
@@ -1312,14 +1373,23 @@ async fn handle_webhook(
         return (StatusCode::TOO_MANY_REQUESTS, Json(err));
     }
 
-    // ── Bearer token auth (pairing) ──
+    // ── Bearer token auth (pairing) with auth rate limiting ──
     if state.pairing.require_pairing() {
+        if let Err(e) = state.auth_limiter.check_rate_limit(&rate_key) {
+            tracing::warn!("Webhook: auth rate limit exceeded for {rate_key}");
+            let err = serde_json::json!({
+                "error": format!("Too many auth attempts. Try again in {}s.", e.retry_after_secs),
+                "retry_after": e.retry_after_secs,
+            });
+            return (StatusCode::TOO_MANY_REQUESTS, Json(err));
+        }
         let auth = headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
             .unwrap_or("");
         let token = auth.strip_prefix("Bearer ").unwrap_or("");
         if !state.pairing.is_authenticated(token) {
+            state.auth_limiter.record_attempt(&rate_key);
             tracing::warn!("Webhook: rejected — not paired / invalid bearer token");
             let err = serde_json::json!({
                 "error": "Unauthorized — pair first via POST /pair, then send Authorization: Bearer <token>"
@@ -2177,6 +2247,33 @@ async fn handle_admin_paircode_new(
     }
 }
 
+/// GET /pair/code — fetch the initial pairing code (no auth, no localhost restriction).
+///
+/// This endpoint is intentionally public so that Docker and remote users can see
+/// the pairing code on the web dashboard without needing terminal access. It only
+/// returns a code when the gateway is in its initial un-paired state (no devices
+/// paired yet and a pairing code exists). Once the first device pairs, this
+/// endpoint stops returning a code.
+async fn handle_pair_code(State(state): State<AppState>) -> impl IntoResponse {
+    let require = state.pairing.require_pairing();
+    let is_paired = state.pairing.is_paired();
+
+    // Only expose the code during initial setup (before first pairing)
+    let code = if require && !is_paired {
+        state.pairing.pairing_code()
+    } else {
+        None
+    };
+
+    let body = serde_json::json!({
+        "success": true,
+        "pairing_required": require,
+        "pairing_code": code,
+    });
+
+    (StatusCode::OK, Json(body))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2209,7 +2306,8 @@ mod tests {
     #[test]
     fn gateway_timeout_falls_back_to_default() {
         // When env var is not set, should return the default constant
-        std::env::remove_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("ZEROCLAW_GATEWAY_TIMEOUT_SECS") };
         assert_eq!(gateway_request_timeout_secs(), 30);
     }
 
@@ -2254,9 +2352,11 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2267,10 +2367,14 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -2297,9 +2401,11 @@ mod tests {
     #[tokio::test]
     async fn metrics_endpoint_renders_prometheus_output() {
         let event_tx = tokio::sync::broadcast::channel(16).0;
+        let event_buffer = Arc::new(sse::EventBuffer::new(16));
         let wrapped = sse::BroadcastObserver::new(
             Box::new(crate::observability::PrometheusObserver::new()),
             event_tx.clone(),
+            event_buffer,
         );
         crate::observability::Observer::record_event(
             &wrapped,
@@ -2318,9 +2424,11 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2331,10 +2439,14 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -2548,6 +2660,7 @@ mod tests {
             thread_ts: None,
             interruption_scope_id: None,
             attachments: vec![],
+            real_phone: None,
         };
 
         let key = whatsapp_memory_key(&msg);
@@ -2708,9 +2821,11 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2721,10 +2836,14 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -2782,9 +2901,11 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2795,10 +2916,14 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -2868,9 +2993,11 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2881,10 +3008,14 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -2926,9 +3057,11 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -2939,10 +3072,14 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -2989,9 +3126,11 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -3002,10 +3141,14 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3057,9 +3200,11 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -3070,10 +3215,14 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),
@@ -3101,6 +3250,7 @@ mod tests {
         let channel = Arc::new(NextcloudTalkChannel::new(
             "https://cloud.example.com".into(),
             "app-token".into(),
+            String::new(),
             vec!["*".into()],
         ));
 
@@ -3121,9 +3271,11 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: Some(channel),
@@ -3134,10 +3286,14 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             path_prefix: String::new(),
             session_backend: None,
+            session_queue: std::sync::Arc::new(
+                crate::gateway::session_queue::SessionActorQueue::new(8, 30, 600),
+            ),
             device_registry: None,
             pending_pairings: None,
             canvas_store: CanvasStore::new(),

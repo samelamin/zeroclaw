@@ -5,7 +5,7 @@
 use super::AppState;
 use axum::{
     extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Json},
 };
 use serde::Deserialize;
@@ -42,6 +42,39 @@ pub(super) fn require_auth(
             })),
         ))
     }
+}
+
+// ── Error Classification ────────────────────────────────────────────
+// Maps anyhow::Error to appropriate HTTP status codes with retry hints.
+// Only applies to /api/* routes. Webhook handlers (WhatsApp, Telegram, etc.)
+// in mod.rs have their own error handling and are NOT affected.
+
+/// Classify an error into an HTTP response with appropriate status code.
+fn error_response(err: &anyhow::Error, context: &str) -> impl IntoResponse {
+    let msg = err.to_string().to_lowercase();
+
+    let (status, retry_after, retryable) = if msg.contains("not found") || msg.contains("no such") {
+        (StatusCode::NOT_FOUND, "0", false)
+    } else if msg.contains("rate limit") || msg.contains("too many") {
+        (StatusCode::TOO_MANY_REQUESTS, "60", true)
+    } else if msg.contains("invalid") || msg.contains("bad request") {
+        (StatusCode::BAD_REQUEST, "0", false)
+    } else if msg.contains("busy") || msg.contains("in progress") {
+        (StatusCode::CONFLICT, "5", true)
+    } else if msg.contains("upstream") || msg.contains("provider") || msg.contains("api error") {
+        (StatusCode::BAD_GATEWAY, "10", true)
+    } else {
+        (StatusCode::INTERNAL_SERVER_ERROR, "0", false)
+    };
+
+    (
+        status,
+        [(header::HeaderName::from_static("retry-after"), retry_after)],
+        Json(serde_json::json!({
+            "error": format!("{context}: {err}"),
+            "retryable": retryable,
+        })),
+    )
 }
 
 // ── Query parameters ─────────────────────────────────────────────
@@ -110,13 +143,20 @@ pub async fn handle_api_status(
         channels.insert(channel.name().to_string(), serde_json::Value::Bool(present));
     }
 
+    let locale = config
+        .locale
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .unwrap_or_else(crate::i18n::detect_locale);
+
     let body = serde_json::json!({
         "provider": config.default_provider,
         "model": state.model,
         "temperature": state.temperature,
         "uptime_seconds": health.uptime_seconds,
         "gateway_port": config.gateway.port,
-        "locale": "en",
+        "locale": locale,
         "memory_backend": state.mem.name(),
         "paired": state.pairing.is_paired(),
         "channels": channels,
@@ -142,11 +182,7 @@ pub async fn handle_api_config_get(
     let toml_str = match toml::to_string_pretty(&masked_config) {
         Ok(s) => s,
         Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Failed to serialize config: {e}")})),
-            )
-                .into_response();
+            return error_response(&e.into(), "Failed to serialize config").into_response();
         }
     };
 
@@ -192,11 +228,7 @@ pub async fn handle_api_config_put(
 
     // Save to disk
     if let Err(e) = new_config.save().await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
-        )
-            .into_response();
+        return error_response(&e, "Failed to save config").into_response();
     }
 
     // Update in-memory config
@@ -241,11 +273,7 @@ pub async fn handle_api_cron_list(
     let config = state.config.lock().clone();
     match crate::cron::list_jobs(&config) {
         Ok(jobs) => Json(serde_json::json!({"jobs": jobs})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to list cron jobs: {e}")})),
-        )
-            .into_response(),
+        Err(e) => error_response(&e, "Failed to list cron jobs").into_response(),
     }
 }
 
@@ -337,11 +365,7 @@ pub async fn handle_api_cron_add(
 
     match result {
         Ok(job) => Json(serde_json::json!({"status": "ok", "job": job})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to add cron job: {e}")})),
-        )
-            .into_response(),
+        Err(e) => error_response(&e, "Failed to add cron job").into_response(),
     }
 }
 
@@ -386,11 +410,7 @@ pub async fn handle_api_cron_runs(
                 .collect();
             Json(serde_json::json!({"runs": runs_json})).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to list cron runs: {e}")})),
-        )
-            .into_response(),
+        Err(e) => error_response(&e, "Failed to list cron runs").into_response(),
     }
 }
 
@@ -446,11 +466,7 @@ pub async fn handle_api_cron_patch(
 
     match crate::cron::update_shell_job_with_approval(&config, &id, patch, false) {
         Ok(job) => Json(serde_json::json!({"status": "ok", "job": job})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to update cron job: {e}")})),
-        )
-            .into_response(),
+        Err(e) => error_response(&e, "Failed to update cron job").into_response(),
     }
 }
 
@@ -467,11 +483,7 @@ pub async fn handle_api_cron_delete(
     let config = state.config.lock().clone();
     match crate::cron::remove_job(&config, &id) {
         Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to remove cron job: {e}")})),
-        )
-            .into_response(),
+        Err(e) => error_response(&e, "Failed to remove cron job").into_response(),
     }
 }
 
@@ -516,11 +528,7 @@ pub async fn handle_api_cron_settings_patch(
     }
 
     if let Err(e) = config.save().await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to save config: {e}")})),
-        )
-            .into_response();
+        return error_response(&e, "Failed to save config").into_response();
     }
 
     *state.config.lock() = config.clone();
@@ -644,11 +652,7 @@ pub async fn handle_api_memory_list(
         let until = params.until.as_deref();
         match state.mem.recall(query, 50, None, since, until).await {
             Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Memory recall failed: {e}")})),
-            )
-                .into_response(),
+            Err(e) => error_response(&e, "Memory recall failed").into_response(),
         }
     } else {
         // List mode
@@ -661,11 +665,7 @@ pub async fn handle_api_memory_list(
 
         match state.mem.list(category.as_ref(), None).await {
             Ok(entries) => Json(serde_json::json!({"entries": entries})).into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Memory list failed: {e}")})),
-            )
-                .into_response(),
+            Err(e) => error_response(&e, "Memory list failed").into_response(),
         }
     }
 }
@@ -697,11 +697,7 @@ pub async fn handle_api_memory_store(
         .await
     {
         Ok(()) => Json(serde_json::json!({"status": "ok"})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Memory store failed: {e}")})),
-        )
-            .into_response(),
+        Err(e) => error_response(&e, "Memory store failed").into_response(),
     }
 }
 
@@ -719,11 +715,7 @@ pub async fn handle_api_memory_delete(
         Ok(deleted) => {
             Json(serde_json::json!({"status": "ok", "deleted": deleted})).into_response()
         }
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Memory forget failed: {e}")})),
-        )
-            .into_response(),
+        Err(e) => error_response(&e, "Memory forget failed").into_response(),
     }
 }
 
@@ -739,11 +731,7 @@ pub async fn handle_api_cost(
     if let Some(ref tracker) = state.cost_tracker {
         match tracker.get_summary() {
             Ok(summary) => Json(serde_json::json!({"cost": summary})).into_response(),
-            Err(e) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": format!("Cost summary failed: {e}")})),
-            )
-                .into_response(),
+            Err(e) => error_response(&e, "Cost summary failed").into_response(),
         }
     } else {
         Json(serde_json::json!({
@@ -1056,6 +1044,7 @@ fn mask_sensitive_fields(config: &crate::config::Config) -> crate::config::Confi
     if let Some(email) = masked.channels_config.email.as_mut() {
         mask_required_secret(&mut email.password);
     }
+    mask_optional_secret(&mut masked.transcription.api_key);
     masked
 }
 
@@ -1243,6 +1232,10 @@ fn restore_masked_sensitive_fields(
     ) {
         restore_required_secret(&mut incoming_ch.password, &current_ch.password);
     }
+    restore_optional_secret(
+        &mut incoming.transcription.api_key,
+        &current.transcription.api_key,
+    );
 }
 
 fn hydrate_config_for_save(
@@ -1296,6 +1289,40 @@ pub async fn handle_api_sessions_list(
     Json(serde_json::json!({ "sessions": gw_sessions })).into_response()
 }
 
+/// GET /api/sessions/{id}/messages — load persisted gateway WebSocket chat transcript
+pub async fn handle_api_session_messages(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return Json(serde_json::json!({
+            "session_id": id,
+            "messages": [],
+            "session_persistence": false,
+        }))
+        .into_response();
+    };
+
+    let session_key = format!("gw_{id}");
+    let msgs = backend.load(&session_key);
+    let messages: Vec<serde_json::Value> = msgs
+        .into_iter()
+        .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+        .collect();
+
+    Json(serde_json::json!({
+        "session_id": id,
+        "messages": messages,
+        "session_persistence": true,
+    }))
+    .into_response()
+}
+
 /// DELETE /api/sessions/{id} — delete a gateway session
 pub async fn handle_api_session_delete(
     State(state): State<AppState>,
@@ -1322,11 +1349,7 @@ pub async fn handle_api_session_delete(
             Json(serde_json::json!({"error": "Session not found"})),
         )
             .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to delete session: {e}")})),
-        )
-            .into_response(),
+        Err(e) => error_response(&anyhow::anyhow!(e), "Failed to delete session").into_response(),
     }
 }
 
@@ -1372,9 +1395,85 @@ pub async fn handle_api_session_rename(
 
     match backend.set_session_name(&session_key, name) {
         Ok(()) => Json(serde_json::json!({"session_id": id, "name": name})).into_response(),
+        Err(e) => error_response(&anyhow::anyhow!(e), "Failed to rename session").into_response(),
+    }
+}
+
+/// GET /api/sessions/running — list sessions currently in "running" state
+pub async fn handle_api_sessions_running(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return Json(serde_json::json!({
+            "sessions": [],
+            "message": "Session persistence is disabled"
+        }))
+        .into_response();
+    };
+
+    let running = backend.list_running_sessions();
+    let sessions: Vec<serde_json::Value> = running
+        .into_iter()
+        .filter_map(|meta| {
+            let session_id = meta.key.strip_prefix("gw_")?;
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "created_at": meta.created_at.to_rfc3339(),
+                "last_activity": meta.last_activity.to_rfc3339(),
+                "message_count": meta.message_count,
+            }))
+        })
+        .collect();
+
+    Json(serde_json::json!({ "sessions": sessions })).into_response()
+}
+
+/// GET /api/sessions/{id}/state — get session state
+pub async fn handle_api_session_state(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let Some(ref backend) = state.session_backend else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session persistence is disabled"})),
+        )
+            .into_response();
+    };
+
+    let session_key = format!("gw_{id}");
+    match backend.get_session_state(&session_key) {
+        Ok(Some(ss)) => {
+            let mut resp = serde_json::json!({
+                "session_id": id,
+                "state": ss.state,
+            });
+            if let Some(turn_id) = ss.turn_id {
+                resp["turn_id"] = serde_json::Value::String(turn_id);
+            }
+            if let Some(started) = ss.turn_started_at {
+                resp["turn_started_at"] = serde_json::Value::String(started.to_rfc3339());
+            }
+            Json(resp).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "Session not found"})),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": format!("Failed to rename session: {e}")})),
+            Json(serde_json::json!({"error": format!("Failed to get session state: {e}")})),
         )
             .into_response(),
     }
@@ -1408,16 +1507,196 @@ pub async fn handle_claude_code_hook(
     Json(serde_json::json!({ "ok": true }))
 }
 
+// ── WhatsApp Web send ────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub(super) struct WhatsAppWebSendBody {
+    pub recipient: String,
+    pub message: String,
+}
+
+/// `POST /api/channels/whatsapp/send` — send a message via the live WhatsApp Web
+/// daemon connection (Baileys-backed). Returns 503 if no channel is wired up yet.
+pub(super) async fn handle_whatsapp_web_send(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<WhatsAppWebSendBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    // Use the live persistent channel from the channels supervisor.
+    // We deliberately do NOT fall back to cold-send: opening a second Baileys
+    // session from the same session file kicks the persistent connection off
+    // WhatsApp's servers, breaking inbound message delivery.
+    let channel = match state
+        .whatsapp_web
+        .clone()
+        .or_else(crate::channels::get_live_whatsapp_channel)
+    {
+        Some(ch) if ch.is_connected() => ch,
+        Some(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "WhatsApp Web channel is reconnecting — retry in a moment"
+                })),
+            )
+                .into_response();
+        }
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "WhatsApp Web channel is not connected"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let msg = crate::channels::traits::SendMessage::new(body.message, body.recipient);
+    match channel.send_with_ack(&msg).await {
+        Ok(ack) => {
+            let mut body = serde_json::json!({ "ok": true });
+            if let Some(message_id) = ack.message_id {
+                body["message_id"] = serde_json::Value::String(message_id);
+            }
+            Json(body).into_response()
+        }
+        Err(e) => error_response(&e, "Failed to send WhatsApp Web message").into_response(),
+    }
+}
+
+// ── WhatsApp Web typing ──────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub(super) struct WhatsAppTypingBody {
+    pub recipient: String,
+}
+
+/// `POST /api/channels/whatsapp/typing` — send a "composing" chatstate to the
+/// given recipient. Naseyma calls this before/during inference so the customer
+/// sees a typing indicator. Returns 503 if channel not live.
+pub(super) async fn handle_whatsapp_typing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<WhatsAppTypingBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let channel = match crate::channels::get_live_whatsapp_channel() {
+        Some(ch) if ch.is_connected() => ch,
+        Some(_) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "WhatsApp Web channel is reconnecting"
+                })),
+            )
+                .into_response();
+        }
+        None => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "WhatsApp Web channel is not connected"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match channel.start_typing(&body.recipient).await {
+        Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
+        Err(e) => error_response(&e, "Failed to send typing indicator").into_response(),
+    }
+}
+
+// ── HTTP Chat (synchronous inference) ───────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub(super) struct HttpChatBody {
+    pub message: String,
+    pub session_id: Option<String>,
+    /// Optional system prompt override — replaces the config-derived system prompt.
+    pub system_prompt: Option<String>,
+}
+
+/// `POST /api/chat` — synchronous (non-streaming) inference via ZeroClaw's native
+/// agentic loop. Returns the final text response after all tool calls complete.
+pub(super) async fn handle_http_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<HttpChatBody>,
+) -> impl IntoResponse {
+    if let Err(e) = require_auth(&state, &headers) {
+        return e.into_response();
+    }
+
+    let config = state.config.lock().clone();
+    let mut agent = match crate::agent::Agent::from_config(&config).await {
+        Ok(a) => a,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": format!("Agent init failed: {e}") })),
+            )
+                .into_response();
+        }
+    };
+
+    // Apply system prompt override if provided
+    if let Some(ref sys) = body.system_prompt {
+        agent = agent.with_system_prompt(sys.clone());
+    }
+
+    // Hydrate from persisted session if session_id provided
+    if let (Some(session_id), Some(backend)) = (&body.session_id, &state.session_backend) {
+        let session_key = format!("gw_{session_id}");
+        let messages = backend.load(&session_key);
+        if !messages.is_empty() {
+            agent.seed_history(&messages);
+        }
+        agent.set_memory_session_id(Some(session_id.clone()));
+    }
+
+    // Run synchronous turn (full agentic loop with tools)
+    match agent.turn(&body.message).await {
+        Ok(response) => {
+            // Persist to session backend if session_id provided
+            if let (Some(session_id), Some(backend)) = (&body.session_id, &state.session_backend) {
+                let session_key = format!("gw_{session_id}");
+                let user_msg = crate::providers::ChatMessage::user(&body.message);
+                let assistant_msg = crate::providers::ChatMessage::assistant(&response);
+                let _ = backend.append(&session_key, &user_msg);
+                let _ = backend.append(&session_key, &assistant_msg);
+            }
+            Json(serde_json::json!({ "text": response })).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": format!("Inference failed: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gateway::{nodes, AppState, GatewayRateLimiter, IdempotencyStore};
+    use crate::channels::traits::{Channel, SendMessage};
+    use crate::gateway::{AppState, GatewayRateLimiter, IdempotencyStore, nodes};
     use crate::memory::{Memory, MemoryCategory, MemoryEntry};
     use crate::providers::Provider;
     use crate::security::pairing::PairingGuard;
     use async_trait::async_trait;
     use axum::response::IntoResponse;
     use http_body_util::BodyExt;
+    use parking_lot::Mutex as ParkingLotMutex;
     use parking_lot::Mutex;
     use std::sync::Arc;
     use std::time::Duration;
@@ -1491,6 +1770,44 @@ mod tests {
         }
     }
 
+    struct MockWhatsAppWebChannel {
+        sent_messages: ParkingLotMutex<Vec<SendMessage>>,
+        message_id: String,
+    }
+
+    #[async_trait]
+    impl Channel for MockWhatsAppWebChannel {
+        fn name(&self) -> &str {
+            "whatsapp"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent_messages.lock().push(message.clone());
+            Ok(())
+        }
+
+        async fn send_with_ack(
+            &self,
+            message: &SendMessage,
+        ) -> anyhow::Result<crate::channels::traits::SendMessageAck> {
+            self.sent_messages.lock().push(message.clone());
+            Ok(crate::channels::traits::SendMessageAck {
+                message_id: Some(self.message_id.clone()),
+            })
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<crate::channels::traits::ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn is_connected(&self) -> bool {
+            true
+        }
+    }
+
     fn test_state(config: crate::config::Config) -> AppState {
         AppState {
             config: Arc::new(Mutex::new(config)),
@@ -1503,9 +1820,11 @@ mod tests {
             pairing: Arc::new(PairingGuard::new(false, &[])),
             trust_forwarded_headers: false,
             rate_limiter: Arc::new(GatewayRateLimiter::new(100, 100, 100)),
+            auth_limiter: Arc::new(crate::gateway::auth_rate_limit::AuthRateLimiter::new()),
             idempotency_store: Arc::new(IdempotencyStore::new(Duration::from_secs(300), 1000)),
             whatsapp: None,
             whatsapp_app_secret: None,
+            whatsapp_web: None,
             linq: None,
             linq_signing_secret: None,
             nextcloud_talk: None,
@@ -1516,9 +1835,13 @@ mod tests {
             tools_registry: Arc::new(Vec::new()),
             cost_tracker: None,
             event_tx: tokio::sync::broadcast::channel(16).0,
+            event_buffer: Arc::new(crate::gateway::sse::EventBuffer::new(16)),
             shutdown_tx: tokio::sync::watch::channel(false).0,
             node_registry: Arc::new(nodes::NodeRegistry::new(16)),
             session_backend: None,
+            session_queue: Arc::new(crate::gateway::session_queue::SessionActorQueue::new(
+                8, 30, 600,
+            )),
             device_registry: None,
             pending_pairings: None,
             path_prefix: String::new(),
@@ -1536,6 +1859,41 @@ mod tests {
             .expect("response body")
             .to_bytes();
         serde_json::from_slice(&body).expect("valid json response")
+    }
+
+    #[tokio::test]
+    async fn whatsapp_web_send_returns_message_id_when_channel_provides_one() {
+        let cfg = crate::config::Config::default();
+        let mut state = test_state(cfg);
+        let channel = Arc::new(MockWhatsAppWebChannel {
+            sent_messages: ParkingLotMutex::new(Vec::new()),
+            message_id: "wa-test-123".to_string(),
+        });
+        state.whatsapp_web = Some(channel.clone());
+
+        let response = handle_whatsapp_web_send(
+            State(state),
+            HeaderMap::new(),
+            Json(WhatsAppWebSendBody {
+                recipient: "15551234567@s.whatsapp.net".to_string(),
+                message: "hello from test".to_string(),
+            }),
+        )
+        .await
+        .into_response();
+
+        let body = response_json(response).await;
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "ok": true,
+                "message_id": "wa-test-123"
+            })
+        );
+        let sent = channel.sent_messages.lock();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].recipient, "15551234567@s.whatsapp.net");
+        assert_eq!(sent[0].content, "hello from test");
     }
 
     #[test]
@@ -1578,6 +1936,7 @@ mod tests {
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
             default_subject: "ZeroClaw Message".to_string(),
+            max_attachment_bytes: 25 * 1024 * 1024,
         });
         cfg.model_routes = vec![crate::config::schema::ModelRouteConfig {
             hint: "reasoning".to_string(),
@@ -1714,6 +2073,7 @@ mod tests {
             idle_timeout_secs: 1740,
             allowed_senders: vec!["*".to_string()],
             default_subject: "ZeroClaw Message".to_string(),
+            max_attachment_bytes: 25 * 1024 * 1024,
         });
         current.model_routes = vec![
             crate::config::schema::ModelRouteConfig {
@@ -1939,14 +2299,18 @@ mod tests {
             Some("route-embed-key-1")
         );
         assert_eq!(hydrated.embedding_routes[2].api_key, None);
-        assert!(hydrated
-            .model_routes
-            .iter()
-            .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET)));
-        assert!(hydrated
-            .embedding_routes
-            .iter()
-            .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET)));
+        assert!(
+            hydrated
+                .model_routes
+                .iter()
+                .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET))
+        );
+        assert!(
+            hydrated
+                .embedding_routes
+                .iter()
+                .all(|route| route.api_key.as_deref() != Some(MASKED_SECRET))
+        );
     }
 
     #[tokio::test]
@@ -2068,10 +2432,12 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = response_json(response).await;
-        assert!(json["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("delivery.to is required"));
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("delivery.to is required")
+        );
 
         let config = state.config.lock().clone();
         assert!(crate::cron::list_jobs(&config).unwrap().is_empty());
@@ -2110,10 +2476,12 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let json = response_json(response).await;
-        assert!(json["error"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("unsupported delivery channel"));
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("unsupported delivery channel")
+        );
 
         let config = state.config.lock().clone();
         assert!(crate::cron::list_jobs(&config).unwrap().is_empty());

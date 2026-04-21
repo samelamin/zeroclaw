@@ -1,7 +1,7 @@
+use super::Provider;
 use super::traits::{
     ChatMessage, ChatRequest, ChatResponse, StreamChunk, StreamEvent, StreamOptions, StreamResult,
 };
-use super::Provider;
 use crate::config::schema::ModelPricing;
 use async_trait::async_trait;
 use futures_util::stream::BoxStream;
@@ -127,6 +127,36 @@ impl RouterProvider {
              falling back to default"
         );
         (self.default_index, self.default_model.clone())
+    }
+
+    /// Resolve model based on estimated task complexity.
+    /// Low complexity (< 30): use cost-optimized route (cheapest capable model)
+    /// Medium complexity (30-70): use default route
+    /// High complexity (> 70): use default route (most capable)
+    pub fn resolve_by_complexity(
+        &self,
+        complexity: u32,
+        prices: &HashMap<String, ModelPricing>,
+        needs_vision: bool,
+        needs_tools: bool,
+    ) -> Option<(usize, String)> {
+        if complexity < 30 {
+            // Try cost-optimized first for simple tasks
+            let result = self.resolve_cost_optimized(
+                "hint:cost-optimized",
+                prices,
+                needs_vision,
+                needs_tools,
+            );
+            // Only use cost-optimized if it didn't fall back to default
+            if result.1 != self.default_model {
+                tracing::debug!(complexity, "Using cost-optimized model for simple task");
+                return Some(result);
+            }
+        }
+        // For medium/high complexity or if cost-optimized fails, use default
+        tracing::debug!(complexity, "Using default model");
+        None // caller falls through to default provider
     }
 
     /// Resolve a model parameter to a (provider, actual_model) pair.
@@ -320,8 +350,8 @@ mod tests {
     use super::*;
     use crate::tools::ToolSpec;
     use futures_util::StreamExt;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct MockProvider {
         calls: Arc<AtomicUsize>,
@@ -376,7 +406,7 @@ mod tests {
             .zip(mocks.iter())
             .map(|((name, _), mock)| {
                 (
-                    name.to_string(),
+                    (*name).to_string(),
                     Box::new(Arc::clone(mock)) as Box<dyn Provider>,
                 )
             })
@@ -386,10 +416,10 @@ mod tests {
             .iter()
             .map(|(hint, provider_name, model)| {
                 (
-                    hint.to_string(),
+                    (*hint).to_string(),
                     Route {
-                        provider_name: provider_name.to_string(),
-                        model: model.to_string(),
+                        provider_name: (*provider_name).to_string(),
+                        model: (*model).to_string(),
                     },
                 )
             })
@@ -1154,6 +1184,7 @@ mod tests {
             ChatRequest {
                 messages: &messages,
                 tools: Some(&tools),
+                thinking_level: None,
             },
             "hint:reasoning",
             0.0,

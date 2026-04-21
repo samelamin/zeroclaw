@@ -1,62 +1,563 @@
 # English tool descriptions (default locale)
 #
-# Each key under [tools] matches the tool's name() return value.
-# Values are the human-readable descriptions shown in system prompts.
+# Schema: each top-level section matches a tool's name() return value.
+# Every section must contain exactly these five fields, all non-empty:
+#
+#   purpose = "One sentence: what the tool does. Starts with an imperative verb."
+#   when    = "When to use it — and when NOT to, by contrast. Two sentences max."
+#   example = '''
+#   Input:  <concrete argument example>
+#   Output: <what a successful return looks like>
+#   '''
+#   success = "One sentence: how a positive result looks so the model knows it worked."
+#   failure = "One sentence: the error shape, so the model can recognize and recover."
 
-[tools]
-backup = "Create, list, verify, and restore workspace backups"
-browser = "Web/browser automation with pluggable backends (agent-browser, rust-native, computer_use). Supports DOM actions plus optional OS-level actions (mouse_move, mouse_click, mouse_drag, key_type, key_press, screen_capture) through a computer-use sidecar. Use 'snapshot' to map interactive elements to refs (@e1, @e2). Enforces browser.allowed_domains for open actions."
-browser_delegate = "Delegate browser-based tasks to a browser-capable CLI for interacting with web applications like Teams, Outlook, Jira, Confluence"
-browser_open = "Open an approved HTTPS URL in the system browser. Security constraints: allowlist-only domains, no local/private hosts, no scraping."
-cloud_ops = "Cloud transformation advisory tool. Analyzes IaC plans, assesses migration paths, reviews costs, and checks architecture against Well-Architected Framework pillars. Read-only: does not create or modify cloud resources."
-cloud_patterns = "Cloud pattern library. Given a workload description, suggests applicable cloud-native architectural patterns (containerization, serverless, database modernization, etc.)."
-composio = "Execute actions on 1000+ apps via Composio (Gmail, Notion, GitHub, Slack, etc.). Use action='list' to see available actions (includes parameter names). action='execute' with action_name/tool_slug and params to run an action. If you are unsure of the exact params, pass 'text' instead with a natural-language description of what you want (Composio will resolve the correct parameters via NLP). action='list_accounts' or action='connected_accounts' to list OAuth-connected accounts. action='connect' with app/auth_config_id to get OAuth URL. connected_account_id is auto-resolved when omitted."
-content_search = "Search file contents by regex pattern within the workspace. Supports ripgrep (rg) with grep fallback. Output modes: 'content' (matching lines with context), 'files_with_matches' (file paths only), 'count' (match counts per file). Example: pattern='fn main', include='*.rs', output_mode='content'."
-cron_add = """Create a scheduled cron job (shell or agent) with cron/at/every schedules. Use job_type='agent' with a prompt to run the AI agent on schedule. To deliver output to a channel (Discord, Telegram, Slack, Mattermost, Matrix), set delivery={"mode":"announce","channel":"discord","to":"<channel_id_or_chat_id>"}. This is the preferred tool for sending scheduled/delayed messages to users via channels."""
-cron_list = "List all scheduled cron jobs"
-cron_remove = "Remove a cron job by id"
-cron_run = "Force-run a cron job immediately and record run history"
-cron_runs = "List recent run history for a cron job"
-cron_update = "Patch an existing cron job (schedule, command, prompt, enabled, delivery, model, etc.)"
-data_management = "Workspace data retention, purge, and storage statistics"
-delegate = "Delegate a subtask to a specialized agent. Use when: a task benefits from a different model (e.g. fast summarization, deep reasoning, code generation). The sub-agent runs a single prompt by default; with agentic=true it can iterate with a filtered tool-call loop."
-file_edit = "Edit a file by replacing an exact string match with new content"
-file_read = "Read file contents with line numbers. Supports partial reading via offset and limit. Extracts text from PDF; other binary files are read with lossy UTF-8 conversion."
-file_write = "Write contents to a file in the workspace"
-git_operations = "Perform structured Git operations (status, diff, log, branch, commit, add, checkout, stash). Provides parsed JSON output and integrates with security policy for autonomy controls."
-glob_search = "Search for files matching a glob pattern within the workspace. Returns a sorted list of matching file paths relative to the workspace root. Examples: '**/*.rs' (all Rust files), 'src/**/mod.rs' (all mod.rs in src)."
-google_workspace = "Interact with Google Workspace services (Drive, Gmail, Calendar, Sheets, Docs, etc.) via the gws CLI. Requires gws to be installed and authenticated."
-hardware_board_info = "Return full board info (chip, architecture, memory map) for connected hardware. Use when: user asks for 'board info', 'what board do I have', 'connected hardware', 'chip info', 'what hardware', or 'memory map'."
-hardware_memory_map = "Return the memory map (flash and RAM address ranges) for connected hardware. Use when: user asks for 'upper and lower memory addresses', 'memory map', 'address space', or 'readable addresses'. Returns flash/RAM ranges from datasheets."
-hardware_memory_read = "Read actual memory/register values from Nucleo via USB. Use when: user asks to 'read register values', 'read memory at address', 'dump memory', 'lower memory 0-126', or 'give address and value'. Returns hex dump. Requires Nucleo connected via USB and probe feature. Params: address (hex, e.g. 0x20000000 for RAM start), length (bytes, default 128)."
-http_request = "Make HTTP requests to external APIs. Supports GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS methods. Security constraints: allowlist-only domains, no local/private hosts, configurable timeout and response size limits."
-image_info = "Read image file metadata (format, dimensions, size) and optionally return base64-encoded data."
-jira = "Interact with Jira: get tickets with configurable detail level, search issues with JQL, and add comments with mention and formatting support."
-knowledge = "Manage a knowledge graph of architecture decisions, solution patterns, lessons learned, and experts. Actions: capture, search, relate, suggest, expert_find, lessons_extract, graph_stats."
-linkedin = "Manage LinkedIn: create posts, list your posts, comment, react, delete posts, view engagement, get profile info, and read the configured content strategy. Requires LINKEDIN_* credentials in .env file."
-discord_search = "Search Discord message history stored in discord.db. Use to find past messages, summarize channel activity, or look up what users said. Supports keyword search and optional filters: channel_id, since, until."
-memory_forget = "Remove a memory by key. Use to delete outdated facts or sensitive data. Returns whether the memory was found and removed."
-memory_recall = "Search long-term memory for relevant facts, preferences, or context. Returns scored results ranked by relevance."
-memory_store = "Store a fact, preference, or note in long-term memory. Use category 'core' for permanent facts, 'daily' for session notes, 'conversation' for chat context, or a custom category name."
-microsoft365 = "Microsoft 365 integration: manage Outlook mail, Teams messages, Calendar events, OneDrive files, and SharePoint search via Microsoft Graph API"
-model_routing_config = "Manage default model settings, scenario-based provider/model routes, classification rules, and delegate sub-agent profiles"
-notion = "Interact with Notion: query databases, read/create/update pages, and search the workspace."
-pdf_read = "Extract plain text from a PDF file in the workspace. Returns all readable text. Image-only or encrypted PDFs return an empty result. Requires the 'rag-pdf' build feature."
-project_intel = "Project delivery intelligence: generate status reports, detect risks, draft client updates, summarize sprints, and estimate effort. Read-only analysis tool."
-proxy_config = "Manage ZeroClaw proxy settings (scope: environment | zeroclaw | services), including runtime and process env application"
-pushover = "Send a Pushover notification to your device. Requires PUSHOVER_TOKEN and PUSHOVER_USER_KEY in .env file."
-schedule = """Manage scheduled shell-only tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. WARNING: This tool creates shell jobs whose output is only logged, NOT delivered to any channel. To send a scheduled message to Discord/Telegram/Slack/Matrix, use the cron_add tool with job_type='agent' and a delivery config like {"mode":"announce","channel":"discord","to":"<channel_id>"}."""
-screenshot = "Capture a screenshot of the current screen. Returns the file path and base64-encoded PNG data."
-security_ops = "Security operations tool for managed cybersecurity services. Actions: triage_alert (classify/prioritize alerts), run_playbook (execute incident response steps), parse_vulnerability (parse scan results), generate_report (create security posture reports), list_playbooks (list available playbooks), alert_stats (summarize alert metrics)."
-shell = "Execute a shell command in the workspace directory"
-sop_advance = "Report the result of the current SOP step and advance to the next step. Provide the run_id, whether the step succeeded or failed, and a brief output summary."
-sop_approve = "Approve a pending SOP step that is waiting for operator approval. Returns the step instruction to execute. Use sop_status to see which runs are waiting."
-sop_execute = "Manually trigger a Standard Operating Procedure (SOP) by name. Returns the run ID and first step instruction. Use sop_list to see available SOPs."
-sop_list = "List all loaded Standard Operating Procedures (SOPs) with their triggers, priority, step count, and active run count. Optionally filter by name or priority."
-sop_status = "Query SOP execution status. Provide run_id for a specific run, or sop_name to list runs for that SOP. With no arguments, shows all active runs."
-swarm = "Orchestrate a swarm of agents to collaboratively handle a task. Supports sequential (pipeline), parallel (fan-out/fan-in), and router (LLM-selected) strategies."
-tool_search = """Fetch full schema definitions for deferred MCP tools so they can be called. Use "select:name1,name2" for exact match or keywords to search."""
-web_fetch = "Fetch a web page and return its content as clean plain text. HTML pages are automatically converted to readable text. JSON and plain text responses are returned as-is. Only GET requests; follows redirects. Security: allowlist-only domains, no local/private hosts."
-web_search_tool = "Search the web for information. Returns relevant search results with titles, URLs, and descriptions. Use this to find current information, news, or research topics."
-workspace = "Manage multi-client workspaces. Subcommands: list, switch, create, info, export. Each workspace provides isolated memory, audit, secrets, and tool restrictions."
-weather = "Get current weather conditions and forecast for any location worldwide. Supports city names (in any language or script), IATA airport codes (e.g. 'LAX'), GPS coordinates (e.g. '51.5,-0.1'), postal/zip codes, and domain-based geolocation. Returns temperature, feels-like, humidity, wind speed/direction, precipitation, visibility, pressure, UV index, and cloud cover. Optional 0–3 day forecast with hourly breakdown. Units default to metric (°C, km/h, mm) but can be set to imperial (°F, mph, inches) per request. No API key required."
+[backup]
+purpose = "Create, list, verify, or restore a point-in-time snapshot of the workspace."
+when = "Use before destructive operations (bulk edits, schema migrations) or to audit past states. Do not use as a substitute for git — backups are local workspace snapshots, not version control."
+example = '''
+Input:  {"command": "create", "label": "before-refactor"}
+Output: Backup created: backup-20260421T143002-before-refactor.tar.gz (1.2 MB)
+'''
+success = "Output contains 'Backup created' (or a file listing / restored path) and no error field."
+failure = "Returns success=false with an error like 'permission denied' or 'no backup found matching label'."
+
+[browser]
+purpose = "Automate a real browser — navigate pages, click elements, fill forms, and capture screenshots."
+when = "Use when a task requires live web interaction such as logging in, submitting forms, or scraping dynamic JS-rendered content. Do not use for static page fetching — use web_fetch instead."
+example = '''
+Input:  {"action": "navigate", "url": "https://example.com"}
+Output: Navigated to https://example.com — title: "Example Domain"
+'''
+success = "Output confirms the action completed (navigation title, element text, or screenshot path) with no error."
+failure = "Returns success=false with an error like 'domain not in allowed list', 'element not found: @e5', or 'timeout waiting for selector'."
+
+[browser_delegate]
+purpose = "Delegate a browser-based task to a browser-capable CLI subprocess (e.g. agent-browser)."
+when = "Use when the local browser tool is unavailable or when the task requires a headless CLI that handles its own session. Do not use when the browser tool is already configured — prefer it for direct control."
+example = '''
+Input:  {"task": "Log into Jira at https://acme.atlassian.net and return the count of open P1 issues"}
+Output: Task completed: 7 open P1 issues found.
+'''
+success = "Output contains the task result text returned by the CLI subprocess with success=true."
+failure = "Returns success=false with 'CLI not found', 'subprocess exited with code 1', or the CLI's own error message."
+
+[browser_open]
+purpose = "Open an approved HTTPS URL in the system's default browser."
+when = "Use to present a URL to the user for manual inspection. Do not use for automated scraping or interaction — use browser or web_fetch for that."
+example = '''
+Input:  {"url": "https://docs.example.com/api"}
+Output: Opened https://docs.example.com/api in system browser.
+'''
+success = "Output contains 'Opened' and the URL with success=true."
+failure = "Returns success=false with 'domain not in allowlist', 'not an HTTPS URL', or 'failed to launch browser'."
+
+[cloud_ops]
+purpose = "Analyze IaC plans, assess cloud migration paths, review costs, and check Well-Architected Framework alignment."
+when = "Use for advisory analysis of infrastructure-as-code (Terraform, CloudFormation) or migration planning. Do not use to create or modify cloud resources — this tool is read-only analysis."
+example = '''
+Input:  {"action": "analyze_plan", "content": "<terraform plan output>"}
+Output: Risk: HIGH — IAM policy grants s3:* on *. Recommendation: scope to specific bucket ARN.
+'''
+success = "Output contains a structured analysis with risk levels or recommendations and success=true."
+failure = "Returns success=false with 'unrecognized IaC format' or 'action not supported'."
+
+[cloud_patterns]
+purpose = "Suggest applicable cloud-native architectural patterns for a described workload."
+when = "Use early in architecture design to enumerate candidate patterns (containerization, serverless, event-driven, etc.). Do not use for cost estimation or compliance checks — use cloud_ops for those."
+example = '''
+Input:  {"workload": "batch image processing triggered by S3 uploads, 10-minute jobs"}
+Output: Patterns: AWS Lambda (short jobs) or AWS Batch (long jobs), S3 event notifications, SQS for retry.
+'''
+success = "Output lists named patterns with brief rationale and success=true."
+failure = "Returns success=false with 'workload description too vague to suggest patterns'."
+
+[composio]
+purpose = "Execute actions on 1000+ external apps (Gmail, GitHub, Slack, Notion, etc.) via the Composio integration platform."
+when = "Use when you need to interact with a third-party SaaS app that has no dedicated tool. Do not use for actions already covered by a native tool (e.g. jira, linkedin, microsoft365)."
+example = '''
+Input:  {"action": "execute", "action_name": "GMAIL_SEND_EMAIL", "tool_slug": "gmail", "params": {"to": "bob@example.com", "subject": "Hello", "body": "Test"}}
+Output: Email sent. Message ID: 18f2a3b4c5d6e7f8
+'''
+success = "Output contains a confirmation message or result payload with success=true."
+failure = "Returns success=false with 'action not found', 'app not connected', or an OAuth error from Composio."
+
+[content_search]
+purpose = "Search file contents by regex pattern within the workspace using ripgrep."
+when = "Use to find code, strings, or patterns inside files. Do not use to find files by name — use glob_search for that. Do not use to retrieve remembered facts — use recall for that."
+example = '''
+Input:  {"pattern": "fn execute\\(", "include": "*.rs", "output_mode": "content"}
+Output: src/tools/shell.rs:323:    async fn execute(&self, args: serde_json::Value) -> anyhow::Result<ToolResult> {
+'''
+success = "Output lists matching lines (content mode) or file paths (files_with_matches mode) with success=true."
+failure = "Returns success=false with 'invalid regex pattern', 'workspace not accessible', or an empty result when no matches exist."
+
+[cron_add]
+purpose = "Create a scheduled cron job that runs a shell command or agent prompt on a recurring schedule."
+when = "Use to automate repeating tasks (hourly reports, daily backups, timed notifications). Do not use for one-shot delayed execution — use the schedule tool for that."
+example = '''
+Input:  {"schedule": "0 9 * * 1-5", "job_type": "agent", "prompt": "Summarize open GitHub issues and post to Discord", "delivery": {"mode": "announce", "channel": "discord", "to": "1234567890"}}
+Output: Cron job created: id=cron_abc123, next run: 2026-04-22T09:00:00Z
+'''
+success = "Output contains 'Cron job created' with a job id and next scheduled run time."
+failure = "Returns success=false with 'invalid cron expression', 'delivery channel not configured', or 'job_type not supported'."
+
+[cron_list]
+purpose = "List all scheduled cron jobs with their id, schedule, type, and enabled status."
+when = "Use to inspect what recurring jobs exist before adding or modifying one. Do not use to view run history — use cron_runs for that."
+example = '''
+Input:  {}
+Output: [{"id": "cron_abc123", "schedule": "0 9 * * 1-5", "job_type": "agent", "enabled": true, "next_run": "2026-04-22T09:00:00Z"}]
+'''
+success = "Output is a JSON array of job objects (possibly empty) with success=true."
+failure = "Returns success=false with 'failed to read cron store' or a storage I/O error."
+
+[cron_remove]
+purpose = "Delete a scheduled cron job by its id."
+when = "Use to permanently remove a cron job. Do not use if you only want to pause it — use cron_update with enabled=false instead."
+example = '''
+Input:  {"id": "cron_abc123"}
+Output: Cron job cron_abc123 removed.
+'''
+success = "Output contains 'removed' and the job id with success=true."
+failure = "Returns success=false with 'job not found: cron_abc123' or a storage write error."
+
+[cron_run]
+purpose = "Force-run a scheduled cron job immediately and record the result in run history."
+when = "Use to test a cron job before its next scheduled trigger. Do not use to view previous runs — use cron_runs for that."
+example = '''
+Input:  {"id": "cron_abc123"}
+Output: Job cron_abc123 executed. Exit code: 0. Output: "Report posted."
+'''
+success = "Output contains exit code and command output with success=true."
+failure = "Returns success=false with 'job not found', 'command exited with code 1', or a runtime execution error."
+
+[cron_runs]
+purpose = "List the recent execution history for a specific cron job."
+when = "Use to debug failed runs or verify a job executed as expected. Do not use to list all jobs — use cron_list for that."
+example = '''
+Input:  {"id": "cron_abc123", "limit": 5}
+Output: [{"run_at": "2026-04-21T09:00:02Z", "exit_code": 0, "output": "Report posted."}]
+'''
+success = "Output is a JSON array of run records with timestamps and exit codes, success=true."
+failure = "Returns success=false with 'job not found' or 'no run history available'."
+
+[cron_update]
+purpose = "Patch an existing cron job's schedule, command, prompt, enabled state, or delivery config."
+when = "Use to modify a job in place without deleting and recreating it. Do not use to view the current config — use cron_list for that."
+example = '''
+Input:  {"id": "cron_abc123", "enabled": false}
+Output: Cron job cron_abc123 updated: enabled=false.
+'''
+success = "Output contains 'updated' and the changed field(s) with success=true."
+failure = "Returns success=false with 'job not found: cron_abc123' or 'invalid field value'."
+
+[data_management]
+purpose = "Manage workspace data retention: view storage statistics, purge old data, or delete specific datasets."
+when = "Use for maintenance operations like reclaiming disk space or enforcing data retention policies. Do not use for reading file contents — use file_read for that."
+example = '''
+Input:  {"action": "stats"}
+Output: Workspace size: 142 MB. Audit logs: 38 MB. Memory: 4 MB. Backups: 100 MB.
+'''
+success = "Output contains a summary of storage usage or confirms a purge operation with success=true."
+failure = "Returns success=false with 'action not recognized', 'permission denied', or 'purge target not found'."
+
+[delegate]
+purpose = "Delegate a subtask to a specialized sub-agent running a different model or tool subset."
+when = "Use when a step benefits from a different model (e.g. fast summarization via a cheap model, deep reasoning via a large model). Do not use for direct file, shell, or memory operations — invoke those tools directly."
+example = '''
+Input:  {"prompt": "Summarize the following 50-page transcript in 3 bullets", "model": "claude-haiku-4-5", "agentic": false}
+Output: • Key decision: migrate to microservices by Q3. • Budget approved: $500k. • Risk: vendor lock-in.
+'''
+success = "Output contains the sub-agent's response text with success=true."
+failure = "Returns success=false with 'model not available', 'max_iterations exceeded', or a provider API error."
+
+[discord_search]
+purpose = "Search Discord message history stored in the local discord.db for past messages or channel activity."
+when = "Use to retrieve prior Discord conversation context. Do not use for real-time Discord actions (posting, reacting) — use the channel delivery mechanism or composio for that."
+example = '''
+Input:  {"query": "deploy rollback", "channel_id": "987654321", "limit": 10}
+Output: [{"ts": "2026-04-20T14:32:11Z", "author": "alice", "content": "rolled back deploy v2.3.1"}]
+'''
+success = "Output is a JSON array of message objects matching the query with success=true."
+failure = "Returns success=false with 'discord.db not found', 'invalid channel_id', or 'query too broad — add filters'."
+
+[file_edit]
+purpose = "Edit a file by replacing an exact string occurrence with new content."
+when = "Use for surgical in-place changes to existing files. Do not use when you need to write a whole new file or replace all content — use file_write for that."
+example = '''
+Input:  {"path": "src/config.rs", "old_string": "timeout: 30", "new_string": "timeout: 60"}
+Output: Replaced 1 occurrence in src/config.rs.
+'''
+success = "Output contains 'Replaced 1 occurrence' and the file path with success=true."
+failure = "Returns success=false with 'old_string not found in file', 'old_string matches 3 times — must be unique', or 'path not allowed by security policy'."
+
+[file_read]
+purpose = "Read file contents with line numbers, supporting partial reads via offset and limit."
+when = "Use to inspect the contents of a known file. Do not use to find files by name — use glob_search. Do not use to search inside files — use content_search. For shell command output, use shell."
+example = '''
+Input:  {"path": "src/main.rs", "offset": 1, "limit": 20}
+Output: 1: fn main() {\n2:     let rt = Runtime::new();\n...\n[Lines 1-20 of 347]
+'''
+success = "Output contains numbered lines followed by a '[Lines X-Y of N]' or '[N lines total]' summary with success=true."
+failure = "Returns success=false with 'Failed to resolve file path: No such file or directory (os error 2)', 'path not allowed by security policy', or 'File too large: N bytes (limit: 10485760 bytes)'."
+
+[file_write]
+purpose = "Write content to a file in the workspace, creating or overwriting it."
+when = "Use to create new files or fully replace a file's contents. Do not use for partial in-place edits — use file_edit for that."
+example = '''
+Input:  {"path": "scripts/migrate.sh", "content": "#!/bin/bash\nset -e\npg_dump $DB_URL > backup.sql"}
+Output: Written to scripts/migrate.sh (47 bytes).
+'''
+success = "Output contains 'Written to' and the byte count with success=true."
+failure = "Returns success=false with 'path not allowed by security policy', 'permission denied', or 'parent directory does not exist'."
+
+[git_operations]
+purpose = "Perform structured Git operations: status, diff, log, branch, commit, add, checkout, and stash."
+when = "Use for version control operations within the workspace. Do not use for running arbitrary shell commands — use shell for non-git operations."
+example = '''
+Input:  {"operation": "diff", "args": ["HEAD~1"]}
+Output: {"files_changed": 2, "insertions": 14, "deletions": 3, "diff": "--- a/src/lib.rs\n+++ b/src/lib.rs\n..."}
+'''
+success = "Output is a JSON object with the operation result (status text, diff, log entries, etc.) and success=true."
+failure = "Returns success=false with 'not a git repository', 'operation blocked by autonomy policy', or a git error message."
+
+[glob_search]
+purpose = "Find files matching a glob pattern within the workspace."
+when = "Use to locate files by name or path pattern. Do not use to search file contents — use content_search for that."
+example = '''
+Input:  {"pattern": "src/**/*.rs", "workspace": "/workspace"}
+Output: ["src/main.rs", "src/tools/shell.rs", "src/tools/file_read.rs"]
+'''
+success = "Output is a JSON array of matching relative file paths (may be empty) with success=true."
+failure = "Returns success=false with 'invalid glob pattern', 'workspace directory not accessible', or 'path traversal not permitted'."
+
+[google_workspace]
+purpose = "Interact with Google Workspace services: Drive, Gmail, Calendar, Sheets, Docs, and more via the gws CLI."
+when = "Use when the task involves Google account services. Do not use for Microsoft 365 services — use microsoft365 for those."
+example = '''
+Input:  {"service": "gmail", "action": "list_unread", "max_results": 5}
+Output: [{"id": "18f2a...", "subject": "Q2 roadmap review", "from": "ceo@acme.com", "date": "2026-04-21"}]
+'''
+success = "Output contains a JSON response from the gws CLI with the requested data and success=true."
+failure = "Returns success=false with 'gws not installed', 'not authenticated — run gws auth login', or a Google API error."
+
+[hardware_board_info]
+purpose = "Return the full board descriptor (chip model, architecture, clock, memory map) for the connected hardware target."
+when = "Use when the user asks what hardware is connected or needs chip/architecture info. Do not use for reading live register values — use hardware_memory_read for that."
+example = '''
+Input:  {}
+Output: {"board": "NUCLEO-F446RE", "chip": "STM32F446RET6", "arch": "Cortex-M4", "flash": "512 KB", "ram": "128 KB"}
+'''
+success = "Output is a JSON object with board name, chip identifier, and memory sizes with success=true."
+failure = "Returns success=false with 'no hardware target connected', 'USB probe not found', or 'board identification timed out'."
+
+[hardware_memory_map]
+purpose = "Return the flash and RAM address ranges for the connected hardware target from its datasheet."
+when = "Use when the user asks for memory map, address space, or upper/lower memory addresses. Do not use to read actual values at those addresses — use hardware_memory_read for that."
+example = '''
+Input:  {}
+Output: {"flash": {"start": "0x08000000", "end": "0x0807FFFF", "size_kb": 512}, "ram": {"start": "0x20000000", "end": "0x2001FFFF", "size_kb": 128}}
+'''
+success = "Output is a JSON object with flash and RAM start/end addresses and sizes with success=true."
+failure = "Returns success=false with 'no hardware target connected' or 'datasheet not available for chip'."
+
+[hardware_memory_read]
+purpose = "Read actual memory or register values from the connected hardware target via USB probe."
+when = "Use when the user asks to 'read register', 'dump memory', or 'give address and value'. Do not use for the static memory map — use hardware_memory_map for that."
+example = '''
+Input:  {"address": "0x20000000", "length": 16}
+Output: 20000000: 00 00 00 00 ff ff ff ff 01 00 00 00 00 00 00 00
+'''
+success = "Output is a hex dump string with the address and byte values with success=true."
+failure = "Returns success=false with 'USB probe not connected', 'address 0xDEADBEEF out of valid range', or 'read timed out after 5s'."
+
+[http_request]
+purpose = "Make an HTTP request (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS) to an external API."
+when = "Use for structured API calls where you control the method, headers, and body. Do not use for simple web page fetching — use web_fetch for clean text extraction. Only allowlisted domains are reachable."
+example = '''
+Input:  {"method": "POST", "url": "https://api.example.com/v1/events", "headers": {"Authorization": "Bearer tok_abc"}, "body": {"name": "deploy"}}
+Output: {"status": 201, "body": {"id": "evt_xyz", "created": 1745271602}}
+'''
+success = "Output contains HTTP status code and parsed response body with success=true."
+failure = "Returns success=false with 'domain not in allowlist', 'connection refused', or 'request timed out after 30s'."
+
+[image_info]
+purpose = "Read image file metadata (format, dimensions, file size) and optionally return base64-encoded image data."
+when = "Use to inspect an image's format and size before processing. Do not use to render or display images — pass the base64 output to a multimodal model for that."
+example = '''
+Input:  {"path": "screenshots/ui.png"}
+Output: {"format": "PNG", "width": 1920, "height": 1080, "size_bytes": 245760}
+'''
+success = "Output is a JSON object with format, dimensions, and file size with success=true."
+failure = "Returns success=false with 'file not found', 'not a recognized image format', or 'path not allowed by security policy'."
+
+[jira]
+purpose = "Interact with Jira: retrieve issue details, search with JQL, and add comments."
+when = "Use for Jira-specific operations like sprint management, issue triage, or comment posting. Do not use for generic web requests to Jira's API — use http_request if you need raw API access beyond what this tool supports."
+example = '''
+Input:  {"action": "search", "jql": "project = PLAT AND status = 'In Progress'", "fields": ["summary", "assignee"]}
+Output: [{"key": "PLAT-482", "summary": "Migrate DB to Postgres 16", "assignee": "bob@acme.com"}]
+'''
+success = "Output is a JSON array of matching issues or a confirmation of a comment posted with success=true."
+failure = "Returns success=false with 'JIRA_URL not configured', 'JQL syntax error', or 'permission denied on project'."
+
+[knowledge]
+purpose = "Manage an in-memory knowledge graph of architecture decisions, solution patterns, lessons learned, and domain experts."
+when = "Use to capture and retrieve structured project knowledge that benefits from graph relationships. Do not use for raw text memory — use remember/recall for simple fact storage."
+example = '''
+Input:  {"action": "capture", "type": "decision", "title": "Use Postgres for OLTP", "rationale": "Consistent ACID guarantees needed"}
+Output: Decision captured: id=dec_001 "Use Postgres for OLTP"
+'''
+success = "Output confirms the action (captured, found, suggested) with an id or result set and success=true."
+failure = "Returns success=false with 'unknown action', 'graph store not initialized', or 'entity id not found'."
+
+[linkedin]
+purpose = "Manage LinkedIn presence: create posts, list posts, comment, react, delete, view engagement, and read content strategy."
+when = "Use for LinkedIn-specific social media management. Requires LINKEDIN_* credentials in .env. Do not use for reading LinkedIn data via web scraping — this tool uses the configured API credentials."
+example = '''
+Input:  {"action": "create_post", "text": "Excited to announce our new open-source release: ZeroClaw v2!"}
+Output: Post created: id=urn:li:share:7193840000000000000
+'''
+success = "Output contains the action result (post id, comment id, reaction confirmation) with success=true."
+failure = "Returns success=false with 'LINKEDIN_ACCESS_TOKEN not set', 'post not found', or 'LinkedIn API rate limit exceeded'."
+
+[microsoft365]
+purpose = "Interact with Microsoft 365: manage Outlook mail, Teams messages, Calendar events, OneDrive files, and SharePoint search."
+when = "Use for Microsoft 365 account services. Do not use for Google Workspace services — use google_workspace for those."
+example = '''
+Input:  {"service": "mail", "action": "list_unread", "max_results": 5}
+Output: [{"id": "AAMk...", "subject": "Board meeting notes", "from": "cfo@acme.com", "received": "2026-04-21T08:14:00Z"}]
+'''
+success = "Output contains a JSON response from Microsoft Graph with the requested data and success=true."
+failure = "Returns success=false with 'Microsoft Graph credentials not configured', 'token expired — re-authenticate', or a Graph API error code."
+
+[model_routing_config]
+purpose = "View and update the agent's model routing rules: default model, scenario overrides, classification rules, and delegate profiles."
+when = "Use when the user wants to change which model handles a scenario or inspect current routing config. Do not use to execute a model switch in the current session — use model_routing_config for persistent config changes."
+example = '''
+Input:  {"action": "get"}
+Output: {"default": "claude-sonnet-4-6", "routes": [{"scenario": "code_review", "model": "claude-opus-4-5"}]}
+'''
+success = "Output is a JSON config object or a confirmation of the update with success=true."
+failure = "Returns success=false with 'config file not writable', 'unknown model identifier', or 'circular route definition'."
+
+[notion]
+purpose = "Interact with Notion: query databases, read, create, and update pages, and search the workspace."
+when = "Use for Notion-specific operations. Do not use for generic HTTP calls to Notion's API — use http_request if you need endpoints not covered here."
+example = '''
+Input:  {"action": "search", "query": "Q2 OKRs"}
+Output: [{"id": "abc123", "title": "Q2 OKRs 2026", "url": "https://notion.so/abc123"}]
+'''
+success = "Output is a JSON array of matching pages or a confirmation of a create/update operation with success=true."
+failure = "Returns success=false with 'NOTION_TOKEN not configured', 'page not found', or 'Notion API rate limit exceeded'."
+
+[pdf_read]
+purpose = "Extract plain text from a PDF file in the workspace."
+when = "Use when you need the text content of a PDF. Do not use for images or other binary files — use file_read for those (lossy UTF-8 fallback). Image-only or encrypted PDFs return an empty result."
+example = '''
+Input:  {"path": "docs/contract.pdf"}
+Output: Section 1. Parties. This Agreement is entered into by Acme Corp ("Client") and ZeroClaw Inc ("Provider")...
+'''
+success = "Output contains the extracted text from the PDF with success=true."
+failure = "Returns success=false with 'file not found', 'PDF is image-only — no extractable text', or 'rag-pdf feature not enabled'."
+
+[project_intel]
+purpose = "Generate status reports, detect delivery risks, draft client updates, summarize sprints, and estimate effort from project data."
+when = "Use for structured project delivery analysis. Do not use for real-time issue tracking — use jira or github API for live data; this tool analyzes data you provide."
+example = '''
+Input:  {"action": "status_report", "data": {"completed": 12, "in_progress": 5, "blocked": 2, "sprint_end": "2026-04-25"}}
+Output: Sprint status: 63% complete. 2 blockers require attention. On track for Friday delivery.
+'''
+success = "Output contains a human-readable analysis or report with success=true."
+failure = "Returns success=false with 'action not supported', 'insufficient data for analysis', or 'data schema validation error'."
+
+[proxy_config]
+purpose = "View or update ZeroClaw proxy settings across environment, zeroclaw, and service scopes."
+when = "Use when the user wants to configure HTTP/HTTPS proxy routing for the agent or services. Do not use for firewall or DNS configuration — this controls proxy settings only."
+example = '''
+Input:  {"action": "set", "scope": "zeroclaw", "http_proxy": "http://proxy.corp.example.com:8080"}
+Output: Proxy updated for scope 'zeroclaw': http_proxy=http://proxy.corp.example.com:8080
+'''
+success = "Output confirms the updated proxy settings or lists the current config with success=true."
+failure = "Returns success=false with 'invalid proxy URL', 'scope not recognized', or 'config file not writable'."
+
+[pushover]
+purpose = "Send a Pushover push notification to the user's registered device."
+when = "Use to alert the user of an important event when they may not be watching the terminal. Do not use for Discord/Slack/Telegram delivery — use cron_add with a delivery config for those channels."
+example = '''
+Input:  {"title": "Deploy finished", "message": "v2.4.1 is live on production."}
+Output: Notification sent: message_id=a1b2c3d4
+'''
+success = "Output contains 'Notification sent' and a Pushover message_id with success=true."
+failure = "Returns success=false with 'PUSHOVER_TOKEN not set in .env', 'PUSHOVER_USER_KEY not set in .env', or 'Pushover API error: invalid token'."
+
+[recall]
+purpose = "Look up previously-remembered facts by substring match, returning timestamped results."
+when = "Use to retrieve durable facts stored with the remember tool across sessions. Do not use for searching files or code — use content_search or shell/grep for that."
+example = '''
+Input:  {"query": "deploy region", "limit": 5}
+Output: [2026-04-15T10:22:00Z] deploy target is eu-west-1 [tags: deploy, region]
+'''
+success = "Output lists '[timestamp] content' lines for each matching memory, or 'No memories matched' if none found, with success=true."
+failure = "Does not fail under normal operation."
+
+[remember]
+purpose = "Save a durable fact to project memory for retrieval in later sessions."
+when = "Use for user preferences, architectural decisions, or cross-session context. Do not use for ephemeral task state — that belongs in the transcript, not in memory."
+example = '''
+Input:  {"fact": "deploy target is eu-west-1", "tags": ["deploy", "region"]}
+Output: Remembered: deploy target is eu-west-1
+'''
+success = "Output contains 'Remembered:' followed by the fact text with success=true."
+failure = "Returns an error if the 'fact' parameter is missing; otherwise does not fail under normal operation."
+
+[schedule]
+purpose = "Manage scheduled shell-only tasks: create, list, get, cancel, pause, and resume timed shell jobs."
+when = "Use for shell jobs whose output is only logged. Do not use to send scheduled messages to Discord, Slack, or Telegram — use cron_add with job_type='agent' and a delivery config for channel delivery."
+example = '''
+Input:  {"action": "create", "command": "pg_dump $DB_URL > /backups/db-$(date +%F).sql", "schedule": "0 2 * * *"}
+Output: Task created: id=task_xyz, schedule=0 2 * * *, next run: 2026-04-22T02:00:00Z
+'''
+success = "Output contains 'Task created' with a task id and next run time, or a list/status response for other actions."
+failure = "Returns success=false with 'invalid cron expression', 'task not found', or 'storage write error'."
+
+[screenshot]
+purpose = "Capture a screenshot of the current screen and return the file path and base64-encoded PNG."
+when = "Use when you need to visually inspect the current screen state or capture evidence of UI behavior. Do not use to read file contents — use file_read for that."
+example = '''
+Input:  {}
+Output: {"path": "/tmp/screenshot-20260421T153002.png", "base64": "iVBORw0KGgoAAAANSUhEUg..."}
+'''
+success = "Output contains a file path and a non-empty base64 string with success=true."
+failure = "Returns success=false with 'screenshot capture failed: display not available' or 'permission denied to capture screen'."
+
+[security_ops]
+purpose = "Perform managed security operations: triage alerts, run incident-response playbooks, parse vulnerability scans, and generate security reports."
+when = "Use for structured cybersecurity workflows. Do not use for network configuration or firewall changes — this tool is analysis and response only."
+example = '''
+Input:  {"action": "triage_alert", "alert": {"type": "brute_force", "source_ip": "203.0.113.42", "count": 342}}
+Output: Severity: HIGH. Recommendation: block 203.0.113.42 at perimeter firewall. Playbook: incident-brute-force.
+'''
+success = "Output contains a severity rating and a recommended action or report with success=true."
+failure = "Returns success=false with 'action not recognized', 'playbook not found', or 'alert schema invalid'."
+
+[shell]
+purpose = "Execute a shell command in the workspace directory and return stdout, stderr, and exit code."
+when = "Use for commands and multi-step operations that no dedicated tool covers. Prefer file_read for reading files, git_operations for git, and content_search for searching — shell is the fallback for everything else."
+example = '''
+Input:  {"command": "cargo test --lib 2>&1 | tail -5"}
+Output: test result: ok. 47 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+'''
+success = "Output contains the command's stdout/stderr with success=true; exit code 0 means success."
+failure = "Returns success=false with 'command blocked by security policy', 'requires approval in supervised mode', or the command's own stderr on non-zero exit."
+
+[sop_advance]
+purpose = "Report the result of the current SOP step and advance to the next step in the run."
+when = "Use within an active SOP run to complete a step and receive the next instruction. Do not use to start an SOP — use sop_execute for that."
+example = '''
+Input:  {"run_id": "run_abc123", "succeeded": true, "output": "Database backup completed: 142 MB"}
+Output: Next step (3/5): Verify backup integrity by running pg_restore --list backup.sql
+'''
+success = "Output contains the next step instruction (or 'SOP complete') with success=true."
+failure = "Returns success=false with 'run_id not found', 'run already completed', or 'step requires approval before advancing'."
+
+[sop_approve]
+purpose = "Approve a pending SOP step that is waiting for operator authorization before proceeding."
+when = "Use to unblock an SOP run that paused at an approval gate. Do not use to view pending approvals — use sop_status for that."
+example = '''
+Input:  {"run_id": "run_abc123", "step_id": "step_3"}
+Output: Step 3 approved. Instruction: Run ALTER TABLE users ADD COLUMN last_login TIMESTAMP;
+'''
+success = "Output contains the approved step's instruction text with success=true."
+failure = "Returns success=false with 'run_id not found', 'step does not require approval', or 'operator not authorized'."
+
+[sop_execute]
+purpose = "Manually trigger a Standard Operating Procedure by name and receive the first step instruction."
+when = "Use to start an SOP run. Do not use for subsequent steps — use sop_advance for those. Do not use to list available SOPs — use sop_list."
+example = '''
+Input:  {"sop_name": "deploy-to-production"}
+Output: Run started: run_abc123. Step 1/5: Run cargo build --release and confirm exit code 0.
+'''
+success = "Output contains a run_id and the first step instruction with success=true."
+failure = "Returns success=false with 'SOP not found: deploy-to-production', 'SOP already has active run', or 'trigger conditions not met'."
+
+[sop_list]
+purpose = "List all loaded Standard Operating Procedures with their triggers, priority, step count, and active run count."
+when = "Use to discover available SOPs before triggering one. Do not use to check run status — use sop_status for that."
+example = '''
+Input:  {}
+Output: [{"name": "deploy-to-production", "trigger": "on_deploy", "steps": 5, "active_runs": 0, "priority": "high"}]
+'''
+success = "Output is a JSON array of SOP descriptors (possibly empty) with success=true."
+failure = "Returns success=false with 'SOP registry not loaded' or 'config file parse error'."
+
+[sop_status]
+purpose = "Query the execution status of one or all active SOP runs."
+when = "Use to check whether a run is waiting for approval or has completed. Do not use to list available SOPs — use sop_list for that."
+example = '''
+Input:  {"run_id": "run_abc123"}
+Output: {"run_id": "run_abc123", "sop": "deploy-to-production", "current_step": 3, "status": "waiting_approval"}
+'''
+success = "Output is a JSON status object with run_id, current step, and status string with success=true."
+failure = "Returns success=false with 'run_id not found' or 'no active runs'."
+
+[swarm]
+purpose = "Orchestrate multiple agents collaboratively using sequential (pipeline), parallel (fan-out/fan-in), or router strategies."
+when = "Use when a task can be decomposed into independent or staged sub-tasks that benefit from parallel or specialized execution. Do not use for single-model delegation — use delegate for that."
+example = '''
+Input:  {"strategy": "parallel", "agents": [{"prompt": "Summarize chapter 1"}, {"prompt": "Summarize chapter 2"}], "merge_prompt": "Combine the two summaries into one coherent overview"}
+Output: Chapter 1: ... Chapter 2: ... Combined: ...
+'''
+success = "Output contains each agent's result and (for parallel/router) the merged final answer with success=true."
+failure = "Returns success=false with 'no agents specified', 'router failed to select an agent', or 'sub-agent timed out after 120s'."
+
+[tool_search]
+purpose = "Fetch full JSON schema definitions for deferred MCP tools so they can be invoked."
+when = "Use when a tool name appears in the system reminder as 'deferred' and you need its parameter schema before calling it. Do not use to look up native tool schemas — those are always available."
+example = '''
+Input:  {"query": "select:slack_post,slack_list"}
+Output: <function>{"name": "slack_post", "description": "...", "parameters": {...}}</function>
+'''
+success = "Output contains a <function> block with the tool's full JSON schema with success=true."
+failure = "Returns success=false with 'no deferred tools matched query' or 'MCP registry unavailable'."
+
+[web_fetch]
+purpose = "Fetch a web page and return its content as clean plain text, with automatic HTML-to-text conversion."
+when = "Use to retrieve information from a static or server-rendered URL. Do not use for dynamic/JS-heavy pages — use browser for those. Do not use for API calls with custom headers — use http_request for that."
+example = '''
+Input:  {"url": "https://docs.rust-lang.org/book/ch04-01-what-is-ownership.html"}
+Output: What Is Ownership? Rust's central feature is ownership. With ownership, Rust guarantees memory safety...
+'''
+success = "Output contains the page's plain-text content with success=true."
+failure = "Returns success=false with 'domain not in allowlist', 'HTTP 404 Not Found', or 'fetch timed out after 30s'."
+
+[web_search_tool]
+purpose = "Search the web and return a list of results with titles, URLs, and descriptions."
+when = "Use to find current information, news, or research topics. Do not use for fetching full page content — use web_fetch after identifying the target URL."
+example = '''
+Input:  {"query": "Rust async runtime comparison 2026"}
+Output: [{"title": "Tokio vs async-std: 2026 benchmark", "url": "https://example.com/rust-async", "description": "Detailed comparison of async runtimes..."}]
+'''
+success = "Output is a JSON array of result objects each with title, url, and description with success=true."
+failure = "Returns success=false with 'search provider not configured', 'rate limit exceeded', or 'no results found'."
+
+[workspace]
+purpose = "Manage multi-client workspaces: list, switch, create, export, and inspect isolated workspace environments."
+when = "Use when the user explicitly wants to switch context between projects or clients. Do not use for file operations within the current workspace — use file_read, file_write, etc."
+example = '''
+Input:  {"action": "list"}
+Output: [{"name": "acme-corp", "active": true}, {"name": "personal", "active": false}]
+'''
+success = "Output is a JSON list of workspace names and their active status (or confirmation of switch/create) with success=true."
+failure = "Returns success=false with 'workspace not found', 'name already exists', or 'storage write error'."
+
+[weather]
+purpose = "Get current weather conditions and forecast for any location worldwide."
+when = "Use when the user asks for weather, temperature, or forecast information. Do not use for historical weather data — this tool returns current and 0-3 day forecasts only."
+example = '''
+Input:  {"location": "London, UK", "days": 1, "units": "metric"}
+Output: London: 14°C, partly cloudy, wind 18 km/h SW, humidity 72%. Tomorrow: 12°C, rain likely.
+'''
+success = "Output contains temperature, conditions, and (if requested) a forecast with success=true."
+failure = "Returns success=false with 'location not found', 'weather service unavailable', or 'invalid units — use metric or imperial'."

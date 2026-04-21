@@ -14,8 +14,10 @@
 //! 3. Agent config (`agent.thinking.default_level`)
 //! 4. Global default (`Medium`)
 
+use regex::Regex;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use std::sync::OnceLock;
 
 /// How deeply the model should reason for a given message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default, JsonSchema)]
@@ -175,6 +177,56 @@ pub fn clamp_temperature(temp: f64) -> f64 {
     temp.clamp(0.0, 2.0)
 }
 
+/// Result of extracting `<think>...</think>` blocks from a model response.
+///
+/// MiniMax (and similar) models emit inline `<think>` blocks containing
+/// chain-of-thought reasoning. This struct separates that reasoning from
+/// the user-visible output.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtractedThinking {
+    /// Concatenated content from all `<think>` blocks, or `None` if none were present.
+    pub thinking: Option<String>,
+    /// The response text with all `<think>` blocks removed.
+    pub visible: String,
+}
+
+/// Extract all `<think>...</think>` blocks from a model response.
+///
+/// - Case-insensitive matching (`<Think>`, `<THINK>`, etc.).
+/// - Supports multiline content inside the tags.
+/// - Multiple blocks are concatenated with a newline separator.
+/// - Empty think blocks are ignored (they do not contribute to `thinking`).
+/// - Unclosed `<think>` tags (no matching `</think>`) are left in the output
+///   unchanged so that visible content is never silently discarded.
+pub fn extract_think_blocks(response: &str) -> ExtractedThinking {
+    static THINK_RE: OnceLock<Regex> = OnceLock::new();
+    let re = THINK_RE.get_or_init(|| {
+        Regex::new(r"(?is)<think>(.*?)</think>").unwrap()
+    });
+
+    let mut thinking_parts: Vec<&str> = Vec::new();
+
+    for cap in re.captures_iter(response) {
+        let inner = cap.get(1).unwrap().as_str().trim();
+        if !inner.is_empty() {
+            thinking_parts.push(inner);
+        }
+    }
+
+    let visible = re.replace_all(response, "").to_string();
+    // Collapse runs of whitespace that removing blocks may have introduced,
+    // but only trim the final result — interior spacing is the caller's concern.
+    let visible = visible.trim().to_string();
+
+    let thinking = if thinking_parts.is_empty() {
+        None
+    } else {
+        Some(thinking_parts.join("\n"))
+    };
+
+    ExtractedThinking { thinking, visible }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -310,11 +362,13 @@ mod tests {
         assert!(params.temperature_adjustment < 0.0);
         assert!(params.max_tokens_adjustment < 0);
         assert!(params.system_prompt_prefix.is_some());
-        assert!(params
-            .system_prompt_prefix
-            .unwrap()
-            .to_lowercase()
-            .contains("concise"));
+        assert!(
+            params
+                .system_prompt_prefix
+                .unwrap()
+                .to_lowercase()
+                .contains("concise")
+        );
     }
 
     #[test]
@@ -420,5 +474,98 @@ mod tests {
         let level = ThinkingLevel::High;
         let json = serde_json::to_string(&level).unwrap();
         assert_eq!(json, "\"high\"");
+    }
+
+    // ── extract_think_blocks ────────────────────────────────────
+
+    #[test]
+    fn extract_no_think_blocks_returns_as_is() {
+        let input = "Hello, this is a plain response.";
+        let result = extract_think_blocks(input);
+        assert_eq!(result.thinking, None);
+        assert_eq!(result.visible, "Hello, this is a plain response.");
+    }
+
+    #[test]
+    fn extract_single_think_block() {
+        let input = "<think>reasoning here</think>The answer is 42.";
+        let result = extract_think_blocks(input);
+        assert_eq!(result.thinking, Some("reasoning here".to_string()));
+        assert_eq!(result.visible, "The answer is 42.");
+    }
+
+    #[test]
+    fn extract_multiple_think_blocks() {
+        let input = "<think>step 1</think>First part. <think>step 2</think>Second part.";
+        let result = extract_think_blocks(input);
+        assert_eq!(result.thinking, Some("step 1\nstep 2".to_string()));
+        assert_eq!(result.visible, "First part. Second part.");
+    }
+
+    #[test]
+    fn extract_empty_think_blocks_ignored() {
+        let input = "<think></think>Visible text.<think>  </think>";
+        let result = extract_think_blocks(input);
+        assert_eq!(result.thinking, None);
+        assert_eq!(result.visible, "Visible text.");
+    }
+
+    #[test]
+    fn extract_think_block_at_start() {
+        let input = "<think>thinking</think>Response text here.";
+        let result = extract_think_blocks(input);
+        assert_eq!(result.thinking, Some("thinking".to_string()));
+        assert_eq!(result.visible, "Response text here.");
+    }
+
+    #[test]
+    fn extract_think_block_in_middle() {
+        let input = "Before.<think>middle thought</think>After.";
+        let result = extract_think_blocks(input);
+        assert_eq!(result.thinking, Some("middle thought".to_string()));
+        assert_eq!(result.visible, "Before.After.");
+    }
+
+    #[test]
+    fn extract_think_block_at_end() {
+        let input = "The result is 7.<think>verified by arithmetic</think>";
+        let result = extract_think_blocks(input);
+        assert_eq!(result.thinking, Some("verified by arithmetic".to_string()));
+        assert_eq!(result.visible, "The result is 7.");
+    }
+
+    #[test]
+    fn extract_multiline_think_block() {
+        let input = "<think>\nLine 1\nLine 2\nLine 3\n</think>Final answer.";
+        let result = extract_think_blocks(input);
+        assert_eq!(
+            result.thinking,
+            Some("Line 1\nLine 2\nLine 3".to_string())
+        );
+        assert_eq!(result.visible, "Final answer.");
+    }
+
+    #[test]
+    fn extract_think_block_case_insensitive() {
+        let input = "<Think>reasoning</Think>Answer.";
+        let result = extract_think_blocks(input);
+        assert_eq!(result.thinking, Some("reasoning".to_string()));
+        assert_eq!(result.visible, "Answer.");
+
+        let input2 = "<THINK>loud thinking</THINK>Quiet answer.";
+        let result2 = extract_think_blocks(input2);
+        assert_eq!(result2.thinking, Some("loud thinking".to_string()));
+        assert_eq!(result2.visible, "Quiet answer.");
+    }
+
+    #[test]
+    fn extract_unclosed_think_tag_left_intact() {
+        let input = "<think>unclosed reasoning. The answer is 42.";
+        let result = extract_think_blocks(input);
+        assert_eq!(result.thinking, None);
+        assert_eq!(
+            result.visible,
+            "<think>unclosed reasoning. The answer is 42."
+        );
     }
 }

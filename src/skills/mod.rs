@@ -13,8 +13,10 @@ use zip::ZipArchive;
 mod audit;
 #[cfg(feature = "skill-creation")]
 pub mod creator;
+pub mod discovery;
 #[cfg(feature = "skill-creation")]
 pub mod improver;
+pub mod refinement;
 pub mod testing;
 
 const OPEN_SKILLS_REPO_URL: &str = "https://github.com/besoeasy/open-skills";
@@ -825,7 +827,10 @@ pub fn skills_to_prompt_with_mode(
                 .collect();
 
             if !registered.is_empty() {
-                let _ = writeln!(prompt, "    <callable_tools hint=\"These are registered as callable tool specs. Invoke them directly by name ({{}}.{{}}) instead of using shell.\">");
+                let _ = writeln!(
+                    prompt,
+                    "    <callable_tools hint=\"These are registered as callable tool specs. Invoke them directly by name ({{}}.{{}}) instead of using shell.\">"
+                );
                 for tool in &registered {
                     let _ = writeln!(prompt, "      <tool>");
                     write_xml_text_element(
@@ -1361,7 +1366,9 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
                 println!("No skills installed.");
                 println!();
                 println!("  Create one: mkdir -p ~/.zeroclaw/workspace/skills/my-skill");
-                println!("              echo '# My Skill' > ~/.zeroclaw/workspace/skills/my-skill/SKILL.md");
+                println!(
+                    "              echo '# My Skill' > ~/.zeroclaw/workspace/skills/my-skill/SKILL.md"
+                );
                 println!();
                 println!("  Or install: zeroclaw skills install <source>");
             } else {
@@ -1488,7 +1495,7 @@ pub fn handle_command(command: crate::SkillCommands, config: &crate::config::Con
             Ok(())
         }
         crate::SkillCommands::Test { name, verbose } => {
-            let results = if let Some(ref skill_name) = name {
+            let results = if let Some(skill_name) = name.as_deref() {
                 // Test a single skill
                 let source_path = PathBuf::from(skill_name);
                 let target = if source_path.exists() {
@@ -1548,7 +1555,8 @@ mod tests {
     impl EnvVarGuard {
         fn unset(key: &'static str) -> Self {
             let original = std::env::var(key).ok();
-            std::env::remove_var(key);
+            // SAFETY: test-only, single-threaded test runner.
+            unsafe { std::env::remove_var(key) };
             Self { key, original }
         }
     }
@@ -1556,9 +1564,11 @@ mod tests {
     impl Drop for EnvVarGuard {
         fn drop(&mut self) {
             if let Some(value) = &self.original {
-                std::env::set_var(self.key, value);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::set_var(self.key, value) };
             } else {
-                std::env::remove_var(self.key);
+                // SAFETY: test-only, single-threaded test runner.
+                unsafe { std::env::remove_var(self.key) };
             }
         }
     }

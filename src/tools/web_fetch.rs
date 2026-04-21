@@ -185,24 +185,36 @@ impl WebFetchTool {
         let response = match client.get(url).send().await {
             Ok(r) => r,
             Err(e) => {
+                let chain = error_chain(&e);
+                tracing::error!(
+                    target: "web_fetch",
+                    url = %url,
+                    error = %e,
+                    error_chain = %chain,
+                    "web_fetch standard_fetch network error"
+                );
                 return ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("HTTP request failed: {e}")),
-                }
+                    error: Some(format!("HTTP request failed: {e} (chain: {chain})")),
+                };
             }
         };
 
         let status = response.status();
         if !status.is_success() {
+            let status_reason = status.canonical_reason().unwrap_or("Unknown");
+            tracing::warn!(
+                target: "web_fetch",
+                url = %url,
+                status = status.as_u16(),
+                status_reason = %status_reason,
+                "web_fetch standard_fetch HTTP non-2xx response"
+            );
             return ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!(
-                    "HTTP {} {}",
-                    status.as_u16(),
-                    status.canonical_reason().unwrap_or("Unknown")
-                )),
+                error: Some(format!("HTTP {} {}", status.as_u16(), status_reason)),
             };
         }
 
@@ -222,6 +234,12 @@ impl WebFetchTool {
         {
             "plain"
         } else {
+            tracing::warn!(
+                target: "web_fetch",
+                url = %url,
+                content_type = %content_type,
+                "web_fetch standard_fetch unsupported content type"
+            );
             return ToolResult {
                 success: false,
                 output: String::new(),
@@ -235,11 +253,20 @@ impl WebFetchTool {
         let body = match self.read_response_text_limited(response).await {
             Ok(t) => t,
             Err(e) => {
+                let chain = anyhow_error_chain(&e);
+                tracing::error!(
+                    target: "web_fetch",
+                    url = %url,
+                    phase = "body_read",
+                    error = %e,
+                    error_chain = %chain,
+                    "web_fetch standard_fetch body_read failure"
+                );
                 return ToolResult {
                     success: false,
                     output: String::new(),
-                    error: Some(format!("Failed to read response body: {e}")),
-                }
+                    error: Some(format!("Failed to read response body: {e} (chain: {chain})")),
+                };
             }
         };
 
@@ -316,7 +343,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(e.to_string()),
-                })
+                });
             }
         };
 
@@ -357,7 +384,28 @@ impl Tool for WebFetchTool {
             .connect_timeout(Duration::from_secs(10))
             .redirect(redirect_policy)
             .user_agent("ZeroClaw/0.1 (web_fetch)");
-        let builder = crate::config::apply_runtime_proxy_to_builder(builder, "tool.web_fetch");
+
+        // Log the effective runtime proxy state so operators debugging
+        // "connection error" reports from customers can tell whether
+        // a proxy was resolved, whether it applied to this service
+        // key, and which concrete URLs (if any) were dialled through.
+        let service_key = "tool.web_fetch";
+        let proxy_cfg = crate::config::runtime_proxy_config();
+        let proxy_applies = proxy_cfg.should_apply_to_service(service_key);
+        tracing::debug!(
+            target: "web_fetch",
+            service_key = %service_key,
+            url = %url,
+            proxy_enabled = proxy_cfg.enabled,
+            proxy_applies = proxy_applies,
+            http_proxy = proxy_cfg.http_proxy.as_deref().unwrap_or(""),
+            https_proxy = proxy_cfg.https_proxy.as_deref().unwrap_or(""),
+            all_proxy = proxy_cfg.all_proxy.as_deref().unwrap_or(""),
+            no_proxy_count = proxy_cfg.normalized_no_proxy().len(),
+            "web_fetch resolved runtime proxy state"
+        );
+
+        let builder = crate::config::apply_runtime_proxy_to_builder(builder, service_key);
         let client = match builder.build() {
             Ok(c) => c,
             Err(e) => {
@@ -365,7 +413,7 @@ impl Tool for WebFetchTool {
                     success: false,
                     output: String::new(),
                     error: Some(format!("Failed to build HTTP client: {e}")),
-                })
+                });
             }
         };
 
@@ -399,6 +447,33 @@ impl Tool for WebFetchTool {
 }
 
 // ── Helper functions (independent from http_request.rs per DRY rule-of-three) ──
+
+/// Render a full `std::error::Error` source chain as a single string,
+/// joining each level with " | caused by: ". For reqwest errors this
+/// surfaces the hyper/io root cause (e.g. ConnectionRefused, tls
+/// handshake failure, dns NXDOMAIN) that is otherwise hidden behind
+/// reqwest's own Display output.
+fn error_chain<E: std::error::Error + ?Sized>(e: &E) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    parts.push(e.to_string());
+    let mut cur: Option<&(dyn std::error::Error + 'static)> = e.source();
+    while let Some(s) = cur {
+        parts.push(s.to_string());
+        cur = s.source();
+    }
+    parts.join(" | caused by: ")
+}
+
+/// Same as [`error_chain`] but accepts an `anyhow::Error` directly,
+/// walking its [`anyhow::Error::chain`] iterator. `anyhow::Error`
+/// does not itself implement `std::error::Error`, so the generic
+/// helper can't be used directly.
+fn anyhow_error_chain(e: &anyhow::Error) -> String {
+    e.chain()
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(" | caused by: ")
+}
 
 fn validate_target_url(
     raw_url: &str,
@@ -661,6 +736,64 @@ mod tests {
     use super::*;
     use crate::config::schema::FirecrawlConfig;
     use crate::security::{AutonomyLevel, SecurityPolicy};
+    use std::sync::Mutex as StdMutex;
+
+    // ── Tracing capture helper (mirrors src/config/schema.rs pattern) ──
+
+    #[derive(Clone, Default)]
+    struct TraceCapture(Arc<StdMutex<Vec<u8>>>);
+
+    struct TraceCaptureWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl TraceCapture {
+        fn as_string(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().unwrap()).to_string()
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for TraceCapture {
+        type Writer = TraceCaptureWriter;
+        fn make_writer(&'a self) -> Self::Writer {
+            TraceCaptureWriter(self.0.clone())
+        }
+    }
+
+    impl std::io::Write for TraceCaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build a tracing subscriber + dispatcher guard that captures all
+    /// events at TRACE level into the returned `TraceCapture` buffer.
+    /// The returned `DefaultGuard` must be kept alive for the duration
+    /// of the assertions, then dropped before reading the buffer.
+    fn install_trace_capture() -> (TraceCapture, tracing::dispatcher::DefaultGuard) {
+        let capture = TraceCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_target(true)
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(capture.clone())
+            .finish();
+        let dispatch = tracing::Dispatch::new(subscriber);
+        let guard = tracing::dispatcher::set_default(&dispatch);
+        (capture, guard)
+    }
+
+    /// Reserve a TCP port by binding and immediately dropping the listener,
+    /// yielding a URL that is guaranteed to refuse connections fast.
+    fn reserved_unused_url() -> String {
+        let tcp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = tcp.local_addr().unwrap().port();
+        drop(tcp);
+        format!("http://127.0.0.1:{port}/nowhere")
+    }
 
     fn test_tool(allowed_domains: Vec<&str>) -> WebFetchTool {
         test_tool_with_blocklist(allowed_domains, vec![])
@@ -877,14 +1010,16 @@ mod tests {
     fn redirect_target_validation_allows_permitted_host() {
         let allowed = vec!["example.com".to_string()];
         let blocked = vec![];
-        assert!(validate_target_url(
-            "https://docs.example.com/page",
-            &allowed,
-            &blocked,
-            &[],
-            "web_fetch"
-        )
-        .is_ok());
+        assert!(
+            validate_target_url(
+                "https://docs.example.com/page",
+                &allowed,
+                &blocked,
+                &[],
+                "web_fetch"
+            )
+            .is_ok()
+        );
     }
 
     #[test]
@@ -1291,7 +1426,8 @@ mod tests {
     #[tokio::test]
     async fn firecrawl_missing_api_key_returns_error() {
         // Ensure the env var is unset for this test
-        std::env::remove_var("FIRECRAWL_TEST_MISSING_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("FIRECRAWL_TEST_MISSING_KEY") };
 
         let tool = test_tool_with_firecrawl(FirecrawlConfig {
             enabled: true,
@@ -1328,7 +1464,8 @@ mod tests {
             .await;
 
         // Ensure Firecrawl API key env is missing so fallback also fails
-        std::env::remove_var("FIRECRAWL_DOUBLE_FAIL_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("FIRECRAWL_DOUBLE_FAIL_KEY") };
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -1414,7 +1551,8 @@ mod tests {
             .await;
 
         // Set up API key env var for this test
-        std::env::set_var("FIRECRAWL_E2E_TEST_KEY", "test-key-12345");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::set_var("FIRECRAWL_E2E_TEST_KEY", "test-key-12345") };
 
         let security = Arc::new(SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
@@ -1461,7 +1599,8 @@ mod tests {
         );
 
         // Clean up env var
-        std::env::remove_var("FIRECRAWL_E2E_TEST_KEY");
+        // SAFETY: test-only, single-threaded test runner.
+        unsafe { std::env::remove_var("FIRECRAWL_E2E_TEST_KEY") };
     }
 
     // ── Allowed private hosts ─────────────────────────────────────
@@ -1498,5 +1637,301 @@ mod tests {
     fn allowed_private_host_with_port() {
         let tool = test_tool_with_private_hosts(vec!["*"], vec![], vec!["192.168.1.5"]);
         assert!(tool.validate_url("https://192.168.1.5:8080/api").is_ok());
+    }
+
+    // ── §1: Error-path logging on standard_fetch ────────────────────
+
+    /// When `standard_fetch` fails with a network error (connection
+    /// refused), the tool MUST emit an ERROR-level tracing event that
+    /// carries the requested URL and the source-chain of the underlying
+    /// reqwest/hyper/io error. Without this log, customers see only a
+    /// generic "connection error" surfaced back to the model and cannot
+    /// tell whether the failure is DNS, TLS, proxy, or upstream.
+    #[tokio::test]
+    async fn standard_fetch_logs_error_with_source_chain_on_network_failure() {
+        let (capture, guard) = install_trace_capture();
+
+        let url = reserved_unused_url();
+        let tool = test_tool(vec!["*"]);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_millis(500))
+            .connect_timeout(Duration::from_millis(500))
+            .build()
+            .unwrap();
+
+        let result = tool.standard_fetch(&client, &url).await;
+        assert!(
+            !result.success,
+            "standard_fetch must fail against a refused port, got success"
+        );
+
+        drop(guard);
+        let logs = capture.as_string();
+
+        assert!(
+            logs.contains("ERROR"),
+            "expected ERROR level tracing event, got logs:\n{logs}"
+        );
+        assert!(
+            logs.contains("web_fetch"),
+            "expected 'web_fetch' in log target/message, got logs:\n{logs}"
+        );
+        assert!(
+            logs.contains(&url),
+            "expected requested URL {url} in logs, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("error_chain"),
+            "expected 'error_chain' structured field with source chain, got:\n{logs}"
+        );
+    }
+
+    /// When `standard_fetch` receives a non-2xx HTTP status code
+    /// (e.g. 403 from a bot-blocking server), the tool MUST emit a
+    /// WARN-level tracing event carrying `url`, `status`, and
+    /// `status_reason`. This is the customer-visible signal that the
+    /// target is actively refusing — distinct from a transport-layer
+    /// failure — and should show up even at a default WARN filter.
+    #[tokio::test]
+    async fn standard_fetch_logs_warn_on_http_non_2xx_with_status_fields() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        let (capture, guard) = install_trace_capture();
+
+        let tool = test_tool(vec!["*"]);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let url = format!("http://{}/denied", server.address());
+        let result = tool.standard_fetch(&client, &url).await;
+        assert!(!result.success, "403 response must map to failure");
+
+        drop(guard);
+        let logs = capture.as_string();
+
+        assert!(
+            logs.contains("WARN"),
+            "expected WARN level tracing event, got logs:\n{logs}"
+        );
+        assert!(
+            logs.contains("web_fetch"),
+            "expected 'web_fetch' in log target, got logs:\n{logs}"
+        );
+        assert!(
+            logs.contains(&url),
+            "expected requested URL {url} in logs, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("status=403"),
+            "expected 'status=403' structured field, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("status_reason"),
+            "expected 'status_reason' structured field, got:\n{logs}"
+        );
+    }
+
+    /// When a server returns a content-type we don't handle (e.g. a
+    /// binary PDF), `standard_fetch` must emit a WARN-level tracing
+    /// event that includes the offending `content_type` so operators
+    /// can quickly see "this site served us a PDF, try a different
+    /// tool" rather than guessing from a generic error string.
+    #[tokio::test]
+    async fn standard_fetch_logs_warn_on_unsupported_content_type() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_bytes(b"%PDF-1.4 fake".to_vec())
+                    .insert_header("content-type", "application/pdf"),
+            )
+            .mount(&server)
+            .await;
+
+        let (capture, guard) = install_trace_capture();
+
+        let tool = test_tool(vec!["*"]);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let url = format!("http://{}/doc.pdf", server.address());
+        let result = tool.standard_fetch(&client, &url).await;
+        assert!(!result.success, "unsupported content-type must fail");
+
+        drop(guard);
+        let logs = capture.as_string();
+
+        assert!(
+            logs.contains("WARN"),
+            "expected WARN level tracing event, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("web_fetch"),
+            "expected 'web_fetch' in log target, got:\n{logs}"
+        );
+        assert!(
+            logs.contains(&url),
+            "expected URL {url} in logs, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("content_type=") && logs.contains("pdf"),
+            "expected 'content_type=...pdf' structured field, got:\n{logs}"
+        );
+    }
+
+    /// When `standard_fetch` gets past the status/content-type checks
+    /// but then fails to stream the body (e.g. the upstream drops the
+    /// connection mid-transfer), the tool MUST emit an ERROR-level
+    /// tracing event carrying the URL and the source-chain of the
+    /// underlying IO error. This is the silent-partial-fetch case:
+    /// customers see an incomplete page and no indication of why.
+    #[tokio::test]
+    async fn standard_fetch_logs_error_on_body_read_failure() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // Minimal hand-rolled TCP server: claims Content-Length: 1048576,
+        // sends a few bytes, then closes. The client will hit an
+        // IncompleteMessage / UnexpectedEof on the body stream.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let _ = sock.read(&mut buf).await;
+                let _ = sock
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\n\
+                          Content-Type: text/html\r\n\
+                          Content-Length: 1048576\r\n\
+                          Connection: close\r\n\
+                          \r\n\
+                          <html><body>partial",
+                    )
+                    .await;
+                // Drop the socket immediately — client will see EOF
+                // mid-body.
+                drop(sock);
+            }
+        });
+
+        let (capture, guard) = install_trace_capture();
+
+        let tool = test_tool(vec!["*"]);
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let url = format!("http://{addr}/partial");
+        let result = tool.standard_fetch(&client, &url).await;
+        assert!(
+            !result.success,
+            "standard_fetch must fail when body is truncated mid-stream, got success={:?}",
+            result.output
+        );
+
+        drop(guard);
+        let logs = capture.as_string();
+
+        assert!(
+            logs.contains("ERROR"),
+            "expected ERROR level tracing event, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("web_fetch"),
+            "expected 'web_fetch' in log target, got:\n{logs}"
+        );
+        assert!(
+            logs.contains(&url),
+            "expected URL {url} in logs, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("error_chain"),
+            "expected 'error_chain' structured field on body-read failure, got:\n{logs}"
+        );
+        // Distinct from the send() error path — body read should
+        // include a phase/stage marker so operators can distinguish
+        // "couldn't connect" from "connected then got cut off".
+        assert!(
+            logs.contains("body_read") || logs.contains("phase=body"),
+            "expected a 'body_read' or phase=body marker to distinguish \
+             body-read failure from connection-establish failure, got:\n{logs}"
+        );
+    }
+
+    /// On `execute()` entry (after URL validation, before dispatching
+    /// the HTTP request), web_fetch MUST emit a DEBUG-level tracing
+    /// event describing the effective runtime proxy state for the
+    /// `tool.web_fetch` service key. Without this, customers reporting
+    /// "connection error" from behind a corporate proxy have no way
+    /// to tell whether ZeroClaw even resolved a proxy at all. Default
+    /// state (proxy disabled) must still log so operators can confirm.
+    #[tokio::test]
+    async fn execute_logs_debug_proxy_state_on_entry() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(
+                        "<html><body>\
+                         padpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpad\
+                         padpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpadpad\
+                         </body></html>",
+                    )
+                    .insert_header("content-type", "text/html"),
+            )
+            .mount(&server)
+            .await;
+
+        let (capture, guard) = install_trace_capture();
+
+        let tool = test_tool_with_private_hosts(vec!["*"], vec![], vec!["127.0.0.1"]);
+        let url = format!("http://{}/ok", server.address());
+        let result = tool.execute(json!({ "url": url.clone() })).await.unwrap();
+        assert!(result.success, "expected execute() to succeed, got {result:?}");
+
+        drop(guard);
+        let logs = capture.as_string();
+
+        assert!(
+            logs.contains("DEBUG"),
+            "expected DEBUG level tracing event, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("web_fetch"),
+            "expected 'web_fetch' in log target, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("service_key=\"tool.web_fetch\"")
+                || logs.contains("service_key=tool.web_fetch"),
+            "expected service_key='tool.web_fetch' in logs, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("proxy_enabled"),
+            "expected 'proxy_enabled' structured field, got:\n{logs}"
+        );
+        assert!(
+            logs.contains("proxy_applies"),
+            "expected 'proxy_applies' structured field showing whether \
+             the runtime proxy scope actually applies to tool.web_fetch, got:\n{logs}"
+        );
     }
 }

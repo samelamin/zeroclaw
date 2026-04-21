@@ -1,16 +1,16 @@
 use super::embeddings::EmbeddingProvider;
-use super::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry};
+use super::traits::{ExportFilter, Memory, MemoryCategory, MemoryEntry, ProceduralMessage};
 use super::vector;
 use crate::config::schema::SearchMode;
 use anyhow::Context;
 use async_trait::async_trait;
 use chrono::Local;
 use parking_lot::Mutex;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
@@ -199,7 +199,29 @@ impl SqliteMemory {
                 created_at   TEXT NOT NULL,
                 accessed_at  TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);",
+            CREATE INDEX IF NOT EXISTS idx_cache_accessed ON embedding_cache(accessed_at);
+
+            -- Procedural memory: named sequences of tool steps
+            CREATE TABLE IF NOT EXISTS procedures (
+                id          TEXT PRIMARY KEY,
+                title       TEXT NOT NULL,
+                steps_json  TEXT NOT NULL,
+                session_id  TEXT,
+                created_at  TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_procedures_session ON procedures(session_id);
+
+            -- Outcome tracking for feedback-driven optimization
+            CREATE TABLE IF NOT EXISTS outcomes (
+                id TEXT PRIMARY KEY,
+                turn_id TEXT NOT NULL,
+                skill_used TEXT,
+                signal TEXT NOT NULL,
+                tool_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_outcomes_skill ON outcomes(skill_used);
+            CREATE INDEX IF NOT EXISTS idx_outcomes_signal ON outcomes(signal);",
         )?;
 
         // Migration: add session_id column if not present (safe to run repeatedly)
@@ -1005,6 +1027,57 @@ impl Memory for SqliteMemory {
             .unwrap_or(false)
     }
 
+    async fn store_procedural(
+        &self,
+        messages: &[ProceduralMessage],
+        session_id: Option<&str>,
+    ) -> anyhow::Result<()> {
+        use crate::memory::procedural::{ToolStep, extract_procedure};
+
+        // Collect tool-role messages into ToolSteps
+        let steps: Vec<ToolStep> = messages
+            .iter()
+            .filter(|m| m.role == "tool")
+            .map(|m| ToolStep {
+                tool_name: m.name.clone().unwrap_or_else(|| "unknown".into()),
+                description: m.content.chars().take(200).collect(),
+                args_summary: m.name.clone().unwrap_or_default(),
+            })
+            .collect();
+
+        // Derive a task description from the first non-tool message content
+        let task_description = messages
+            .iter()
+            .find(|m| m.role != "tool")
+            .map(|m| m.content.as_str())
+            .unwrap_or("Unnamed procedure");
+
+        let procedure = extract_procedure(task_description, &steps);
+
+        // Skip trivial sequences
+        if procedure.steps.is_empty() {
+            return Ok(());
+        }
+
+        let steps_json = serde_json::to_string(&procedure.steps)?;
+        let conn = self.conn.clone();
+        let title = procedure.title.clone();
+        let sid = session_id.map(String::from);
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let conn = conn.lock();
+            let id = Uuid::new_v4().to_string();
+            let now = chrono::Utc::now().to_rfc3339();
+            conn.execute(
+                "INSERT INTO procedures (id, title, steps_json, session_id, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![id, title, steps_json, sid, now],
+            )?;
+            Ok(())
+        })
+        .await?
+    }
+
     async fn export(&self, filter: &ExportFilter) -> anyhow::Result<Vec<MemoryEntry>> {
         let conn = self.conn.clone();
         let filter = filter.clone();
@@ -1211,9 +1284,11 @@ mod tests {
 
         let results = mem.recall("Rust", 10, None, None, None).await.unwrap();
         assert_eq!(results.len(), 2);
-        assert!(results
-            .iter()
-            .all(|r| r.content.to_lowercase().contains("rust")));
+        assert!(
+            results
+                .iter()
+                .all(|r| r.content.to_lowercase().contains("rust"))
+        );
     }
 
     #[tokio::test]
@@ -1974,7 +2049,7 @@ mod tests {
         mem.reindex().await.unwrap();
         let count = mem.reindex().await.unwrap();
         assert_eq!(count, 0); // Noop embedder → nothing to re-embed
-                              // Data should still be intact
+        // Data should still be intact
         let results = mem.recall("reindex", 10, None, None, None).await.unwrap();
         assert_eq!(results.len(), 1);
     }
@@ -2104,9 +2179,11 @@ mod tests {
         assert_eq!(mem.count().await.unwrap(), 3);
 
         let remaining = mem.list(None, None).await.unwrap();
-        assert!(remaining
-            .iter()
-            .all(|e| e.category != MemoryCategory::Custom("ns1".into())));
+        assert!(
+            remaining
+                .iter()
+                .all(|e| e.category != MemoryCategory::Custom("ns1".into()))
+        );
     }
 
     #[tokio::test]
@@ -2163,9 +2240,11 @@ mod tests {
         assert_eq!(mem.count().await.unwrap(), 2);
 
         let remaining = mem.list(None, None).await.unwrap();
-        assert!(remaining
-            .iter()
-            .all(|e| e.session_id.as_deref() != Some("sess-a")));
+        assert!(
+            remaining
+                .iter()
+                .all(|e| e.session_id.as_deref() != Some("sess-a"))
+        );
     }
 
     #[tokio::test]
@@ -2299,9 +2378,11 @@ mod tests {
         // List with session-a filter
         let results = mem.list(None, Some("sess-a")).await.unwrap();
         assert_eq!(results.len(), 2);
-        assert!(results
-            .iter()
-            .all(|e| e.session_id.as_deref() == Some("sess-a")));
+        assert!(
+            results
+                .iter()
+                .all(|e| e.session_id.as_deref() == Some("sess-a"))
+        );
 
         // List with session-a + category filter
         let results = mem

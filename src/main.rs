@@ -33,14 +33,14 @@
     dead_code
 )]
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use dialoguer::Password;
 use serde::{Deserialize, Serialize};
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 use tracing::{info, warn};
-use tracing_subscriber::{fmt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt};
 
 fn parse_temperature(s: &str) -> std::result::Result<f64, String> {
     let t: f64 = s.parse().map_err(|e| format!("{e}"))?;
@@ -110,6 +110,7 @@ mod skills;
 mod sop;
 mod tools;
 mod trust;
+mod tui;
 mod tunnel;
 mod util;
 mod verifiable_intent;
@@ -118,8 +119,9 @@ use config::Config;
 
 // Re-export so binary modules can use crate::<CommandEnum> while keeping a single source of truth.
 pub use zeroclaw::{
-    ChannelCommands, CronCommands, GatewayCommands, HardwareCommands, IntegrationCommands,
-    MigrateCommands, PeripheralCommands, ServiceCommands, SkillCommands, SopCommands,
+    BrowserCommands, ChannelCommands, CronCommands, GatewayCommands, HardwareCommands,
+    IntegrationCommands, MigrateCommands, PeripheralCommands, ServiceCommands, SkillCommands,
+    SopCommands,
 };
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
@@ -195,6 +197,10 @@ enum Commands {
         /// Skip interactive prompts and use quick setup with defaults
         #[arg(long)]
         quick: bool,
+
+        /// Use the ratatui-based TUI onboarding wizard
+        #[arg(long)]
+        tui: bool,
     },
 
     /// Start the AI agent loop
@@ -272,6 +278,30 @@ Examples:
         /// Session inactivity timeout in seconds (default: 3600)
         #[arg(long)]
         session_timeout: Option<u64>,
+    },
+
+    /// Start MCP server (Model Context Protocol)
+    #[command(long_about = "\
+Start the MCP server for tool integration.
+
+Exposes ZeroClaw's tools over the Model Context Protocol (MCP), \
+following Claude Code's pattern. Use stdio for local IDE integration \
+or HTTP for remote clients.
+
+Examples:
+  zeroclaw mcp                        # stdio transport (for Claude Desktop)
+  zeroclaw mcp --http                 # HTTP+SSE transport
+  zeroclaw mcp --http --port 8080     # custom port")]
+    Mcp {
+        /// Use HTTP+SSE transport instead of stdio
+        #[arg(long)]
+        http: bool,
+        /// Port for HTTP transport
+        #[arg(long, default_value = "3000")]
+        port: u16,
+        /// Enable debug logging
+        #[arg(long)]
+        debug: bool,
     },
 
     /// Start long-running autonomous runtime (gateway + channels + heartbeat + scheduler)
@@ -582,6 +612,17 @@ Examples:
         install: bool,
     },
 
+    /// Manage browser sidecar (Playwright-MCP)
+    #[command(long_about = "\
+Manage the Playwright-MCP browser sidecar.\n\n\
+Examples:\n\
+  zeroclaw browser status     # check sidecar reachability\n\
+  zeroclaw browser bootstrap  # print startup instructions")]
+    Browser {
+        #[command(subcommand)]
+        browser_command: BrowserCommands,
+    },
+
     /// Manage WASM plugins
     #[cfg(feature = "plugins-wasm")]
     Plugin {
@@ -616,6 +657,37 @@ enum PluginCommands {
 enum ConfigCommands {
     /// Dump the full configuration JSON Schema to stdout
     Schema,
+
+    /// Validate a TOML config file for structural, deserialization, and semantic errors.
+    ///
+    /// Exits 0 if valid (warnings are printed but not fatal).
+    /// Exits 1 if any errors are found.
+    ///
+    /// Examples:
+    ///   zeroclaw config validate config.toml
+    ///   zeroclaw config validate --strict config.toml
+    Validate {
+        /// Path to the TOML config file to validate (defaults to the active config.toml).
+        #[arg(value_name = "FILE")]
+        file: Option<std::path::PathBuf>,
+
+        /// Treat unknown keys and legacy [tools.X] sections as errors instead of warnings.
+        #[arg(long)]
+        strict: bool,
+    },
+
+    /// Rewrite legacy [tools.X] sections to top-level [X] sections.
+    ///
+    /// Saves a backup as <file>.bak before writing.
+    ///
+    /// Examples:
+    ///   zeroclaw config migrate
+    ///   zeroclaw config migrate config.toml
+    Migrate {
+        /// Path to the TOML config file to migrate (defaults to the active config.toml).
+        #[arg(value_name = "FILE")]
+        file: Option<std::path::PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -836,7 +908,8 @@ async fn main() -> Result<()> {
         if config_dir.trim().is_empty() {
             bail!("--config-dir cannot be empty");
         }
-        std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir);
+        // SAFETY: called early in main before any threads are spawned.
+        unsafe { std::env::set_var("ZEROCLAW_CONFIG_DIR", config_dir) };
     }
 
     // Completions must remain stdout-only and should not load config or initialize logging.
@@ -872,6 +945,7 @@ async fn main() -> Result<()> {
         model,
         memory,
         quick,
+        tui: use_tui,
     } = &cli.command
     {
         let force = *force;
@@ -882,6 +956,7 @@ async fn main() -> Result<()> {
         let model = model.clone();
         let memory = memory.clone();
         let quick = *quick;
+        let use_tui = *use_tui;
 
         if reinit && channels_only {
             bail!("--reinit and --channels-only cannot be used together");
@@ -945,6 +1020,12 @@ async fn main() -> Result<()> {
             api_key.is_some() || provider.is_some() || model.is_some() || memory.is_some();
         let is_tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
         let env_interactive = std::env::var("ZEROCLAW_INTERACTIVE").as_deref() == Ok("1");
+
+        // TUI onboarding mode (ratatui-based)
+        if use_tui {
+            Box::pin(tui::run_tui_onboarding()).await?;
+            return Ok(());
+        }
 
         let config = if channels_only {
             Box::pin(onboard::run_channels_repair_wizard()).await
@@ -1046,6 +1127,35 @@ async fn main() -> Result<()> {
             server.run().await
         }
 
+        Commands::Mcp { http, port, debug } => {
+            let mcp_config = zeroclaw::mcp_server::McpServerConfig {
+                transport: if http {
+                    zeroclaw::mcp_server::TransportMode::Http
+                } else {
+                    zeroclaw::mcp_server::TransportMode::Stdio
+                },
+                port,
+                api_key: std::env::var("MCP_API_KEY").ok(),
+                debug,
+                workspace_dir: config
+                    .config_path
+                    .parent()
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| std::path::PathBuf::from(".")),
+                // §3: opt the MCP server into the full ~40-tool surface
+                // (web_fetch, http_request, calculator, memory_*, cron_*,
+                // …) rather than the 6-tool default_tools subset. The
+                // transport will load its own `Config::load_or_init`
+                // internally — we can't pass `config` directly because
+                // the binary crate and the library crate each compile
+                // `mod config;` separately, so the `Config` types are
+                // nominally distinct.
+                expose_full_surface: true,
+            };
+            zeroclaw::mcp_server::serve(mcp_config).await?;
+            Ok(())
+        }
+
         Commands::Gateway { gateway_command } => {
             match gateway_command {
                 Some(zeroclaw::GatewayCommands::Restart { port, host }) => {
@@ -1082,7 +1192,7 @@ async fn main() -> Result<()> {
                     }
 
                     log_gateway_start(&host, port);
-                    Box::pin(gateway::run_gateway(&host, port, config)).await
+                    Box::pin(gateway::run_gateway(&host, port, config, None)).await
                 }
                 Some(zeroclaw::GatewayCommands::GetPaircode { new }) => {
                     let port = config.gateway.port;
@@ -1103,8 +1213,12 @@ async fn main() -> Result<()> {
                         }
                         Ok(None) => {
                             if config.gateway.require_pairing {
-                                println!("🔐 Gateway pairing is enabled, but no active pairing code available.");
-                                println!("   The gateway may already be paired, or the code has been used.");
+                                println!(
+                                    "🔐 Gateway pairing is enabled, but no active pairing code available."
+                                );
+                                println!(
+                                    "   The gateway may already be paired, or the code has been used."
+                                );
                                 println!("   Restart the gateway to generate a new pairing code.");
                             } else {
                                 println!("⚠️  Gateway pairing is disabled in config.");
@@ -1131,18 +1245,28 @@ async fn main() -> Result<()> {
                 Some(zeroclaw::GatewayCommands::Start { port, host }) => {
                     let (port, host) = resolve_gateway_addr(&config, port, host);
                     log_gateway_start(&host, port);
-                    Box::pin(gateway::run_gateway(&host, port, config)).await
+                    Box::pin(gateway::run_gateway(&host, port, config, None)).await
                 }
                 None => {
                     let port = config.gateway.port;
                     let host = config.gateway.host.clone();
                     log_gateway_start(&host, port);
-                    Box::pin(gateway::run_gateway(&host, port, config)).await
+                    Box::pin(gateway::run_gateway(&host, port, config, None)).await
                 }
             }
         }
 
         Commands::Daemon { port, host } => {
+            if let Ok(exe) = std::env::current_exe() {
+                let exe_str = exe.to_string_lossy();
+                if exe_str.contains(".cargo/bin") || exe_str.contains("/home/") {
+                    tracing::warn!(
+                        "Daemon running from user home directory: {}. \
+                         Consider installing to /usr/local/bin for system-wide service.",
+                        exe_str
+                    );
+                }
+            }
             let port = port.unwrap_or(config.gateway.port);
             let host = host.unwrap_or_else(|| config.gateway.host.clone());
             if port == 0 {
@@ -1241,9 +1365,37 @@ async fn main() -> Result<()> {
                 config.autonomy.max_actions_per_hour
             );
             println!(
-                "  Max cost/day:      ${:.2}",
-                f64::from(config.autonomy.max_cost_per_day_cents) / 100.0
+                "  Cost tracking:     {}",
+                if config.cost.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
             );
+            println!("  Max cost/day:      ${:.2}", config.cost.daily_limit_usd);
+            println!("  Max cost/month:    ${:.2}", config.cost.monthly_limit_usd);
+            if config.cost.enabled {
+                match cost::CostTracker::new(config.cost.clone(), &config.workspace_dir) {
+                    Ok(tracker) => match tracker.get_summary() {
+                        Ok(summary) => {
+                            println!(
+                                "  Spent today:       ${:.4} / ${:.2}",
+                                summary.daily_cost_usd, config.cost.daily_limit_usd
+                            );
+                            println!(
+                                "  Spent this month:  ${:.4} / ${:.2}",
+                                summary.monthly_cost_usd, config.cost.monthly_limit_usd
+                            );
+                        }
+                        Err(e) => {
+                            eprintln!("  ⚠ Could not load cost usage: {e}");
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("  ⚠ Could not init cost tracker: {e}");
+                    }
+                }
+            }
             println!("  OTP enabled:       {}", config.security.otp.enabled);
             println!("  E-stop enabled:    {}", config.security.estop.enabled);
             println!();
@@ -1394,6 +1546,61 @@ async fn main() -> Result<()> {
         Commands::Hardware { hardware_command } => {
             hardware::handle_command(hardware_command.clone(), &config)
         }
+
+        Commands::Browser { browser_command } => match browser_command {
+            BrowserCommands::Status => {
+                let endpoint = &config.browser.playwright_mcp.endpoint;
+                let browser = &config.browser.playwright_mcp.browser;
+                let backend = &config.browser.backend;
+                // Try a TCP reachability probe
+                let url = reqwest::Url::parse(endpoint).ok();
+                let reachable = url.map_or(false, |u| {
+                    let host = u.host_str().unwrap_or("127.0.0.1");
+                    let port = u.port().unwrap_or(3000);
+                    std::net::TcpStream::connect_timeout(
+                        &format!("{host}:{port}").parse().unwrap_or("127.0.0.1:3000".parse().unwrap()),
+                        std::time::Duration::from_millis(500),
+                    ).is_ok()
+                });
+                println!("Playwright-MCP sidecar");
+                println!("  endpoint  : {endpoint}");
+                println!("  browser   : {browser}");
+                println!("  reachable : {}", if reachable { "yes" } else { "NO" });
+                println!("  backend   : {backend}");
+                if !reachable {
+                    println!();
+                    println!("To start: npx @playwright/mcp --port 3000 --browser {browser}");
+                }
+                Ok(())
+            }
+            BrowserCommands::Bootstrap => {
+                let cfg = &config.browser.playwright_mcp;
+                let mut cmd = format!("npx @playwright/mcp --port 3000 --browser {}", cfg.browser);
+                if let Some(ua) = &cfg.user_agent {
+                    cmd.push_str(&format!(" --user-agent \"{ua}\""));
+                }
+                if let Some(locale) = &cfg.locale {
+                    cmd.push_str(&format!(" --locale {locale}"));
+                }
+                if let Some(tz) = &cfg.timezone_id {
+                    cmd.push_str(&format!(" --timezone {tz}"));
+                }
+                println!("# Playwright-MCP sidecar bootstrap");
+                println!("#");
+                println!("# Option 1: npx (requires Node.js)");
+                println!("{cmd}");
+                println!();
+                println!("# Option 2: Docker Compose override");
+                println!("docker compose -f docker-compose.yml -f docker-compose.playwright.yml up -d");
+                println!();
+                println!("# Then set in config.toml:");
+                println!("[browser]");
+                println!("backend = \"playwright_mcp\"");
+                println!("[browser.playwright_mcp]");
+                println!("endpoint = \"{}\"", cfg.endpoint);
+                Ok(())
+            }
+        },
 
         Commands::Peripheral { peripheral_command } => {
             Box::pin(peripherals::handle_command(
@@ -1561,6 +1768,87 @@ async fn main() -> Result<()> {
                     "{}",
                     serde_json::to_string_pretty(&schema).expect("failed to serialize JSON Schema")
                 );
+                Ok(())
+            }
+
+            ConfigCommands::Validate { file, strict } => {
+                let path = match file {
+                    Some(p) => p,
+                    None => config.config_path.clone(),
+                };
+                let toml_content = std::fs::read_to_string(&path)
+                    .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+
+                use zeroclaw::config::validate::{ValidationOutcome, validate_config_toml};
+                let outcome = validate_config_toml(&toml_content, strict);
+
+                match &outcome {
+                    ValidationOutcome::Ok { warnings } => {
+                        for w in warnings {
+                            warn!("config validate: {w}");
+                        }
+                        println!("Config valid: {}", path.display());
+                        Ok(())
+                    }
+                    ValidationOutcome::Errors { errors, warnings } => {
+                        for w in warnings {
+                            warn!("config validate: {w}");
+                        }
+                        for e in errors {
+                            eprintln!("error: {e}");
+                        }
+                        eprintln!(
+                            "\nConfig validation FAILED ({} error(s)): {}",
+                            errors.len(),
+                            path.display()
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            }
+
+            ConfigCommands::Migrate { file } => {
+                let path = match file {
+                    Some(p) => p,
+                    None => config.config_path.clone(),
+                };
+                let toml_content = std::fs::read_to_string(&path)
+                    .with_context(|| format!("Failed to read config file: {}", path.display()))?;
+
+                use zeroclaw::config::validate::migrate_tools_prefix;
+                let (migrated, keys) = migrate_tools_prefix(&toml_content)
+                    .with_context(|| format!("Migration failed for: {}", path.display()))?;
+
+                if keys.is_empty() {
+                    println!("Nothing to migrate in {}", path.display());
+                    return Ok(());
+                }
+
+                // Write backup
+                let backup_path = path.with_extension(
+                    path.extension()
+                        .map(|e| format!("{}.bak", e.to_string_lossy()))
+                        .unwrap_or_else(|| "bak".into()),
+                );
+                std::fs::copy(&path, &backup_path).with_context(|| {
+                    format!(
+                        "Failed to write backup to {}",
+                        backup_path.display()
+                    )
+                })?;
+
+                std::fs::write(&path, &migrated)
+                    .with_context(|| format!("Failed to write migrated config to {}", path.display()))?;
+
+                println!(
+                    "Migrated {} key(s) in {} (backup: {}):",
+                    keys.len(),
+                    path.display(),
+                    backup_path.display()
+                );
+                for k in &keys {
+                    println!("  [tools.{k}] → [{k}]");
+                }
                 Ok(())
             }
         },

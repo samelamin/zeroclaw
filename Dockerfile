@@ -28,16 +28,16 @@ COPY Cargo.toml Cargo.lock ./
 # with the lockfile and caused `cargo --locked` to fail (Cargo refused to rewrite the lock).
 COPY crates/robot-kit/ crates/robot-kit/
 COPY crates/aardvark-sys/ crates/aardvark-sys/
-# Copy the real Cargo.toml for apps/tauri so the workspace parses correctly
-# under --locked (stub content would mismatch the lockfile).
-# The src/ is not needed for the dep-cache step — stub it.
+# Include tauri workspace member manifest (desktop app, but needed for workspace resolution).
+# .dockerignore whitelists only Cargo.toml; src and build.rs are stubbed below.
 COPY apps/tauri/Cargo.toml apps/tauri/Cargo.toml
 # Create dummy targets declared in Cargo.toml so manifest parsing succeeds.
 RUN mkdir -p src benches apps/tauri/src \
     && echo "fn main() {}" > src/main.rs \
     && echo "" > src/lib.rs \
     && echo "fn main() {}" > benches/agent_benchmarks.rs \
-    && echo "fn main() {}" > apps/tauri/src/main.rs
+    && echo "fn main() {}" > apps/tauri/src/main.rs \
+    && echo "fn main() {}" > apps/tauri/build.rs
 RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=zeroclaw-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=zeroclaw-target,target=/app/target,sharing=locked \
@@ -49,6 +49,8 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
 RUN rm -rf src benches
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
+# ARG ZEROCLAW_SRC_HASH allows callers to force-bust the COPY src/ cache layer.
+ARG ZEROCLAW_SRC_HASH=unknown
 COPY src/ src/
 COPY benches/ benches/
 COPY --from=web-builder /web/dist web/dist
