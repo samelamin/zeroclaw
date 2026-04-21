@@ -637,10 +637,22 @@ impl Agent {
                         duration: start.elapsed(),
                         success: r.success,
                     });
-                    if r.success {
-                        r.output
+                    if self.config.core == "minimal" {
+                        let raw = if r.success {
+                            r.output
+                        } else {
+                            match r.error {
+                                Some(e) if !e.is_empty() => e,
+                                _ => r.output,
+                            }
+                        };
+                        crate::agent::tool_result_truncate::format_tool_output(&raw, r.success)
                     } else {
-                        format!("Error: {}", r.error.unwrap_or(r.output))
+                        if r.success {
+                            r.output
+                        } else {
+                            format!("Error: {}", r.error.unwrap_or(r.output))
+                        }
                     }
                 }
                 Err(e) => {
@@ -649,7 +661,12 @@ impl Agent {
                         duration: start.elapsed(),
                         success: false,
                     });
-                    format!("Error executing {}: {e}", call.name)
+                    if self.config.core == "minimal" {
+                        let raw = format!("{e:#}");
+                        crate::agent::tool_result_truncate::format_tool_output(&raw, false)
+                    } else {
+                        format!("Error executing {}: {e}", call.name)
+                    }
                 }
             }
         } else if let Some(activated_arc) = self.activated_tools.as_ref() {
@@ -663,10 +680,22 @@ impl Agent {
                             duration: start.elapsed(),
                             success: r.success,
                         });
-                        if r.success {
-                            r.output
+                        if self.config.core == "minimal" {
+                            let raw = if r.success {
+                                r.output
+                            } else {
+                                match r.error {
+                                    Some(e) if !e.is_empty() => e,
+                                    _ => r.output,
+                                }
+                            };
+                            crate::agent::tool_result_truncate::format_tool_output(&raw, r.success)
                         } else {
-                            format!("Error: {}", r.error.unwrap_or(r.output))
+                            if r.success {
+                                r.output
+                            } else {
+                                format!("Error: {}", r.error.unwrap_or(r.output))
+                            }
                         }
                     }
                     Err(e) => {
@@ -675,7 +704,12 @@ impl Agent {
                             duration: start.elapsed(),
                             success: false,
                         });
-                        format!("Error executing {}: {e}", call.name)
+                        if self.config.core == "minimal" {
+                            let raw = format!("{e:#}");
+                            crate::agent::tool_result_truncate::format_tool_output(&raw, false)
+                        } else {
+                            format!("Error executing {}: {e}", call.name)
+                        }
                     }
                 }
             } else {
@@ -764,15 +798,18 @@ impl Agent {
                 )));
         }
 
-        let context = self
-            .memory_loader
-            .load_context(
-                self.memory.as_ref(),
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
-            .await
-            .unwrap_or_default();
+        let context = if self.config.core == "minimal" {
+            String::new()
+        } else {
+            self.memory_loader
+                .load_context(
+                    self.memory.as_ref(),
+                    user_message,
+                    self.memory_session_id.as_deref(),
+                )
+                .await
+                .unwrap_or_default()
+        };
 
         if self.auto_save {
             let _ = self
@@ -802,7 +839,11 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = self.classify_model(user_message);
+        let effective_model = if self.config.core == "minimal" {
+            self.model_name.clone()
+        } else {
+            self.classify_model(user_message)
+        };
 
         for _ in 0..self.config.max_tool_iterations {
             let messages = self.tool_dispatcher.to_provider_messages(&self.history);
@@ -949,15 +990,18 @@ impl Agent {
                 )));
         }
 
-        let context = self
-            .memory_loader
-            .load_context(
-                self.memory.as_ref(),
-                user_message,
-                self.memory_session_id.as_deref(),
-            )
-            .await
-            .unwrap_or_default();
+        let context = if self.config.core == "minimal" {
+            String::new()
+        } else {
+            self.memory_loader
+                .load_context(
+                    self.memory.as_ref(),
+                    user_message,
+                    self.memory_session_id.as_deref(),
+                )
+                .await
+                .unwrap_or_default()
+        };
 
         if self.auto_save {
             let _ = self
@@ -981,7 +1025,11 @@ impl Agent {
         self.history
             .push(ConversationMessage::Chat(ChatMessage::user(enriched)));
 
-        let effective_model = self.classify_model(user_message);
+        let effective_model = if self.config.core == "minimal" {
+            self.model_name.clone()
+        } else {
+            self.classify_model(user_message)
+        };
 
         // ── Turn loop ──────────────────────────────────────────────────
         for _ in 0..self.config.max_tool_iterations {
