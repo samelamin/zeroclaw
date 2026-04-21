@@ -1155,6 +1155,10 @@ mod tests {
         Arc::new(tokio::sync::Mutex::new(Vec::new()))
     }
 
+    fn make_cookies_json() -> Arc<tokio::sync::Mutex<Option<String>>> {
+        Arc::new(tokio::sync::Mutex::new(None))
+    }
+
     fn sse_body(json: &str) -> String {
         format!("event: message\ndata: {json}\n\n")
     }
@@ -1196,7 +1200,7 @@ mod tests {
             })
             .mount(&server)
             .await;
-        let client = PlaywrightMcpClient::new(server.uri(), None, 30_000, make_session_id(), make_last_url(), make_replayable_actions());
+        let client = PlaywrightMcpClient::new(server.uri(), None, 30_000, make_session_id(), make_last_url(), make_replayable_actions(), make_cookies_json());
         let result = client.call_tool("browser_navigate", serde_json::json!({ "url": "https://x.com" })).await;
         assert!(result.is_ok(), "expected ok, got: {result:?}");
     }
@@ -1221,7 +1225,7 @@ mod tests {
             })
             .mount(&server)
             .await;
-        let client = PlaywrightMcpClient::new(server.uri(), Some("tok123".into()), 30_000, make_session_id(), make_last_url(), make_replayable_actions());
+        let client = PlaywrightMcpClient::new(server.uri(), Some("tok123".into()), 30_000, make_session_id(), make_last_url(), make_replayable_actions(), make_cookies_json());
         let result = client.call_tool("browser_navigate", serde_json::json!({})).await;
         assert!(result.is_ok(), "expected ok, got: {result:?}");
     }
@@ -1247,7 +1251,7 @@ mod tests {
             })
             .mount(&server)
             .await;
-        let client = PlaywrightMcpClient::new(server.uri(), None, 30_000, make_session_id(), make_last_url(), make_replayable_actions());
+        let client = PlaywrightMcpClient::new(server.uri(), None, 30_000, make_session_id(), make_last_url(), make_replayable_actions(), make_cookies_json());
         let result = client.call_tool("browser_navigate", serde_json::json!({ "url": "https://x.com" })).await;
         assert!(result.is_ok(), "expected successful retry after 404, got: {result:?}");
     }
@@ -1296,7 +1300,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = PlaywrightMcpClient::new(server.uri(), None, 30_000, make_session_id(), make_last_url(), make_replayable_actions());
+        let client = PlaywrightMcpClient::new(server.uri(), None, 30_000, make_session_id(), make_last_url(), make_replayable_actions(), make_cookies_json());
         client
             .call_tool("browser_navigate", serde_json::json!({ "url": "https://example.com/login" }))
             .await
@@ -1357,7 +1361,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = PlaywrightMcpClient::new(server.uri(), None, 30_000, make_session_id(), make_last_url(), make_replayable_actions());
+        let client = PlaywrightMcpClient::new(server.uri(), None, 30_000, make_session_id(), make_last_url(), make_replayable_actions(), make_cookies_json());
         client
             .call_tool("browser_navigate", serde_json::json!({ "url": "https://example.com/login" }))
             .await
@@ -1390,7 +1394,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(500))
             .mount(&server)
             .await;
-        let client = PlaywrightMcpClient::new(server.uri(), None, 30_000, make_session_id(), make_last_url(), make_replayable_actions());
+        let client = PlaywrightMcpClient::new(server.uri(), None, 30_000, make_session_id(), make_last_url(), make_replayable_actions(), make_cookies_json());
         let result = client.call_tool_with_retry("browser_navigate", serde_json::json!({})).await;
         assert!(result.is_err());
     }
