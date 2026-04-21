@@ -66,12 +66,9 @@ pub mod mcp_deferred;
 pub mod mcp_protocol;
 pub mod mcp_tool;
 pub mod mcp_transport;
-pub mod memory_export;
-pub mod memory_forget;
-pub mod memory_purge;
-pub mod memory_recall;
-pub mod memory_store;
 pub mod microsoft365;
+pub mod recall;
+pub mod remember;
 pub mod model_routing_config;
 pub mod model_switch;
 pub mod node_capabilities;
@@ -167,12 +164,9 @@ pub use llm_task::LlmTaskTool;
 pub use mcp_client::McpRegistry;
 pub use mcp_deferred::{ActivatedToolSet, DeferredMcpToolSet};
 pub use mcp_tool::McpToolWrapper;
-pub use memory_export::MemoryExportTool;
-pub use memory_forget::MemoryForgetTool;
-pub use memory_purge::MemoryPurgeTool;
-pub use memory_recall::MemoryRecallTool;
-pub use memory_store::MemoryStoreTool;
 pub use microsoft365::Microsoft365Tool;
+pub use recall::RecallTool;
+pub use remember::RememberTool;
 pub use model_routing_config::ModelRoutingConfigTool;
 pub use model_switch::ModelSwitchTool;
 #[allow(unused_imports)]
@@ -499,11 +493,8 @@ pub fn all_tools_with_runtime(
         Arc::new(CronUpdateTool::new(config.clone(), security.clone())),
         Arc::new(CronRunTool::new(config.clone(), security.clone())),
         Arc::new(CronRunsTool::new(config.clone())),
-        Arc::new(MemoryStoreTool::new(memory.clone(), security.clone())),
-        Arc::new(MemoryRecallTool::new(memory.clone())),
-        Arc::new(MemoryForgetTool::new(memory.clone(), security.clone())),
-        Arc::new(MemoryExportTool::new(memory.clone())),
-        Arc::new(MemoryPurgeTool::new(memory.clone(), security.clone())),
+        Arc::new(RememberTool::new(memory.clone())),
+        Arc::new(RecallTool::new(memory.clone())),
         Arc::new(ScheduleTool::new(security.clone(), root_config.clone())),
         Arc::new(ModelRoutingConfigTool::new(
             config.clone(),
