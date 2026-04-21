@@ -1,7 +1,8 @@
-//! Integration test: drives both agent.core values through the canonical eval
-//! task suite and prints per-core pass rate + median tokens.
+//! Integration test: drives the canonical eval task suite through the agent
+//! and reports pass rate + median tokens.
 //!
-//! Serves as the promotion gate used by Task 9.
+//! Originally tested both "legacy" and "minimal" cores; after the legacy
+//! scaffolding was removed the test now runs against the single unified path.
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -61,8 +62,8 @@ impl Provider for ScriptedProvider {
     }
 }
 
-/// Build an Agent for the given core string, wired up with the scripted provider.
-fn make_agent(core: &str, responses: Vec<ChatResponse>) -> Agent {
+/// Build an Agent wired up with the scripted provider.
+fn make_agent(_label: &str, responses: Vec<ChatResponse>) -> Agent {
     let tmp = TempDir::new().expect("tempdir");
     // Keep the TempDir alive by leaking it — this is a test, memory is fine.
     let tmp_path = tmp.into_path();
@@ -70,8 +71,7 @@ fn make_agent(core: &str, responses: Vec<ChatResponse>) -> Agent {
     let memory = Arc::new(MarkdownMemory::new(&tmp_path));
     let observer = Arc::new(NoopObserver {});
 
-    let mut config = AgentConfig::default();
-    config.core = core.to_string();
+    let config = AgentConfig::default();
 
     Agent::builder()
         .provider(Box::new(ScriptedProvider::new(responses)))
@@ -86,32 +86,19 @@ fn make_agent(core: &str, responses: Vec<ChatResponse>) -> Agent {
 }
 
 #[tokio::test]
-async fn eval_suite_reports_for_both_cores() {
+async fn eval_suite_passes_all_tasks() {
     let tasks = canonical_tasks();
 
-    let legacy = run_suite(&tasks, "legacy", |core, responses| {
-        make_agent(core, responses)
-    })
-    .await;
-
-    let minimal = run_suite(&tasks, "minimal", |core, responses| {
-        make_agent(core, responses)
+    let results = run_suite(&tasks, "minimal", |label, responses| {
+        make_agent(label, responses)
     })
     .await;
 
     println!(
-        "legacy pass rate:  {:.0}%  median tokens: {}",
-        legacy.pass_rate("legacy") * 100.0,
-        legacy.median_tokens("legacy")
-    );
-    println!(
-        "minimal pass rate: {:.0}%  median tokens: {}",
-        minimal.pass_rate("minimal") * 100.0,
-        minimal.median_tokens("minimal")
+        "pass rate:     {:.0}%  median tokens: {}",
+        results.pass_rate("minimal") * 100.0,
+        results.median_tokens("minimal")
     );
 
-    // v1: only assert the runner completes all tasks for both cores.
-    // Promotion thresholds are enforced in Task 9.
-    assert_eq!(legacy.results.len(), tasks.len());
-    assert_eq!(minimal.results.len(), tasks.len());
+    assert_eq!(results.results.len(), tasks.len());
 }

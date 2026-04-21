@@ -439,74 +439,7 @@ async fn agent_multi_turn_with_tools_builds_context() {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 6. Memory Consolidation Integration
-// ═════════════════════════════════════════════════════════════════════════════
-
-/// Direct test of consolidate_turn saving to memory.
-#[tokio::test]
-async fn consolidation_extracts_facts_to_memory() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
-
-    let provider = MockProvider::new(vec![text_response(
-        r#"{"history_entry": "User shared project deadline info", "memory_update": "Project deadline is April 15th 2026"}"#,
-    )]);
-
-    let result = zeroclaw::memory::consolidation::consolidate_turn(
-        &provider,
-        "test-model",
-        mem.as_ref(),
-        "The project deadline is April 15th 2026",
-        "Got it, I'll remember the deadline is April 15th.",
-    )
-    .await;
-
-    assert!(result.is_ok(), "Consolidation should succeed");
-
-    // Check that facts were stored
-    let entries = mem.recall("deadline", 10, None, None, None).await.unwrap();
-    assert!(
-        !entries.is_empty(),
-        "Consolidation should have stored facts about the deadline"
-    );
-}
-
-/// Memory survives multiple consolidation rounds without corruption.
-#[tokio::test]
-async fn memory_survives_rapid_consolidation() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let mem: Arc<dyn Memory> = Arc::new(SqliteMemory::new(tmp.path()).unwrap());
-
-    // Simulate 10 rapid consolidation rounds
-    for i in 0..10 {
-        let provider = MockProvider::new(vec![text_response(&format!(
-            r#"{{"history_entry": "Turn {i} conversation", "memory_update": null}}"#,
-        ))]);
-
-        let _ = zeroclaw::memory::consolidation::consolidate_turn(
-            &provider,
-            "test-model",
-            mem.as_ref(),
-            &format!("User message {i}"),
-            &format!("Assistant response {i}"),
-        )
-        .await;
-    }
-
-    // All daily entries should exist
-    let entries = mem
-        .recall("conversation", 20, None, None, None)
-        .await
-        .unwrap();
-    assert!(
-        entries.len() >= 5,
-        "At least 5 of 10 consolidation entries should be recallable, got {}",
-        entries.len()
-    );
-}
-
-// ═════════════════════════════════════════════════════════════════════════════
-// 7. Session Persistence End-to-End
+// 6. Session Persistence End-to-End
 // ═════════════════════════════════════════════════════════════════════════════
 
 /// SQLite session backend stores and loads messages correctly.

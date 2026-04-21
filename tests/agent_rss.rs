@@ -1,4 +1,4 @@
-//! RSS regression test for agent.core = "minimal".
+//! RSS regression test for the agent turn loop.
 //!
 //! Drives 500 agent.turn() calls and asserts RSS growth stays under 20 MB.
 //! This catches the brain.db-class memory snowball before it re-lands.
@@ -53,13 +53,12 @@ fn rss_kb() -> u64 {
 }
 
 #[tokio::test]
-async fn agent_core_minimal_500_turns_rss_stable() {
+async fn agent_500_turns_rss_stable() {
     let tmp = TempDir::new().expect("tempdir");
     let memory = Arc::new(MarkdownMemory::new(tmp.path()));
     let observer = Arc::new(NoopObserver {});
 
-    let mut config = AgentConfig::default();
-    config.core = "minimal".into();
+    let config = AgentConfig::default();
 
     let mut agent = Agent::builder()
         .provider(Box::new(ScriptedProvider))

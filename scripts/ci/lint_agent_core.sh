@@ -3,7 +3,7 @@
 # Fails CI if banned growth-prone patterns appear in src/agent/ or src/memory/.
 # These are the five patterns identified in the agent-recore spec as the root
 # cause of the brain.db memory snowball. New code must avoid them; pre-existing
-# hits in Phase-7-scheduled files are allowlisted below.
+# hits in load-bearing files are allowlisted below.
 
 set -euo pipefail
 
@@ -19,36 +19,26 @@ PATTERNS=(
 )
 
 # -----------------------------------------------------------------------------
-# Files allowlisted because they are scheduled for deletion in Phase 7.
-# Remove entries here as the corresponding files are deleted.
+# Files allowlisted because they contain production-necessary patterns.
+# Remove entries here only when the pattern is genuinely eliminated.
 # -----------------------------------------------------------------------------
 ALLOWLIST=(
-  # --- Phase-7 scheduled deletions (remove entries as files are deleted) ---
+  # --- Phase-7 remaining files (still have external callers, not yet deleted) ---
   'src/agent/loop_.rs'
   'src/agent/microcompactor.rs'
   'src/agent/loop_detector.rs'
   'src/agent/history_pruner.rs'
   'src/agent/context_compressor.rs'
-  'src/agent/context_analyzer.rs'
   'src/agent/classifier.rs'
   'src/agent/personality.rs'
   'src/agent/thinking.rs'
-  'src/agent/memory_loader.rs'
-  'src/memory/dreaming.rs'
-  'src/memory/consolidation.rs'
   'src/memory/decay.rs'
   'src/memory/knowledge_graph.rs'
-  'src/memory/hygiene.rs'
-  'src/memory/importance.rs'
   'src/memory/procedural.rs'
-  'src/memory/outcomes.rs'
-  'src/memory/conflict.rs'
-  'src/memory/response_cache.rs'
   'src/memory/embeddings.rs'
   'src/memory/vector.rs'
   'src/memory/qdrant.rs'
   'src/memory/chunker.rs'
-  'src/memory/customer_model.rs'
 
   # --- Pre-existing load-bearing files (NOT scheduled for deletion) ---
   # These hold production tokio::spawn() calls that are:
