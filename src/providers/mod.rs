@@ -1415,7 +1415,13 @@ fn create_provider_with_url_and_options(
             AuthStyle::Bearer,
         ))),
         "copilot" | "github-copilot" => Ok(Box::new(copilot::CopilotProvider::new(key))),
-        "claude-code" => Ok(Box::new(claude_code::ClaudeCodeProvider::new())),
+        "claude-code" => {
+            let mut provider = claude_code::ClaudeCodeProvider::new();
+            if let Some(t) = options.provider_timeout_secs {
+                provider = provider.with_timeout_secs(t);
+            }
+            Ok(Box::new(provider))
+        }
         "gemini-cli" => Ok(Box::new(gemini_cli::GeminiCliProvider::new())),
         "kilocli" | "kilo" => Ok(Box::new(kilocli::KiloCliProvider::new())),
         "lmstudio" | "lm-studio" => {

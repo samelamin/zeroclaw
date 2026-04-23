@@ -48,7 +48,9 @@ const DEFAULT_CLAUDE_CODE_BINARY: &str = "claude";
 const DEFAULT_MODEL_MARKER: &str = "default";
 /// Claude Code requests are bounded to avoid hung subprocesses.
 /// Set higher than typical API timeouts to accommodate multi-turn tool loops.
-const CLAUDE_CODE_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+/// Callers can override via [`ClaudeCodeProvider::with_timeout_secs`], wired
+/// from the `provider_timeout_secs` config value in the factory.
+const DEFAULT_CLAUDE_CODE_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 /// Avoid leaking oversized stderr payloads.
 const MAX_CLAUDE_CODE_STDERR_CHARS: usize = 512;
 
@@ -59,6 +61,10 @@ const MAX_CLAUDE_CODE_STDERR_CHARS: usize = 512;
 pub struct ClaudeCodeProvider {
     /// Path to the `claude` binary.
     binary_path: PathBuf,
+    /// Per-request subprocess timeout. Defaults to
+    /// [`DEFAULT_CLAUDE_CODE_REQUEST_TIMEOUT`]; override with
+    /// [`Self::with_timeout_secs`].
+    timeout: Duration,
 }
 
 impl ClaudeCodeProvider {
@@ -73,7 +79,23 @@ impl ClaudeCodeProvider {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_CLAUDE_CODE_BINARY));
 
-        Self { binary_path }
+        Self {
+            binary_path,
+            timeout: DEFAULT_CLAUDE_CODE_REQUEST_TIMEOUT,
+        }
+    }
+
+    /// Override the per-request subprocess timeout.
+    ///
+    /// A value of 0 is rejected and falls back to the default. This mirrors
+    /// the semantics used by `OpenAiCompatibleProvider::with_timeout_secs`
+    /// so the factory can pass the configured `provider_timeout_secs`
+    /// through without guarding the zero case.
+    pub fn with_timeout_secs(mut self, secs: u64) -> Self {
+        if secs > 0 {
+            self.timeout = Duration::from_secs(secs);
+        }
+        self
     }
 
     /// Returns true if the model argument should be forwarded to the CLI.
@@ -159,12 +181,12 @@ impl ClaudeCodeProvider {
             })?;
         }
 
-        let output = timeout(CLAUDE_CODE_REQUEST_TIMEOUT, child.wait_with_output())
+        let output = timeout(self.timeout, child.wait_with_output())
             .await
             .map_err(|_| {
                 anyhow::anyhow!(
-                    "Claude Code request timed out after {:?} (binary: {})",
-                    CLAUDE_CODE_REQUEST_TIMEOUT,
+                    "Claude Code request timed out after {}s (binary: {})",
+                    self.timeout.as_secs(),
                     self.binary_path.display()
                 )
             })?
@@ -380,6 +402,29 @@ mod tests {
     }
 
     #[test]
+    fn new_uses_default_timeout() {
+        let _guard = env_lock();
+        let provider = ClaudeCodeProvider::new();
+        assert_eq!(provider.timeout, DEFAULT_CLAUDE_CODE_REQUEST_TIMEOUT);
+    }
+
+    #[test]
+    fn with_timeout_secs_overrides_default() {
+        let _guard = env_lock();
+        let provider = ClaudeCodeProvider::new().with_timeout_secs(900);
+        assert_eq!(provider.timeout, Duration::from_secs(900));
+    }
+
+    #[test]
+    fn with_timeout_secs_zero_keeps_default() {
+        // Zero is rejected so the factory can pass the configured value
+        // unconditionally without re-implementing the fallback.
+        let _guard = env_lock();
+        let provider = ClaudeCodeProvider::new().with_timeout_secs(0);
+        assert_eq!(provider.timeout, DEFAULT_CLAUDE_CODE_REQUEST_TIMEOUT);
+    }
+
+    #[test]
     fn should_forward_model_standard() {
         assert!(ClaudeCodeProvider::should_forward_model(
             "claude-sonnet-4-20250514"
@@ -416,6 +461,7 @@ mod tests {
     async fn invoke_missing_binary_returns_error() {
         let provider = ClaudeCodeProvider {
             binary_path: PathBuf::from("/nonexistent/path/to/claude"),
+            timeout: DEFAULT_CLAUDE_CODE_REQUEST_TIMEOUT,
         };
         let result = provider.invoke_cli("hello", "default", None, false).await;
         assert!(result.is_err());
@@ -462,6 +508,7 @@ mod tests {
         std::fs::rename(&tmp_path, &final_path).unwrap();
         ClaudeCodeProvider {
             binary_path: final_path,
+            timeout: DEFAULT_CLAUDE_CODE_REQUEST_TIMEOUT,
         }
     }
 
