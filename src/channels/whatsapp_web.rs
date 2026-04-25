@@ -332,6 +332,13 @@ impl WhatsAppWebChannel {
     }
 
     /// Build normalized sender candidates from sender JID, optional alt JID, and optional LID->PN mapping.
+    ///
+    /// PN candidates are listed before LID candidates so downstream consumers
+    /// that pick the first allowed candidate (e.g. wildcard allow-lists) get
+    /// the canonical phone number. LIDs are opaque WhatsApp identifiers that
+    /// downstream CRMs cannot reply to or dedupe against contact records — if
+    /// a PN is available from `sender_alt` (inline on the message envelope)
+    /// or `mapped_phone` (LID->PN cache / usync resolution), it must win.
     #[cfg(feature = "whatsapp-web")]
     fn sender_phone_candidates(
         sender: &wa_rs_binary::jid::Jid,
@@ -348,15 +355,66 @@ impl WhatsAppWebChannel {
             }
         };
 
-        add_candidate(Self::normalize_phone_token(&sender.to_string()));
-        if let Some(alt) = sender_alt {
-            add_candidate(Self::normalize_phone_token(&alt.to_string()));
-        }
-        if let Some(mapped_phone) = mapped_phone {
-            add_candidate(Self::normalize_phone_token(mapped_phone));
+        let sender_is_lid = sender.is_lid();
+        let alt_is_pn = sender_alt.map(|a| a.is_pn()).unwrap_or(false);
+
+        if sender_is_lid {
+            // Prefer any resolved PN over the opaque LID.
+            if alt_is_pn {
+                if let Some(alt) = sender_alt {
+                    add_candidate(Self::normalize_phone_token(&alt.to_string()));
+                }
+            }
+            if let Some(mapped_phone) = mapped_phone {
+                add_candidate(Self::normalize_phone_token(mapped_phone));
+            }
+            // LID last — only used when no PN is available.
+            add_candidate(Self::normalize_phone_token(&sender.to_string()));
+            // Include any non-PN alt as a final fallback (e.g. another LID).
+            if !alt_is_pn {
+                if let Some(alt) = sender_alt {
+                    add_candidate(Self::normalize_phone_token(&alt.to_string()));
+                }
+            }
+        } else {
+            add_candidate(Self::normalize_phone_token(&sender.to_string()));
+            if let Some(alt) = sender_alt {
+                add_candidate(Self::normalize_phone_token(&alt.to_string()));
+            }
+            if let Some(mapped_phone) = mapped_phone {
+                add_candidate(Self::normalize_phone_token(mapped_phone));
+            }
         }
 
         candidates
+    }
+
+    /// Pick the canonical phone-number form for an inbound LID sender.
+    ///
+    /// Order: `mapped_phone` (cache / usync resolution) → `sender_alt` PN
+    /// (inline on message envelope) → None. The returned string has the
+    /// digits-only shape that the studio webhook expects in `real_phone`.
+    #[cfg(feature = "whatsapp-web")]
+    fn resolve_real_phone_for_lid(
+        mapped_phone: Option<&str>,
+        sender_alt: Option<&wa_rs_binary::jid::Jid>,
+    ) -> Option<String> {
+        if let Some(mp) = mapped_phone {
+            let digits: String = mp.chars().filter(|c| c.is_ascii_digit()).collect();
+            if !digits.is_empty() {
+                return Some(digits);
+            }
+        }
+        if let Some(alt) = sender_alt {
+            if alt.is_pn() {
+                let digits: String =
+                    alt.user.chars().filter(|c| c.is_ascii_digit()).collect();
+                if !digits.is_empty() {
+                    return Some(digits);
+                }
+            }
+        }
+        None
     }
 
     /// Normalize phone number to E.164 format
@@ -1794,11 +1852,20 @@ impl Channel for WhatsAppWebChannel {
                                         thread_ts: None,
                                         interruption_scope_id: None,
                                         attachments: vec![],
-                                        // When the sender uses a LID, Baileys can resolve
-                                        // it to the real E.164 phone number. Include it
-                                        // so the webhook receiver can build the mapping
-                                        // without needing a prior outbound send.
-                                        real_phone: mapped_phone.clone(),
+                                        // When the sender uses a LID, prefer any PN we
+                                        // can recover: the cache/usync mapping first,
+                                        // then `sender_alt` which WhatsApp embeds inline
+                                        // on the message envelope. Without this, downstream
+                                        // CRM keeps the conversation on the opaque LID and
+                                        // cannot match it against a known contact phone.
+                                        real_phone: if sender_jid.is_lid() {
+                                            Self::resolve_real_phone_for_lid(
+                                                mapped_phone.as_deref(),
+                                                sender_alt.as_ref(),
+                                            )
+                                        } else {
+                                            mapped_phone.clone()
+                                        },
                                     })
                                     .await
                                 {
@@ -2484,6 +2551,63 @@ mod tests {
         let candidates =
             WhatsAppWebChannel::sender_phone_candidates(&sender, None, Some("15551234567"));
         assert!(candidates.contains(&"+15551234567".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_sender_candidates_prefer_pn_alt_over_lid() {
+        // Wildcard allow-lists pick the first candidate. When sender is a
+        // LID and sender_alt is a PN, the PN must be first so downstream
+        // CRMs receive the canonical phone, not the opaque LID.
+        let sender = Jid::lid("246763202064579");
+        let sender_alt = Jid::pn("966541118020");
+        let candidates =
+            WhatsAppWebChannel::sender_phone_candidates(&sender, Some(&sender_alt), None);
+        assert_eq!(candidates.first().map(|s| s.as_str()), Some("+966541118020"));
+        assert!(candidates.contains(&"+246763202064579".to_string()));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_sender_candidates_prefer_mapping_over_lid() {
+        let sender = Jid::lid("246763202064579");
+        let candidates =
+            WhatsAppWebChannel::sender_phone_candidates(&sender, None, Some("966541118020"));
+        assert_eq!(candidates.first().map(|s| s.as_str()), Some("+966541118020"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_sender_candidates_lid_only_fallback() {
+        let sender = Jid::lid("246763202064579");
+        let candidates = WhatsAppWebChannel::sender_phone_candidates(&sender, None, None);
+        assert_eq!(candidates, vec!["+246763202064579".to_string()]);
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_resolve_real_phone_uses_sender_alt_when_mapping_missing() {
+        let alt = Jid::pn("966541118020");
+        let resolved =
+            WhatsAppWebChannel::resolve_real_phone_for_lid(None, Some(&alt));
+        assert_eq!(resolved.as_deref(), Some("966541118020"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_resolve_real_phone_prefers_mapping_when_present() {
+        let alt = Jid::pn("966541118020");
+        let resolved =
+            WhatsAppWebChannel::resolve_real_phone_for_lid(Some("447908186388"), Some(&alt));
+        assert_eq!(resolved.as_deref(), Some("447908186388"));
+    }
+
+    #[test]
+    #[cfg(feature = "whatsapp-web")]
+    fn whatsapp_web_resolve_real_phone_returns_none_when_only_lid() {
+        let alt = Jid::lid("999999999999");
+        let resolved = WhatsAppWebChannel::resolve_real_phone_for_lid(None, Some(&alt));
+        assert!(resolved.is_none());
     }
 
     #[tokio::test]
