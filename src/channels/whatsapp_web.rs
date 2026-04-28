@@ -770,8 +770,11 @@ impl WhatsAppWebChannel {
         mime_type: Option<&str>,
         caption: Option<&str>,
         kind_label: &str,
-    ) -> (Option<String>, Option<String>, Option<String>) {
+    ) -> (Option<String>, Option<String>, Option<String>, Option<String>) {
         const MAX_BYTES: usize = 25 * 1024 * 1024;
+
+        let cap = caption.map(str::to_string);
+        let fail = |reason: String| (None, None, cap.clone(), Some(reason));
 
         let studio_url = match std::env::var("STUDIO_INTERNAL_URL") {
             Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
@@ -780,7 +783,7 @@ impl WhatsAppWebChannel {
                     "WhatsApp Web: STUDIO_INTERNAL_URL not set — skipping {} upload",
                     kind_label
                 );
-                return (None, None, caption.map(str::to_string));
+                return fail("studio endpoint not configured".to_string());
             }
         };
         let secret = match std::env::var("INTERNAL_API_SECRET") {
@@ -790,7 +793,7 @@ impl WhatsAppWebChannel {
                     "WhatsApp Web: INTERNAL_API_SECRET not set — skipping {} upload",
                     kind_label
                 );
-                return (None, None, caption.map(str::to_string));
+                return fail("internal api secret not configured".to_string());
             }
         };
 
@@ -802,12 +805,12 @@ impl WhatsAppWebChannel {
                     kind_label,
                     e
                 );
-                return (None, None, caption.map(str::to_string));
+                return fail(format!("download failed ({})", Self::sanitize_reason(&e.to_string())));
             }
         };
         if bytes.is_empty() {
             tracing::warn!("WhatsApp Web: {} download returned 0 bytes", kind_label);
-            return (None, None, caption.map(str::to_string));
+            return fail("download returned 0 bytes".to_string());
         }
         if bytes.len() > MAX_BYTES {
             tracing::warn!(
@@ -816,7 +819,11 @@ impl WhatsAppWebChannel {
                 bytes.len(),
                 MAX_BYTES
             );
-            return (None, None, caption.map(str::to_string));
+            return fail(format!(
+                "payload too large ({} bytes, cap {})",
+                bytes.len(),
+                MAX_BYTES
+            ));
         }
 
         let mime = mime_type
@@ -837,7 +844,10 @@ impl WhatsAppWebChannel {
                     "WhatsApp Web: failed to build reqwest client for media upload: {}",
                     e
                 );
-                return (None, None, caption.map(str::to_string));
+                return fail(format!(
+                    "http client init failed ({})",
+                    Self::sanitize_reason(&e.to_string())
+                ));
             }
         };
 
@@ -857,7 +867,10 @@ impl WhatsAppWebChannel {
                     mime,
                     e
                 );
-                return (None, None, caption.map(str::to_string));
+                return fail(format!(
+                    "upload failed ({})",
+                    Self::sanitize_reason(&e.to_string())
+                ));
             }
         };
 
@@ -870,7 +883,7 @@ impl WhatsAppWebChannel {
                 status,
                 body.chars().take(200).collect::<String>()
             );
-            return (None, None, caption.map(str::to_string));
+            return fail(format!("studio rejected upload ({})", status));
         }
 
         let parsed: serde_json::Value = match resp.json().await {
@@ -881,7 +894,10 @@ impl WhatsAppWebChannel {
                     kind_label,
                     e
                 );
-                return (None, None, caption.map(str::to_string));
+                return fail(format!(
+                    "studio response parse failed ({})",
+                    Self::sanitize_reason(&e.to_string())
+                ));
             }
         };
         let url = parsed
@@ -893,8 +909,26 @@ impl WhatsAppWebChannel {
                 "WhatsApp Web: media-store response missing `url` field for {}",
                 kind_label
             );
+            return fail("studio response missing url".to_string());
         }
-        (url, Some(mime), caption.map(str::to_string))
+        (url, Some(mime), cap, None)
+    }
+
+    /// Strip control chars + cap length so the failure reason can be safely
+    /// embedded in a plaintext sentinel that flows through Telegram, the
+    /// studio webhook, and SQL columns without surprises.
+    #[cfg(feature = "whatsapp-web")]
+    fn sanitize_reason(raw: &str) -> String {
+        let cleaned: String = raw
+            .chars()
+            .filter(|c| !c.is_control() && *c != '[' && *c != ']')
+            .collect();
+        let trimmed = cleaned.trim();
+        if trimmed.len() > 160 {
+            format!("{}…", &trimmed[..160])
+        } else {
+            trimmed.to_string()
+        }
     }
 
     /// Synthesize text to speech and send as a WhatsApp voice note (static version for spawned tasks).
@@ -1903,7 +1937,7 @@ impl Channel for WhatsAppWebChannel {
                                 // as mediaUrl/mediaType/mediaCaption) so downstream
                                 // consumers can reference, render, and extract
                                 // content from the attachment.
-                                let (media_url, media_type, media_caption) =
+                                let (media_url, media_type, media_caption, media_failure) =
                                     if let Some(ref image) = msg.image_message {
                                         Self::try_capture_customer_media(
                                             &client,
@@ -1932,7 +1966,7 @@ impl Channel for WhatsAppWebChannel {
                                         )
                                         .await
                                     } else {
-                                        (None, None, None)
+                                        (None, None, None, None)
                                     };
 
                                 // Prepend quoted message text so the agent has full context
@@ -1959,10 +1993,32 @@ impl Channel for WhatsAppWebChannel {
                                 // legitimate inbound that the studio router synthesises
                                 // a placeholder body for. Without this exception
                                 // uncaptioned attachments are silently dropped.
+                                //
+                                // Capture-failure path: when the customer DID attach
+                                // media but we could not download / persist it, the
+                                // body would otherwise be empty (or only the caption)
+                                // and the operator would never know an attachment was
+                                // attempted. Stamp a stable sentinel into the body so
+                                // the studio router can detect it and fire an ops
+                                // alert — see `extractCustomerMediaFailure` in the
+                                // change-request router.
                                 let content = if content.is_empty() && media_url.is_some() {
                                     media_caption
                                         .clone()
                                         .unwrap_or_else(|| "(no caption)".to_string())
+                                } else {
+                                    content
+                                };
+                                let content = if let Some(ref reason) = media_failure {
+                                    let sentinel = format!(
+                                        "[Customer attempted attachment but capture failed: {}]",
+                                        reason
+                                    );
+                                    if content.is_empty() {
+                                        sentinel
+                                    } else {
+                                        format!("{}\n{}", content, sentinel)
+                                    }
                                 } else {
                                     content
                                 };
