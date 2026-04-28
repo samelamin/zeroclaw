@@ -132,6 +132,9 @@ impl Channel for MatrixTestChannel {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         })
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -629,6 +632,9 @@ fn channel_message_thread_ts_preserved_on_clone() {
         interruption_scope_id: None,
         attachments: vec![],
         real_phone: None,
+        media_url: None,
+        media_type: None,
+        media_caption: None,
     };
 
     let cloned = msg.clone();
@@ -648,6 +654,9 @@ fn channel_message_none_thread_ts_preserved() {
         interruption_scope_id: None,
         attachments: vec![],
         real_phone: None,
+        media_url: None,
+        media_type: None,
+        media_caption: None,
     };
 
     assert!(msg.clone().thread_ts.is_none());
@@ -704,6 +713,9 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         },
         "discord" => ChannelMessage {
             id: "dc_1".into(),
@@ -716,6 +728,9 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         },
         "slack" => ChannelMessage {
             id: "sl_1".into(),
@@ -728,6 +743,9 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         },
         "imessage" => ChannelMessage {
             id: "im_1".into(),
@@ -740,6 +758,9 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         },
         "irc" => ChannelMessage {
             id: "irc_1".into(),
@@ -752,6 +773,9 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         },
         "email" => ChannelMessage {
             id: "email_1".into(),
@@ -764,6 +788,9 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         },
         "signal" => ChannelMessage {
             id: "sig_1".into(),
@@ -776,6 +803,9 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         },
         "mattermost" => ChannelMessage {
             id: "mm_1".into(),
@@ -788,6 +818,9 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         },
         "whatsapp" => ChannelMessage {
             id: "wa_1".into(),
@@ -800,6 +833,9 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         },
         "nextcloud_talk" => ChannelMessage {
             id: "nc_1".into(),
@@ -812,6 +848,9 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         },
         "wecom" => ChannelMessage {
             id: "wc_1".into(),
@@ -824,6 +863,9 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         },
         "dingtalk" => ChannelMessage {
             id: "dt_1".into(),
@@ -836,6 +878,9 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         },
         "qq" => ChannelMessage {
             id: "qq_1".into(),
@@ -848,6 +893,9 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         },
         "linq" => ChannelMessage {
             id: "lq_1".into(),
@@ -860,6 +908,9 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         },
         "wati" => ChannelMessage {
             id: "wt_1".into(),
@@ -872,6 +923,9 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         },
         "cli" => ChannelMessage {
             id: "cli_1".into(),
@@ -884,6 +938,9 @@ fn make_platform_message(platform: &str) -> ChannelMessage {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         },
         _ => panic!("Unknown platform: {platform}"),
     }
@@ -1188,6 +1245,9 @@ fn channel_message_zero_timestamp() {
         interruption_scope_id: None,
         attachments: vec![],
         real_phone: None,
+        media_url: None,
+        media_type: None,
+        media_caption: None,
     };
     assert_eq!(msg.timestamp, 0);
 }
@@ -1205,6 +1265,9 @@ fn channel_message_max_timestamp() {
         interruption_scope_id: None,
         attachments: vec![],
         real_phone: None,
+        media_url: None,
+        media_type: None,
+        media_caption: None,
     };
     assert_eq!(msg.timestamp, u64::MAX);
 }

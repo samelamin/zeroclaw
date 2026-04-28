@@ -542,6 +542,9 @@ impl EmailChannel {
                 interruption_scope_id: None,
                 attachments: email.attachments,
                 real_phone: None,
+                media_url: None,
+                media_type: None,
+                media_caption: None,
             };
 
             if tx.send(msg).await.is_err() {

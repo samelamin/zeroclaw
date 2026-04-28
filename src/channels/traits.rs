@@ -26,6 +26,19 @@ pub struct ChannelMessage {
     /// Set by WhatsApp Web when Baileys can resolve the LID to a real number.
     /// Included in webhook forward payloads as `real_phone`.
     pub real_phone: Option<String>,
+    /// Public URL of a customer-attached file (image, PDF, video, audio)
+    /// that was downloaded from the WhatsApp WebSocket and persisted by the
+    /// studio media-store. Forwarded to the webhook as `mediaUrl` so the
+    /// receiving service can extract content (PDF text, image description)
+    /// and surface it to the LLM.
+    pub media_url: Option<String>,
+    /// MIME type of {@link media_url} (e.g. `image/jpeg`, `application/pdf`).
+    /// Forwarded as `mediaType`.
+    pub media_type: Option<String>,
+    /// Caption text the customer attached alongside the media (WhatsApp
+    /// surfaces this on imageMessage / documentMessage / videoMessage).
+    /// Forwarded as `mediaCaption`.
+    pub media_caption: Option<String>,
 }
 
 /// Message to send through a channel
@@ -284,6 +297,9 @@ mod tests {
                 interruption_scope_id: None,
                 attachments: vec![],
                 real_phone: None,
+                media_url: None,
+                media_type: None,
+                media_caption: None,
             })
             .await
             .map_err(|e| anyhow::anyhow!(e.to_string()))
@@ -303,6 +319,9 @@ mod tests {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         };
 
         let cloned = message.clone();

@@ -292,6 +292,9 @@ impl Channel for DingTalkChannel {
                         interruption_scope_id: None,
                         attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
                     };
 
                     if tx.send(channel_msg).await.is_err() {

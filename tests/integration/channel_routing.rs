@@ -28,6 +28,9 @@ fn channel_message_sender_field_holds_platform_user_id() {
         interruption_scope_id: None,
         attachments: vec![],
         real_phone: None,
+        media_url: None,
+        media_type: None,
+        media_caption: None,
     };
 
     assert_eq!(msg.sender, "123456789");
@@ -53,6 +56,9 @@ fn channel_message_reply_target_distinct_from_sender() {
         interruption_scope_id: None,
         attachments: vec![],
         real_phone: None,
+        media_url: None,
+        media_type: None,
+        media_caption: None,
     };
 
     assert_ne!(
@@ -76,6 +82,9 @@ fn channel_message_fields_not_swapped() {
         interruption_scope_id: None,
         attachments: vec![],
         real_phone: None,
+        media_url: None,
+        media_type: None,
+        media_caption: None,
     };
 
     assert_eq!(
@@ -105,6 +114,9 @@ fn channel_message_preserves_all_fields_on_clone() {
         interruption_scope_id: None,
         attachments: vec![],
         real_phone: None,
+        media_url: None,
+        media_type: None,
+        media_caption: None,
     };
 
     let cloned = original.clone();
@@ -201,6 +213,9 @@ impl Channel for CapturingChannel {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         })
         .await
         .map_err(|e| anyhow::anyhow!(e.to_string()))

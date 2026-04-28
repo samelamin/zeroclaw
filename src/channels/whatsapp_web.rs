@@ -754,6 +754,149 @@ impl WhatsAppWebChannel {
         }
     }
 
+    /// Download a customer-attached file (image, PDF, video, voice note) from
+    /// the WhatsApp WebSocket and persist it via the studio media-store
+    /// endpoint. Returns the public URL the studio handed back, plus the MIME
+    /// type and caption for downstream `ChannelMessage` enrichment.
+    ///
+    /// Returns `(None, _, _)` on any failure (env not configured, download
+    /// error, upload error, oversized payload). Failures are logged at warn
+    /// level; the message is still forwarded with whatever text content was
+    /// captured.
+    #[cfg(feature = "whatsapp-web")]
+    async fn try_capture_customer_media(
+        client: &wa_rs::Client,
+        downloadable: &dyn wa_rs::download::Downloadable,
+        mime_type: Option<&str>,
+        caption: Option<&str>,
+        kind_label: &str,
+    ) -> (Option<String>, Option<String>, Option<String>) {
+        const MAX_BYTES: usize = 25 * 1024 * 1024;
+
+        let studio_url = match std::env::var("STUDIO_INTERNAL_URL") {
+            Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+            _ => {
+                tracing::warn!(
+                    "WhatsApp Web: STUDIO_INTERNAL_URL not set — skipping {} upload",
+                    kind_label
+                );
+                return (None, None, caption.map(str::to_string));
+            }
+        };
+        let secret = match std::env::var("INTERNAL_API_SECRET") {
+            Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+            _ => {
+                tracing::warn!(
+                    "WhatsApp Web: INTERNAL_API_SECRET not set — skipping {} upload",
+                    kind_label
+                );
+                return (None, None, caption.map(str::to_string));
+            }
+        };
+
+        let bytes = match client.download(downloadable).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(
+                    "WhatsApp Web: failed to download {} payload: {}",
+                    kind_label,
+                    e
+                );
+                return (None, None, caption.map(str::to_string));
+            }
+        };
+        if bytes.is_empty() {
+            tracing::warn!("WhatsApp Web: {} download returned 0 bytes", kind_label);
+            return (None, None, caption.map(str::to_string));
+        }
+        if bytes.len() > MAX_BYTES {
+            tracing::warn!(
+                "WhatsApp Web: {} payload too large ({} > {} bytes), skipping upload",
+                kind_label,
+                bytes.len(),
+                MAX_BYTES
+            );
+            return (None, None, caption.map(str::to_string));
+        }
+
+        let mime = mime_type
+            .map(str::to_string)
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+
+        let endpoint = format!(
+            "{}/api/internal/customer-media/store",
+            studio_url.trim_end_matches('/')
+        );
+        let http = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(
+                    "WhatsApp Web: failed to build reqwest client for media upload: {}",
+                    e
+                );
+                return (None, None, caption.map(str::to_string));
+            }
+        };
+
+        let resp = match http
+            .post(&endpoint)
+            .header("Content-Type", &mime)
+            .header("X-Internal-Secret", &secret)
+            .body(bytes)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    "WhatsApp Web: media-store upload failed for {} ({}): {}",
+                    kind_label,
+                    mime,
+                    e
+                );
+                return (None, None, caption.map(str::to_string));
+            }
+        };
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            tracing::warn!(
+                "WhatsApp Web: media-store rejected {} upload ({}): {}",
+                kind_label,
+                status,
+                body.chars().take(200).collect::<String>()
+            );
+            return (None, None, caption.map(str::to_string));
+        }
+
+        let parsed: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(
+                    "WhatsApp Web: media-store response parse failed for {}: {}",
+                    kind_label,
+                    e
+                );
+                return (None, None, caption.map(str::to_string));
+            }
+        };
+        let url = parsed
+            .get("url")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        if url.is_none() {
+            tracing::warn!(
+                "WhatsApp Web: media-store response missing `url` field for {}",
+                kind_label
+            );
+        }
+        (url, Some(mime), caption.map(str::to_string))
+    }
+
     /// Synthesize text to speech and send as a WhatsApp voice note (static version for spawned tasks).
     #[cfg(feature = "whatsapp-web")]
     async fn synthesize_voice_static(
@@ -1752,6 +1895,46 @@ impl Channel for WhatsAppWebChannel {
                                     text.trim().to_string()
                                 };
 
+                                // ── Customer-attached media capture ──
+                                // Download images / PDFs / videos from the WebSocket
+                                // and persist them via the studio media-store. The
+                                // resulting public URL is forwarded on the
+                                // `ChannelMessage` (and surfaced in webhook_forward
+                                // as mediaUrl/mediaType/mediaCaption) so downstream
+                                // consumers can reference, render, and extract
+                                // content from the attachment.
+                                let (media_url, media_type, media_caption) =
+                                    if let Some(ref image) = msg.image_message {
+                                        Self::try_capture_customer_media(
+                                            &client,
+                                            image.as_ref() as &dyn wa_rs::download::Downloadable,
+                                            image.mimetype.as_deref(),
+                                            image.caption.as_deref(),
+                                            "image",
+                                        )
+                                        .await
+                                    } else if let Some(ref doc) = msg.document_message {
+                                        Self::try_capture_customer_media(
+                                            &client,
+                                            doc.as_ref() as &dyn wa_rs::download::Downloadable,
+                                            doc.mimetype.as_deref(),
+                                            doc.caption.as_deref().or(doc.title.as_deref()),
+                                            "document",
+                                        )
+                                        .await
+                                    } else if let Some(ref video) = msg.video_message {
+                                        Self::try_capture_customer_media(
+                                            &client,
+                                            video.as_ref() as &dyn wa_rs::download::Downloadable,
+                                            video.mimetype.as_deref(),
+                                            video.caption.as_deref(),
+                                            "video",
+                                        )
+                                        .await
+                                    } else {
+                                        (None, None, None)
+                                    };
+
                                 // Prepend quoted message text so the agent has full context
                                 // when the user replies to a specific message (e.g. "translate
                                 // this", "summarise", "what does this mean?").
@@ -1770,6 +1953,19 @@ impl Channel for WhatsAppWebChannel {
                                     "WhatsApp Web message content: {}",
                                     content
                                 );
+
+                                // Allow empty text content when media is attached:
+                                // a customer sending a photo without caption is a
+                                // legitimate inbound that the studio router synthesises
+                                // a placeholder body for. Without this exception
+                                // uncaptioned attachments are silently dropped.
+                                let content = if content.is_empty() && media_url.is_some() {
+                                    media_caption
+                                        .clone()
+                                        .unwrap_or_else(|| "(no caption)".to_string())
+                                } else {
+                                    content
+                                };
 
                                 if content.is_empty() {
                                     tracing::debug!(
@@ -1866,6 +2062,9 @@ impl Channel for WhatsAppWebChannel {
                                         } else {
                                             mapped_phone.clone()
                                         },
+                                        media_url,
+                                        media_type,
+                                        media_caption,
                                     })
                                     .await
                                 {

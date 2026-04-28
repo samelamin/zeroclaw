@@ -368,6 +368,9 @@ impl VoiceCallChannel {
             interruption_scope_id: Some(call_id.to_string()),
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         };
         tx.send(msg)
             .await

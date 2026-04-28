@@ -282,6 +282,9 @@ impl SignalChannel {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         })
     }
 }

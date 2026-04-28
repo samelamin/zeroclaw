@@ -2661,6 +2661,9 @@ mod tests {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         };
 
         let key = whatsapp_memory_key(&msg);

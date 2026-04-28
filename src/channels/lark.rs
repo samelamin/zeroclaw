@@ -1030,6 +1030,9 @@ impl LarkChannel {
                         interruption_scope_id: None,
                     attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
                     };
 
                     tracing::debug!("Lark WS: message in {}", lark_msg.chat_id);
@@ -1558,6 +1561,9 @@ impl LarkChannel {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         }]
     }
 
@@ -1775,6 +1781,9 @@ impl LarkChannel {
             interruption_scope_id: None,
             attachments: vec![],
             real_phone: None,
+            media_url: None,
+            media_type: None,
+            media_caption: None,
         });
 
         messages
