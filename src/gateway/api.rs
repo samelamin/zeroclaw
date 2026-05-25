@@ -22,6 +22,34 @@ fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
         .and_then(|auth| auth.strip_prefix("Bearer "))
 }
 
+fn configured_http_chat_api_key() -> Option<String> {
+    [
+        "ZEROCLAW_API_CHAT_KEY",
+        "ZEROCLAW_HTTP_API_KEY",
+        "ZEROCLAW_API_KEY",
+    ]
+    .iter()
+    .find_map(|name| {
+        std::env::var(name)
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+    })
+}
+
+fn is_bearer_authorized(headers: &HeaderMap, expected_key: Option<&str>) -> bool {
+    let Some(expected_key) = expected_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return true;
+    };
+
+    extract_bearer_token(headers)
+        .map(str::trim)
+        .is_some_and(|token| crate::security::pairing::constant_time_eq(token, expected_key))
+}
+
 /// Verify bearer token against PairingGuard. Returns error response if unauthorized.
 pub(super) fn require_auth(
     state: &AppState,
@@ -42,6 +70,24 @@ pub(super) fn require_auth(
             })),
         ))
     }
+}
+
+fn require_http_chat_auth(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if let Some(expected_key) = configured_http_chat_api_key() {
+        if is_bearer_authorized(headers, Some(&expected_key)) {
+            return Ok(());
+        }
+
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "Unauthorized"})),
+        ));
+    }
+
+    require_auth(state, headers)
 }
 
 // ── Error Classification ────────────────────────────────────────────
@@ -1621,8 +1667,10 @@ pub(super) async fn handle_whatsapp_typing(
 #[derive(serde::Deserialize)]
 pub(super) struct HttpChatBody {
     pub message: String,
+    #[serde(default, alias = "sessionId")]
     pub session_id: Option<String>,
-    /// Optional system prompt override — replaces the config-derived system prompt.
+    /// Optional trusted caller context appended to the config-derived system prompt.
+    #[serde(default, alias = "systemPrompt")]
     pub system_prompt: Option<String>,
 }
 
@@ -1633,8 +1681,17 @@ pub(super) async fn handle_http_chat(
     headers: HeaderMap,
     Json(body): Json<HttpChatBody>,
 ) -> impl IntoResponse {
-    if let Err(e) = require_auth(&state, &headers) {
+    if let Err(e) = require_http_chat_auth(&state, &headers) {
         return e.into_response();
+    }
+
+    let message = body.message.trim();
+    if message.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "message is required"})),
+        )
+            .into_response();
     }
 
     let config = state.config.lock().clone();
@@ -1649,9 +1706,20 @@ pub(super) async fn handle_http_chat(
         }
     };
 
-    // Apply system prompt override if provided
+    // Append trusted caller context while preserving tools, skills, and policy.
     if let Some(ref sys) = body.system_prompt {
-        agent = agent.with_system_prompt(sys.clone());
+        match agent.with_system_prompt_context(sys.clone()) {
+            Ok(scoped_agent) => {
+                agent = scoped_agent;
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": format!("Agent prompt failed: {e}") })),
+                )
+                    .into_response();
+            }
+        }
     }
 
     // Hydrate from persisted session if session_id provided
@@ -1665,17 +1733,25 @@ pub(super) async fn handle_http_chat(
     }
 
     // Run synchronous turn (full agentic loop with tools)
-    match agent.turn(&body.message).await {
+    match agent.turn(message).await {
         Ok(response) => {
             // Persist to session backend if session_id provided
             if let (Some(session_id), Some(backend)) = (&body.session_id, &state.session_backend) {
                 let session_key = format!("gw_{session_id}");
-                let user_msg = crate::providers::ChatMessage::user(&body.message);
+                let user_msg = crate::providers::ChatMessage::user(message);
                 let assistant_msg = crate::providers::ChatMessage::assistant(&response);
                 let _ = backend.append(&session_key, &user_msg);
                 let _ = backend.append(&session_key, &assistant_msg);
             }
-            Json(serde_json::json!({ "text": response })).into_response()
+            let response_text = response.clone();
+            Json(serde_json::json!({
+                "text": response,
+                "response": response_text,
+                "model": state.model,
+                "session_id": body.session_id,
+                "tool_loop": true,
+            }))
+            .into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1859,6 +1935,42 @@ mod tests {
             .expect("response body")
             .to_bytes();
         serde_json::from_slice(&body).expect("valid json response")
+    }
+
+    #[test]
+    fn http_chat_body_accepts_camel_case_aliases() {
+        let parsed: HttpChatBody = serde_json::from_str(
+            r#"{
+                "message": "hello",
+                "sessionId": "customer-123",
+                "systemPrompt": "Active customer context"
+            }"#,
+        )
+        .expect("http chat body should parse camelCase aliases");
+
+        assert_eq!(parsed.message, "hello");
+        assert_eq!(parsed.session_id.as_deref(), Some("customer-123"));
+        assert_eq!(
+            parsed.system_prompt.as_deref(),
+            Some("Active customer context")
+        );
+    }
+
+    #[test]
+    fn bearer_auth_requires_matching_key_when_configured() {
+        let mut headers = HeaderMap::new();
+        assert!(!is_bearer_authorized(&headers, Some("secret")));
+
+        headers.insert(header::AUTHORIZATION, "Bearer wrong".parse().unwrap());
+        assert!(!is_bearer_authorized(&headers, Some("secret")));
+
+        headers.insert(header::AUTHORIZATION, "Bearer secret".parse().unwrap());
+        assert!(is_bearer_authorized(&headers, Some("secret")));
+    }
+
+    #[test]
+    fn bearer_auth_allows_requests_when_no_key_is_configured() {
+        assert!(is_bearer_authorized(&HeaderMap::new(), None));
     }
 
     #[tokio::test]

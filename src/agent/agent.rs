@@ -65,7 +65,8 @@ pub struct Agent {
     /// and stored here for lookup during tool execution.
     activated_tools: Option<Arc<std::sync::Mutex<crate::tools::ActivatedToolSet>>>,
     /// Optional per-request system prompt override. When set, replaces the
-    /// dynamically built system prompt so callers can inject dynamic context.
+    /// dynamically built system prompt. Prefer `with_system_prompt_context`
+    /// for trusted caller context that should preserve tools and runtime policy.
     system_prompt_override: Option<String>,
 }
 
@@ -305,6 +306,17 @@ impl Agent {
     pub fn with_system_prompt(mut self, prompt: String) -> Self {
         self.system_prompt_override = Some(prompt);
         self
+    }
+
+    /// Append trusted caller context to the generated system prompt.
+    ///
+    /// This preserves ZeroClaw's tool instructions, security policy, skills, and
+    /// identity while letting gateway callers scope a turn to a customer/business.
+    pub fn with_system_prompt_context(mut self, context: String) -> Result<Self> {
+        let mut prompt = self.build_system_prompt()?;
+        append_caller_system_context(&mut prompt, Some(&context));
+        self.system_prompt_override = Some(prompt);
+        Ok(self)
     }
 
     /// Hydrate the agent with prior chat messages (e.g. from a session backend).
@@ -1064,6 +1076,18 @@ pub async fn run(
     Ok(())
 }
 
+fn append_caller_system_context(system_prompt: &mut String, caller_system_context: Option<&str>) {
+    let Some(extra) = caller_system_context
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+
+    system_prompt.push_str("\n\n## Caller System Context\n");
+    system_prompt.push_str(extra);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1129,6 +1153,27 @@ mod tests {
                 error: None,
             })
         }
+    }
+
+    #[test]
+    fn caller_system_context_is_appended_without_replacing_runtime_prompt() {
+        let mut system_prompt = "ZeroClaw base prompt\n\nTool instructions stay here.".to_string();
+
+        append_caller_system_context(&mut system_prompt, Some("Active customer: restaurant"));
+
+        assert!(system_prompt.contains("ZeroClaw base prompt"));
+        assert!(system_prompt.contains("Tool instructions stay here."));
+        assert!(system_prompt.contains("## Caller System Context"));
+        assert!(system_prompt.contains("Active customer: restaurant"));
+    }
+
+    #[test]
+    fn caller_system_context_ignores_blank_context() {
+        let mut system_prompt = "ZeroClaw base prompt".to_string();
+
+        append_caller_system_context(&mut system_prompt, Some("   \n\t  "));
+
+        assert_eq!(system_prompt, "ZeroClaw base prompt");
     }
 
     #[tokio::test]
