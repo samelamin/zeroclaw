@@ -4178,6 +4178,18 @@ pub async fn run(
         .await
 }
 
+fn append_caller_system_prompt(system_prompt: &mut String, caller_system_prompt: Option<&str>) {
+    let Some(extra) = caller_system_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+
+    system_prompt.push_str("\n\n## Caller System Context\n");
+    system_prompt.push_str(extra);
+}
+
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
 pub async fn process_message(
@@ -4185,6 +4197,18 @@ pub async fn process_message(
     agent_alias: &str,
     message: &str,
     session_id: Option<&str>,
+) -> Result<String> {
+    process_message_with_system_prompt(config, agent_alias, message, session_id, None).await
+}
+
+/// Process a single message through the full agent while appending trusted
+/// gateway-provided context to the runtime system prompt.
+pub async fn process_message_with_system_prompt(
+    config: Config,
+    agent_alias: &str,
+    message: &str,
+    session_id: Option<&str>,
+    caller_system_prompt: Option<&str>,
 ) -> Result<String> {
     use ::zeroclaw_log::Instrument;
     let agent = config
@@ -4560,6 +4584,7 @@ pub async fn process_message(
                 agent.compact_context,
                 agent.max_system_prompt_chars,
             );
+        append_caller_system_prompt(&mut system_prompt, caller_system_prompt);
         if expose_text_tool_protocol {
             system_prompt.push_str(&build_tool_instructions_for_names(
                 &tools_registry,
@@ -4694,9 +4719,9 @@ pub async fn process_message(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_text_tool_prompt_policy, emergency_history_trim, estimate_history_tokens,
-        fast_trim_tool_results, load_interactive_session_history, save_interactive_session_history,
-        truncate_tool_result,
+        append_caller_system_prompt, apply_text_tool_prompt_policy, emergency_history_trim,
+        estimate_history_tokens, fast_trim_tool_results, load_interactive_session_history,
+        save_interactive_session_history, truncate_tool_result,
     };
     use crate::agent::history::{DEFAULT_MAX_HISTORY_MESSAGES, InteractiveSessionState};
     use crate::agent::tool_execution::execute_one_tool;
@@ -4719,6 +4744,27 @@ mod tests {
     fn truncate_tool_result_short_passthrough() {
         let output = "short output";
         assert_eq!(truncate_tool_result(output, 100), output);
+    }
+
+    #[test]
+    fn caller_system_prompt_is_appended_without_replacing_runtime_prompt() {
+        let mut system_prompt = "ZeroClaw base prompt\n\nTool instructions stay here.".to_string();
+
+        append_caller_system_prompt(&mut system_prompt, Some("Active customer: restaurant"));
+
+        assert!(system_prompt.contains("ZeroClaw base prompt"));
+        assert!(system_prompt.contains("Tool instructions stay here."));
+        assert!(system_prompt.contains("## Caller System Context"));
+        assert!(system_prompt.contains("Active customer: restaurant"));
+    }
+
+    #[test]
+    fn caller_system_prompt_ignores_blank_context() {
+        let mut system_prompt = "ZeroClaw base prompt".to_string();
+
+        append_caller_system_prompt(&mut system_prompt, Some("   \n\t  "));
+
+        assert_eq!(system_prompt, "ZeroClaw base prompt");
     }
 
     #[test]

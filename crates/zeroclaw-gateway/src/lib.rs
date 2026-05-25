@@ -114,6 +114,10 @@ fn webhook_memory_key() -> String {
     format!("webhook_msg_{}", Uuid::new_v4())
 }
 
+fn api_chat_memory_key() -> String {
+    format!("api_chat_msg_{}", Uuid::new_v4())
+}
+
 fn whatsapp_memory_key(msg: &zeroclaw_api::channel::ChannelMessage) -> String {
     format!("whatsapp_{}_{}", msg.sender, msg.id)
 }
@@ -151,6 +155,39 @@ fn webhook_session_id(headers: &HeaderMap) -> Option<String> {
                 .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || b == b'.')
         })
         .map(str::to_owned)
+}
+
+fn configured_api_chat_key() -> Option<String> {
+    std::env::var("ZEROCLAW_API_KEY")
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn is_api_chat_authorized(headers: &HeaderMap, expected_key: Option<&str>) -> bool {
+    let Some(expected) = expected_key
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return true;
+    };
+
+    bearer_token(headers).is_some_and(|token| constant_time_eq(token, expected))
+        || headers
+            .get("x-zeroclaw-secret")
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .is_some_and(|value| constant_time_eq(value, expected))
 }
 
 fn hash_webhook_secret(value: &str) -> String {
@@ -1114,6 +1151,7 @@ pub async fn run_gateway(
         println!();
     }
     println!("  POST {pfx}/pair      — pair a new client (X-Pairing-Code header)");
+    println!("  POST {pfx}/api/chat  — {{\"message\": \"your prompt\"}}");
     println!("  POST {pfx}/webhook   — {{\"message\": \"your prompt\"}}");
     if whatsapp_channel.is_some() {
         println!("  GET  {pfx}/whatsapp  — Meta webhook verification");
@@ -1264,6 +1302,7 @@ pub async fn run_gateway(
         .route("/metrics", get(handle_metrics))
         .route("/pair", post(handle_pair))
         .route("/pair/code", get(handle_pair_code))
+        .route("/api/chat", post(handle_api_chat))
         .route("/webhook", post(handle_webhook))
         .route("/whatsapp", get(handle_whatsapp_verify))
         .route("/whatsapp", post(handle_whatsapp_message))
@@ -1876,6 +1915,15 @@ async fn run_gateway_chat_with_tools(
     message: &str,
     session_id: Option<&str>,
 ) -> anyhow::Result<GatewayChatOutcome> {
+    run_gateway_chat_with_tools_with_system_prompt(state, message, session_id, None).await
+}
+
+async fn run_gateway_chat_with_tools_with_system_prompt(
+    state: &AppState,
+    message: &str,
+    session_id: Option<&str>,
+    caller_system_prompt: Option<&str>,
+) -> anyhow::Result<GatewayChatOutcome> {
     if let Some(err) = needs_onboarding_for(&state.model) {
         return Err(err);
     }
@@ -1887,6 +1935,7 @@ async fn run_gateway_chat_with_tools(
     #[cfg(test)]
     {
         let _ = session_id;
+        let _ = caller_system_prompt;
         let response = state
             .model_provider
             .chat_with_system(None, message, &state.model, state.temperature)
@@ -1962,7 +2011,13 @@ async fn run_gateway_chat_with_tools(
         let response = Box::pin(
             zeroclaw_runtime::agent::cost::TOOL_LOOP_COST_TRACKING_CONTEXT.scope(
                 cost_tracking_context,
-                zeroclaw_runtime::agent::process_message(config, &agent_alias, message, session_id),
+                zeroclaw_runtime::agent::process_message_with_system_prompt(
+                    config,
+                    &agent_alias,
+                    message,
+                    session_id,
+                    caller_system_prompt,
+                ),
             ),
         )
         .await?;
@@ -1990,6 +2045,135 @@ async fn run_gateway_chat_with_tools(
 #[derive(serde::Deserialize)]
 pub struct WebhookBody {
     pub message: String,
+}
+
+/// Internal REST chat body for trusted app-to-agent calls.
+#[derive(serde::Deserialize)]
+pub struct ApiChatBody {
+    pub message: String,
+    #[serde(default, alias = "systemPrompt")]
+    pub system_prompt: Option<String>,
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<String>,
+}
+
+/// POST /api/chat — internal full agent chat endpoint.
+async fn handle_api_chat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Json<ApiChatBody>, axum::extract::rejection::JsonRejection>,
+) -> impl IntoResponse {
+    if let Some(expected_key) = configured_api_chat_key() {
+        if !is_api_chat_authorized(&headers, Some(&expected_key)) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "/api/chat rejected: invalid bearer token"
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Unauthorized"})),
+            );
+        }
+    } else if state.pairing.require_pairing() {
+        let token = bearer_token(&headers).unwrap_or("");
+        if !state.pairing.is_authenticated(token) {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure),
+                "/api/chat rejected: not paired / invalid bearer token"
+            );
+            return (
+                StatusCode::UNAUTHORIZED,
+                Json(serde_json::json!({"error": "Unauthorized"})),
+            );
+        }
+    }
+
+    let Json(chat_body) = match body {
+        Ok(body) => body,
+        Err(e) => {
+            ::zeroclaw_log::record!(
+                WARN,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Reject)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": format!("{}", e)})),
+                "/api/chat JSON parse error"
+            );
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Invalid JSON body. Expected: {\"message\": \"...\"}"
+                })),
+            );
+        }
+    };
+
+    let message = chat_body.message.trim();
+    if message.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": "message is required"})),
+        );
+    }
+
+    let session_id = chat_body
+        .session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let system_prompt = chat_body
+        .system_prompt
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+
+    if state.auto_save && !zeroclaw_memory::should_skip_autosave_content(message) {
+        let key = api_chat_memory_key();
+        let _ = state
+            .mem
+            .store(&key, message, MemoryCategory::Conversation, session_id)
+            .await;
+    }
+
+    let started_at = Instant::now();
+    match run_gateway_chat_with_tools_with_system_prompt(&state, message, session_id, system_prompt)
+        .await
+    {
+        Ok(outcome) => {
+            let duration = started_at.elapsed();
+            let response_text = outcome.response.clone();
+            state.observer.record_metric(
+                &zeroclaw_runtime::observability::traits::ObserverMetric::RequestLatency(duration),
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "text": outcome.response,
+                    "response": response_text,
+                    "model": state.model.clone(),
+                    "session_id": session_id,
+                    "tool_loop": true,
+                })),
+            )
+        }
+        Err(e) => {
+            let sanitized = zeroclaw_providers::sanitize_api_error(&e.to_string());
+            ::zeroclaw_log::record!(
+                ERROR,
+                ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
+                    .with_outcome(::zeroclaw_log::EventOutcome::Failure)
+                    .with_attrs(::serde_json::json!({"error": sanitized.clone()})),
+                "/api/chat failed"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": sanitized})),
+            )
+        }
+    }
 }
 
 /// POST /webhook — main webhook endpoint
@@ -3289,6 +3473,56 @@ mod tests {
         let missing = r#"{"other": "field"}"#;
         let parsed: Result<WebhookBody, _> = serde_json::from_str(missing);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn api_chat_body_accepts_system_prompt_and_session_id() {
+        let valid = r#"{
+            "message": "hello",
+            "system_prompt": "customer context",
+            "session_id": "wa-customer-1"
+        }"#;
+
+        let parsed: ApiChatBody = serde_json::from_str(valid).unwrap();
+
+        assert_eq!(parsed.message, "hello");
+        assert_eq!(parsed.system_prompt.as_deref(), Some("customer context"));
+        assert_eq!(parsed.session_id.as_deref(), Some("wa-customer-1"));
+    }
+
+    #[test]
+    fn api_chat_body_accepts_camel_case_system_prompt() {
+        let valid = r#"{"message":"hello","systemPrompt":"customer context"}"#;
+
+        let parsed: ApiChatBody = serde_json::from_str(valid).unwrap();
+
+        assert_eq!(parsed.system_prompt.as_deref(), Some("customer context"));
+    }
+
+    #[test]
+    fn api_chat_auth_requires_matching_bearer_when_key_is_configured() {
+        let mut headers = HeaderMap::new();
+
+        assert!(!is_api_chat_authorized(&headers, Some("secret")));
+
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer wrong"),
+        );
+        assert!(!is_api_chat_authorized(&headers, Some("secret")));
+
+        headers.insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("Bearer secret"),
+        );
+        assert!(is_api_chat_authorized(&headers, Some("secret")));
+    }
+
+    #[test]
+    fn api_chat_auth_allows_dev_when_no_key_is_configured() {
+        let headers = HeaderMap::new();
+
+        assert!(is_api_chat_authorized(&headers, None));
     }
 
     #[test]
