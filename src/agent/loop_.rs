@@ -3958,16 +3958,22 @@ pub(crate) fn build_tool_instructions(
 ) -> String {
     let mut instructions = String::new();
     instructions.push_str("\n## Tool Use Protocol\n\n");
-    instructions.push_str("To use a tool, wrap a JSON object in <tool_call></tool_call> tags:\n\n");
+    instructions.push_str(
+        "When a tool is needed, output real <tool_call> blocks containing valid JSON. Do not describe the tool call in prose.\n\n",
+    );
     instructions.push_str("```\n<tool_call>\n{\"name\": \"tool_name\", \"arguments\": {\"param\": \"value\"}}\n</tool_call>\n```\n\n");
     instructions.push_str(
         "CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.\n\n",
     );
     instructions.push_str("Example: User says \"what's the date?\". You MUST respond with:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n\n");
-    instructions.push_str("You may use multiple tool calls in a single response. ");
-    instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
-    instructions
-        .push_str("Continue reasoning with the results until you can give a final answer.\n\n");
+    instructions.push_str(
+        "- `name` must exactly match an available tool name.\n\
+         - `arguments` must be a JSON object matching that tool's parameter schema; use `{}` when there are no arguments.\n\
+         - You may emit multiple <tool_call> blocks in one response when the actions are independent.\n\
+         - After tool execution, results will appear in <tool_result> tags. Read every result, adapt on errors, and continue with more tool calls if needed.\n\
+         - Do not provide the final user-facing answer until the needed tool results are available.\n\
+         - Never include <tool_call>, <tool_result>, or other internal protocol tags in the final user-facing answer.\n\n",
+    );
     instructions.push_str("### Available Tools\n\n");
 
     for tool in tools_registry {

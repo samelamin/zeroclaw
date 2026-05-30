@@ -1282,6 +1282,9 @@ fn xml_dispatcher_generates_tool_instructions() {
 
     assert!(instructions.contains("## Tool Use Protocol"));
     assert!(instructions.contains("<tool_call>"));
+    assert!(instructions.contains("valid JSON"));
+    assert!(instructions.contains("multiple <tool_call> blocks"));
+    assert!(instructions.contains("Never include <tool_call>"));
     // Tool listing is handled by ToolsSection in prompt.rs, not by the
     // dispatcher.  prompt_instructions() must only emit the protocol envelope.
     assert!(
@@ -1340,4 +1343,3 @@ async fn run_single_delegates_to_turn() {
         "Expected non-empty response from run_single"
     );
 }
-
