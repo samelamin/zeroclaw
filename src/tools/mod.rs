@@ -646,6 +646,12 @@ pub fn all_tools_with_runtime(
                 http_config.max_response_size,
                 http_config.timeout_secs,
                 http_config.allow_private_hosts,
+                http_config
+                    .default_headers_env
+                    .as_deref()
+                    .and_then(|name| std::env::var(name).ok())
+                    .map(|raw| crate::config::schema::parse_extra_headers_env(&raw))
+                    .unwrap_or_default(),
             )));
         }
     }

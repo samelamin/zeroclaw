@@ -39,6 +39,7 @@ pub struct HttpRequestTool {
     max_response_size: usize,
     timeout_secs: u64,
     allow_private_hosts: bool,
+    default_headers: Vec<(String, String)>,
 }
 
 impl HttpRequestTool {
@@ -48,6 +49,7 @@ impl HttpRequestTool {
         max_response_size: usize,
         timeout_secs: u64,
         allow_private_hosts: bool,
+        default_headers: Vec<(String, String)>,
     ) -> Self {
         Self {
             security,
@@ -55,6 +57,7 @@ impl HttpRequestTool {
             max_response_size,
             timeout_secs,
             allow_private_hosts,
+            default_headers,
         }
     }
 
@@ -339,7 +342,8 @@ impl Tool for HttpRequestTool {
             }
         };
 
-        let request_headers = self.parse_headers(&headers_val);
+        let mut request_headers = self.default_headers.clone();
+        request_headers.extend(self.parse_headers(&headers_val));
 
         match self
             .execute_request(&url, method, request_headers, body)
@@ -594,6 +598,7 @@ mod tests {
             1_000_000,
             30,
             allow_private_hosts,
+            Vec::new(),
         )
     }
 
@@ -701,7 +706,7 @@ mod tests {
     #[test]
     fn validate_requires_allowlist() {
         let security = Arc::new(SecurityPolicy::default());
-        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30, false);
+        let tool = HttpRequestTool::new(security, vec![], 1_000_000, 30, false, Vec::new());
         let err = tool
             .validate_url("https://example.com")
             .unwrap_err()
@@ -817,7 +822,14 @@ mod tests {
             autonomy: AutonomyLevel::ReadOnly,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, false);
+        let tool = HttpRequestTool::new(
+            security,
+            vec!["example.com".into()],
+            1_000_000,
+            30,
+            false,
+            Vec::new(),
+        );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -832,7 +844,14 @@ mod tests {
             max_actions_per_hour: 0,
             ..SecurityPolicy::default()
         });
-        let tool = HttpRequestTool::new(security, vec!["example.com".into()], 1_000_000, 30, false);
+        let tool = HttpRequestTool::new(
+            security,
+            vec!["example.com".into()],
+            1_000_000,
+            30,
+            false,
+            Vec::new(),
+        );
         let result = tool
             .execute(json!({"url": "https://example.com"}))
             .await
@@ -856,6 +875,7 @@ mod tests {
             10,
             30,
             false,
+            Vec::new(),
         );
         let text = "hello world this is long";
         let truncated = tool.truncate_response(text);
@@ -871,6 +891,7 @@ mod tests {
             0, // max_response_size = 0 means no limit
             30,
             false,
+            Vec::new(),
         );
         let text = "a".repeat(10_000_000);
         assert_eq!(tool.truncate_response(&text), text);
@@ -884,6 +905,7 @@ mod tests {
             5,
             30,
             false,
+            Vec::new(),
         );
         let text = "hello world";
         let truncated = tool.truncate_response(text);
@@ -1163,7 +1185,7 @@ mod tests {
     // on the captured event content.
 
     use std::sync::Mutex as StdMutex;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[derive(Clone, Default)]
@@ -1230,7 +1252,51 @@ mod tests {
             1_000_000,
             30,
             true, // allow private hosts so we can point at 127.0.0.1
+            Vec::new(),
         )
+    }
+
+    fn test_tool_with_private_hosts_and_default_headers(
+        allowed_domains: Vec<&str>,
+        default_headers: Vec<(String, String)>,
+    ) -> HttpRequestTool {
+        let security = Arc::new(SecurityPolicy {
+            autonomy: AutonomyLevel::Full,
+            max_actions_per_hour: 1000,
+            ..SecurityPolicy::default()
+        });
+        HttpRequestTool::new(
+            security,
+            allowed_domains.into_iter().map(String::from).collect(),
+            1_000_000,
+            30,
+            true,
+            default_headers,
+        )
+    }
+
+    #[tokio::test]
+    async fn execute_injects_default_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/operator"))
+            .and(header("Authorization", "Bearer injected-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("ok"))
+            .mount(&server)
+            .await;
+
+        let tool = test_tool_with_private_hosts_and_default_headers(
+            vec!["*"],
+            vec![("Authorization".into(), "Bearer injected-token".into())],
+        );
+        let url = format!("{}/operator", server.uri());
+        let result = tool
+            .execute(json!({"url": url, "method": "POST", "body": "{}"}))
+            .await
+            .unwrap();
+
+        assert!(result.success);
+        assert!(result.output.contains("ok"));
     }
 
     /// RED: when the underlying `reqwest::Client::send` returns an error

@@ -2656,6 +2656,12 @@ pub struct HttpRequestConfig {
     /// Default: false (deny private hosts for SSRF protection).
     #[serde(default)]
     pub allow_private_hosts: bool,
+    /// Optional environment variable containing default request headers in
+    /// `Key:Value,Key2:Value2` format. These headers are injected by the
+    /// runtime before model-supplied headers, so explicit per-call headers can
+    /// override them.
+    #[serde(default)]
+    pub default_headers_env: Option<String>,
 }
 
 impl Default for HttpRequestConfig {
@@ -2666,6 +2672,7 @@ impl Default for HttpRequestConfig {
             max_response_size: default_http_max_response_size(),
             timeout_secs: default_http_timeout_secs(),
             allow_private_hosts: false,
+            default_headers_env: None,
         }
     }
 }
