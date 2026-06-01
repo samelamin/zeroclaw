@@ -144,6 +144,15 @@ pub trait Channel: Send + Sync {
         Ok(())
     }
 
+    /// Start typing because an external orchestrator explicitly requested it.
+    ///
+    /// Some channels keep scoped typing state so late background loops cannot
+    /// re-enable typing after a message has already been sent. External control
+    /// paths can override that guard by implementing this method.
+    async fn force_start_typing(&self, recipient: &str) -> anyhow::Result<()> {
+        self.start_typing(recipient).await
+    }
+
     /// Stop any active typing indicator.
     async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
         Ok(())

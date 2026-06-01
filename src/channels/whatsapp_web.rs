@@ -2562,6 +2562,13 @@ impl Channel for WhatsAppWebChannel {
         Ok(())
     }
 
+    async fn force_start_typing(&self, recipient: &str) -> Result<()> {
+        if let Ok(mut ts) = self.typing_started.lock() {
+            ts.insert(recipient.to_string(), std::time::Instant::now());
+        }
+        self.start_typing(recipient).await
+    }
+
     async fn stop_typing(&self, recipient: &str) -> Result<()> {
         let client = self.client.lock().clone();
         let Some(client) = client else {
@@ -2585,6 +2592,10 @@ impl Channel for WhatsAppWebChannel {
             .send_paused(&to)
             .await
             .map_err(|e| anyhow!("Failed to send typing state (paused): {e}"))?;
+
+        if let Ok(mut ts) = self.typing_started.lock() {
+            ts.remove(recipient);
+        }
 
         tracing::debug!("WhatsApp Web: stop typing for {}", recipient);
         Ok(())

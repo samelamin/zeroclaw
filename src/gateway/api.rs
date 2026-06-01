@@ -1656,7 +1656,7 @@ pub(super) async fn handle_whatsapp_typing(
         }
     };
 
-    match channel.start_typing(&body.recipient).await {
+    match channel.force_start_typing(&body.recipient).await {
         Ok(()) => Json(serde_json::json!({ "ok": true })).into_response(),
         Err(e) => error_response(&e, "Failed to send typing indicator").into_response(),
     }
