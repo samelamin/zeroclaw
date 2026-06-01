@@ -2646,7 +2646,7 @@ async fn process_channel_message(
                 // Show typing indicator while waiting for the external agent to respond
                 let typing_channel = ctx.channels_by_name.get("whatsapp").cloned();
                 let typing_token = CancellationToken::new();
-                let typing_task = typing_channel.as_ref().map(|ch| {
+                let mut typing_task = typing_channel.as_ref().map(|ch| {
                     spawn_scoped_typing_task(
                         Arc::clone(ch),
                         msg.reply_target.clone(),
@@ -2704,7 +2704,7 @@ async fn process_channel_message(
                     // Webhook returned a synchronous reply — stop typing then
                     // deliver it so the user sees "typing…" → message cleanly.
                     typing_token.cancel();
-                    if let Some(task) = typing_task {
+                    if let Some(task) = typing_task.take() {
                         let _ = task.await;
                     }
 
@@ -2728,10 +2728,17 @@ async fn process_channel_message(
                 }
                 // No sync reply — the external service will call POST
                 // /api/channels/whatsapp/send when its reply is ready.
-                // Keep the typing task alive so the indicator stays visible
-                // until send() issues send_paused right before the message.
-                // The 120s safety timeout in WhatsAppWebChannel will clean up
-                // if the external service never calls back.
+                //
+                // Do not keep the webhook-forward typing task alive here:
+                // forwarded WhatsApp messages may arrive from an LID while the
+                // async send API deliberately targets the resolved phone-number
+                // JID. In that case send() can succeed but cannot stop the LID
+                // typing task, leaving customers stuck seeing "typing..." long
+                // after the reply is visible.
+                typing_token.cancel();
+                if let Some(task) = typing_task.take() {
+                    let _ = task.await;
+                }
                 return; // Don't process with local LLM
             }
         }
