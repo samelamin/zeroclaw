@@ -1,7 +1,7 @@
 //! §7 — MiniMax tool-loop reliability CI integration tests.
 //!
 //! These tests guard against regressions in the agent orchestration loop when
-//! used with MiniMax M2.7 (or any model whose behaviour matches it):
+//! used with MiniMax reasoning models (or any model whose behaviour matches it):
 //!
 //! * Multi-step tool pipelines complete without stalling.
 //! * The loop terminates correctly at `max_tool_iterations`.
@@ -14,7 +14,7 @@
 //! All tests use mock providers and mock tools — no external services required.
 //!
 //! Context: Naseyma's multi-agent WhatsApp website-generation pipeline relies on
-//! MiniMax M2.7 calling 3–5 tools in sequence (fetch brand info → generate HTML
+//! MiniMax reasoning models calling 3–5 tools in sequence (fetch brand info → generate HTML
 //! → generate CSS → save → deploy). These tests model that exact lifecycle.
 
 use crate::support::helpers::{

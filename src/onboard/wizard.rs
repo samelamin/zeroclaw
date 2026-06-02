@@ -840,11 +840,12 @@ fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
 }
 
 /// Pick a sensible default model for the given provider.
-const MINIMAX_ONBOARD_MODELS: [(&str, &str); 7] = [
+const MINIMAX_ONBOARD_MODELS: [(&str, &str); 8] = [
     (
-        "MiniMax-M2.7",
-        "MiniMax M2.7 (latest flagship, recommended)",
+        "MiniMax-M3",
+        "MiniMax M3 (latest flagship, recommended)",
     ),
+    ("MiniMax-M2.7", "MiniMax M2.7 (previous flagship)"),
     ("MiniMax-M2.7-highspeed", "MiniMax M2.7 High-Speed (faster)"),
     ("MiniMax-M2.5", "MiniMax M2.5 (stable)"),
     ("MiniMax-M2.5-highspeed", "MiniMax M2.5 High-Speed (faster)"),
@@ -870,7 +871,7 @@ fn default_model_for_provider(provider: &str) -> String {
         "cohere" => "command-a-03-2025".into(),
         "moonshot" => "kimi-k2.5".into(),
         "glm" | "zai" => "glm-5".into(),
-        "minimax" => "MiniMax-M2.7".into(),
+        "minimax" => "MiniMax-M3".into(),
         "qwen" => "qwen-plus".into(),
         "qwen-code" => "qwen3-coder-plus".into(),
         "ollama" => "llama3.2".into(),
@@ -1135,8 +1136,12 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
         ],
         "minimax" => vec![
             (
+                "MiniMax-M3".to_string(),
+                "MiniMax M3 (latest flagship, recommended)".to_string(),
+            ),
+            (
                 "MiniMax-M2.7".to_string(),
-                "MiniMax M2.7 (latest flagship)".to_string(),
+                "MiniMax M2.7 (previous flagship)".to_string(),
             ),
             (
                 "MiniMax-M2.7-highspeed".to_string(),
@@ -7079,7 +7084,7 @@ mod tests {
         assert_eq!(default_model_for_provider("qwen-intl"), "qwen-plus");
         assert_eq!(default_model_for_provider("qwen-code"), "qwen3-coder-plus");
         assert_eq!(default_model_for_provider("glm-cn"), "glm-5");
-        assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M2.7");
+        assert_eq!(default_model_for_provider("minimax-cn"), "MiniMax-M3");
         assert_eq!(default_model_for_provider("zai-cn"), "glm-5");
         assert_eq!(default_model_for_provider("gemini"), "gemini-2.5-pro");
         assert_eq!(default_model_for_provider("google"), "gemini-2.5-pro");
